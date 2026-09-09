@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{cspSource}}; script-src 'nonce-{{nonce}}';">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <script type="module" nonce="{{nonce}}" src="{{toolkitUri}}"></script>
+    <link href="{{styleUri}}" rel="stylesheet">
+    <script nonce="{{nonce}}" src="{{scriptUri}}" defer></script>
+    
+    <title>Geometry AI Chat</title>
+</head>
+<body>
+    <div class="ai-panel">
+        <div class="panel-header">
+            <span class="panel-title">CLINE (⌘+J)</span>
+            <div class="header-buttons">
+                <button class="header-btn" title="新建对话">+</button>
+                <button class="header-btn" title="历史记录">≡</button>
+                <button class="header-btn" title="刷新">↻</button>
+                <button class="header-btn" title="编辑">✏</button>
+                <button class="header-btn" title="用户设置">👤</button>
+                <button class="header-btn" title="设置">⚙</button>
+            </div>
+        </div>
+
+        <div class="welcome-section">
+            <div class="ai-avatar">🤖</div>
+            <div class="welcome-text">
+                What can I do for you?
+                <span class="info-icon">i</span>
+            </div>
+        </div>
+
+        <div class="recent-tasks">
+            <div class="section-header">Recent Tasks</div>
+            
+            <div class="task-item" onclick="loadTask(1)">
+                <div class="task-date">JULY 12, 3:55 AM</div>
+                <div class="task-title">Fix the following code in @/src/PikafishWasmLoader.ts</div>
+                <div class="task-tokens">Tokens: 1160.3k | 4.6k</div>
+            </div>
+
+            <div class="task-item" onclick="loadTask(2)">
+                <div class="task-date">JULY 12, 3:53 AM</div>
+                <div class="task-title">Fix the following code in @/src/PikafishWasmLoader.ts</div>
+                <div class="task-tokens">Tokens: 161.6k | 230</div>
+            </div>
+
+            <div class="task-item" onclick="loadTask(3)">
+                <div class="task-date">JULY 12, 3:25 AM</div>
+                <div class="task-title">Fix the following code in @/src/PikafishWorker.ts</div>
+                <div class="task-tokens">Tokens: 159.7k | 501</div>
+            </div>
+
+            <div class="view-history" onclick="viewAllHistory()">
+                View all history
+            </div>
+        </div>
+
+        <div class="input-section">
+            <div class="auto-approve">Auto-approve:</div>
+            <div class="approve-options">
+                <label class="approve-option">
+                    <input type="checkbox" checked> All
+                </label>
+                <label class="approve-option">
+                    <input type="checkbox" checked> Read
+                </label>
+                <label class="approve-option">
+                    <input type="checkbox" checked> Edit
+                </label>
+            </div>
+
+            <div class="input-container">
+                <textarea 
+                    class="chat-input" 
+                    placeholder="Type your task here..."
+                    id="chatInput"
+                    onkeydown="handleKeyDown(event)"
+                    oninput="handleInputChange()"
+                ></textarea>
+                <button class="send-button" id="sendButton" onclick="sendMessage()" disabled>▶</button>
+            </div>
+
+            <div class="bottom-toolbar">
+                <button class="toolbar-btn" title="附加文件">📎</button>
+                <button class="toolbar-btn" title="添加">+</button>
+                <button class="toolbar-btn" title="菜单">≡</button>
+                <button class="toolbar-btn" title="AI助手">🤖</button>
+                <span>openai-compat-gemini-2.5-flash</span>
+                <span style="margin-left: auto;">Plan</span>
+                <button class="toolbar-btn" style="background-color: #0078d4; color: white;">Ad</button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

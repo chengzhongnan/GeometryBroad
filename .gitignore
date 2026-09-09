@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Build output and packaged artifacts
+dist/
+dist-ssr/
+*.vsix
+*.zip
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# TypeScript and tool caches
+*.tsbuildinfo
+.cache/
+.vite/
+.turbo/
+coverage/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Package-manager alternatives
+**/yarn.lock
+**/pnpm-lock.yaml
+
+# Editors and OS files
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.sln
+*.sw?
+
+# Project-local WorkBuddy metadata
+.workbuddy-ai/

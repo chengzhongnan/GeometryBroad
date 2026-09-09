@@ -1,0 +1,99 @@
+{
+	"$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+	"name": "GeometryScript",
+	"patterns": [
+	  {
+		"include": "#keywords"
+	  },
+	  {
+		"include": "#geometric_commands"
+	  },
+	  {
+		"include": "#key_value_pairs"
+	  },
+	  {
+		"include": "#expressions"
+	  },
+	  {
+		"include": "#strings"
+	  },
+	  {
+		"include": "#numbers"
+	  },
+	  {
+		"include": "#object_names"
+	  },
+	  {
+		"include": "#comments"
+	  }
+	],
+	"repository": {
+	  "keywords": {
+		"patterns": [
+		  {
+			"name": "keyword.control.geometryscript",
+			"match": "(?i:\\b(CREATE|CLEAR|VIEW|TRANSLATE|DRAW|MEASURE|RUN|CODE|WITH|CALCULATE|GETOBJ|PRINT)\\b)"
+		  }
+		]
+	  },
+	  "geometric_commands": {
+		"patterns": [
+		  {
+			"name": "entity.name.function.geometryscript",
+			"match": "\\b(?i)(POINT|LINE|SEGMENT|CIRCLE|INTERSECT|TRIANGLE|RECTANGLE|POLYGON|ELLIPSE|PERPENDICULAR|PARALLEL|ANGLE|TANGENT|MIDPOINT|RAY|POINT_ON_LINE|PERP_BISECTOR|ANGLE_BISECTOR|CIRCUMCIRCLE|INCIRCLE|FOCIS|RANDOMPOINT|SLOT|ANIMATION)\\b"
+		  }
+		]
+	  },
+	  "key_value_pairs": {
+		"patterns": [
+		  {
+			"name": "meta.property-value.geometryscript",
+			"match": "(\\b\\w+\\b)(?=\\s*=)"  
+		  }
+		]
+	  },
+	  "expressions": {
+		"patterns": [
+		  {
+			"name": "constant.other.placeholder.geometryscript",
+			"match": "\\{([^}]+)\\}" 
+		  }
+		]
+	  },
+	  "strings": {
+		"name": "string.quoted.double.geometryscript",
+		"begin": "\"",
+		"end": "\"",
+		"patterns": [
+		  {
+			"name": "constant.character.escape.geometryscript",
+			"match": "\\\\."  
+		  }
+		]
+	  },
+	  "numbers": {
+		"patterns": [
+		  {
+			"name": "constant.numeric.geometryscript",
+			"match": "\\b-?([0-9]+(\\.[0-9]+)?)\\b"  
+		  }
+		]
+	  },
+	  "object_names": {
+		"patterns": [
+		  {
+			"name": "variable.other.geometryscript",
+			"match": "\\b([A-Z][a-zA-Z0-9_]*)\\b"  
+		  }
+		]
+	  },
+	  "comments": {
+		"patterns": [{
+			"name": "comment.line.geometryscript",
+			"match": "#.*$"
+		}]
+	  }
+	},
+	"scopeName": "source.geometryscript"
+  }
+  

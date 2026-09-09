@@ -1,0 +1,69 @@
+{
+    "tokenColors": [
+      {
+        "scope": [
+          "keyword.control.geometryscript",
+          "keyword.other.geometryscript"
+        ],
+        "settings": {
+          "foreground": "#C586C0",
+          "fontStyle": "bold"
+        }
+      },
+      {
+        "scope": [
+          "entity.name.function.geometryscript",
+          "entity.name.class.geometryscript"
+        ],
+        "settings": {
+          "foreground": "#4FC1FF",
+          "fontStyle": "italic"
+        }
+      },
+      {
+        "scope": [
+          "variable.other.geometryscript",
+          "variable.parameter.geometryscript"
+        ],
+        "settings": {
+          "foreground": "#9CDCFE"
+        }
+      },
+      {
+        "scope": [
+          "meta.property-value.geometryscript",
+          "constant.numeric.geometryscript"
+        ],
+        "settings": {
+          "foreground": "#4EC9B0"
+        }
+      },
+      {
+        "scope": [
+          "string.quoted.double.geometryscript"
+        ],
+        "settings": {
+          "foreground": "#A5D6A7",
+          "fontStyle": "italic"
+        }
+      },
+      {
+        "scope": [
+          "constant.other.placeholder.geometryscript"
+        ],
+        "settings": {
+          "foreground": "#8D6E63"
+        }
+      },
+      {
+        "scope": [
+          "comment.line.geometryscript"
+        ],
+        "settings": {
+          "foreground": "#6A9955",
+          "fontStyle": "bold"
+        }
+      }
+    ]
+  }
+  

@@ -1,0 +1,96 @@
+{
+  "name": "geometryscript",
+  "displayName": "GeometryScript",
+  "version": "0.0.1",
+  "main": "./dist/extension.js",
+  "scripts": {
+    "install": "tsc && vsce package && code --install-extension geometryscript-0.0.1.vsix",
+    "build": "tsc && vsce package"
+  },
+  "repository": {},
+  "activationEvents": [
+    "onLanguage:geometryscript"
+  ],
+  "engines": {
+    "vscode": "^1.88.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "geometryscript",
+        "aliases": [
+          "GeometryScript",
+          "geometryscript"
+        ],
+        "extensions": [
+          ".gs"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "geometryscript",
+        "scopeName": "source.geometryscript",
+        "path": "./syntaxes/geometryscript.tmLanguage.json"
+      }
+    ],
+    "themes": [
+      {
+        "label": "GeometryScript Theme",
+        "uiTheme": "vs-dark",
+        "path": "./themes/geometryscript-color-theme.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "extension.geometryLog",
+        "title": "Log Geometry Message"
+      },
+      {
+        "command": "extension.showDrawing",
+        "title": "Show Geometry Drawing",
+        "icon": "$(play)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "extension.showDrawing",
+          "when": "resourceLangId == geometryscript",
+          "group": "navigation"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "geometry-broad-container",
+          "title": "几何画板",
+          "icon": "$(variable-group)"
+        }
+      ]
+    },
+    "views": {
+      "geometry-broad-container": [
+        {
+          "id": "geometryView",
+          "name": "Geometry AI Chat",
+          "type": "webview",
+          "contextualTitle": "Geometry Broad"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "@vscode/webview-ui-toolkit": "^1.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.x",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.x"
+  }
+}
