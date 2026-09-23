@@ -1,6 +1,6 @@
 import { Point } from './Point';
 import { Line } from './LinearObject';
-import { GeometricObject, type DrawLabelOptions, type DrawOptions, type IPoint } from './base';
+import { GeometricObject, type DrawLabelOptions, type DrawOptions, type IPoint, toScreenPoint } from './base';
 
 type ParabolaDirection = 'up' | 'down' | 'left' | 'right';
 
@@ -40,10 +40,7 @@ export class Parabola extends GeometricObject {
         const worldY = rotatedY + this.vertex.y;
 
         // 4. 将世界坐标转换为屏幕坐标并返回
-        return {
-            x: worldX * transform.scale + transform.offsetX,
-            y: worldY * transform.scale + transform.offsetY,
-        };
+        return toScreenPoint(worldX, worldY, transform);
     }
 
     /**
@@ -59,7 +56,7 @@ export class Parabola extends GeometricObject {
         }
 
         ctx.strokeStyle = options?.color || 'black';
-        ctx.lineWidth = options?.lineWidth || 1;
+        ctx.lineWidth = (options?.lineWidth || 1) * (options?.highlight ? 2 : 1);
         ctx.setLineDash(options?.dashed ? [5, 5] : []);
         ctx.beginPath();
 

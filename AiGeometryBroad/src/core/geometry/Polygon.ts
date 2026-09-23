@@ -1,6 +1,8 @@
-import { GeometricObject, type DrawLabelOptions, type DrawOptions, type IPoint } from './base';
+import { GeometricObject, type DrawLabelOptions, type DrawOptions, type IPoint, toScreenPoint, resolveLineWidth } from './base';
 import { Point } from './Point';
-import { Segment } from './LinearObject';
+import { Circle } from './Circle';
+import { Curve } from './Curve';
+import { LinearObject, Segment } from './LinearObject';
 
 export class Polygon extends GeometricObject {
     public vertices: Point[];
@@ -54,7 +56,7 @@ export class Polygon extends GeometricObject {
             }
 
             ctx.strokeStyle = options?.color || 'black';
-            ctx.lineWidth = options?.lineWidth || 1;
+            ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform.scale) * (options?.highlight ? 2 : 1);
             if (options?.dashed) {
                 ctx.setLineDash([5, 5]);
             } else {
@@ -65,7 +67,152 @@ export class Polygon extends GeometricObject {
     }
 
     getDrawLabelPosition(transform: { scale: number; offsetX: number; offsetY: number; }, options: DrawLabelOptions, textWidth: number, textHeight: number): IPoint {
-        return this.vertices[0];
+        // 标签放在多边形的几何中心（顶点平均值）附近
+        const centerX = this.vertices.reduce((sum, v) => sum + v.x, 0) / this.vertices.length;
+        const centerY = this.vertices.reduce((sum, v) => sum + v.y, 0) / this.vertices.length;
+        return toScreenPoint(centerX, centerY, transform);
+    }
+}
+
+// 有序点边界围成的可填充区域。
+// Region 复用 Polygon 的路径绘制，因此 Canvas 与 SVG 使用完全相同的边界和填充规则。
+export class Region extends Polygon {
+    constructor(name: string, vertices: Point[]) {
+        super(name, vertices, 'region');
+    }
+}
+
+export type CircularRegionSide = 'left' | 'right';
+
+// 由一条圆弧和对应弦线围成的精确圆弓形区域。
+// arcStartAngle / arcEndAngle 使用 Canvas 坐标系角度，直接兼容 Canvas 和 SVG 上下文。
+export class CircularRegion extends GeometricObject {
+    public readonly circle: Circle;
+    public readonly line: LinearObject;
+    public readonly startPoint: IPoint;
+    public readonly endPoint: IPoint;
+    public readonly arcStartAngle: number;
+    public readonly arcEndAngle: number;
+    public readonly counterclockwise: boolean;
+    public readonly side: CircularRegionSide;
+
+    constructor(
+        name: string,
+        circle: Circle,
+        line: LinearObject,
+        startPoint: IPoint,
+        endPoint: IPoint,
+        arcStartAngle: number,
+        arcEndAngle: number,
+        counterclockwise: boolean,
+        side: CircularRegionSide,
+    ) {
+        super(name, 'circular-region');
+        this.circle = circle;
+        this.line = line;
+        this.startPoint = startPoint;
+        this.endPoint = endPoint;
+        this.arcStartAngle = arcStartAngle;
+        this.arcEndAngle = arcEndAngle;
+        this.counterclockwise = counterclockwise;
+        this.side = side;
+    }
+
+    public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
+        const center = toScreenPoint(this.circle.center.x, this.circle.center.y, transform);
+        const start = toScreenPoint(this.startPoint.x, this.startPoint.y, transform);
+        const end = toScreenPoint(this.endPoint.x, this.endPoint.y, transform);
+        const radius = Math.abs(this.circle.radius * transform.scale);
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(start.x, start.y);
+        ctx.lineTo(end.x, end.y);
+        ctx.arc(center.x, center.y, radius, this.arcStartAngle, this.arcEndAngle, this.counterclockwise);
+        ctx.closePath();
+
+        if (options?.fillColor) {
+            ctx.fillStyle = options.fillColor;
+            ctx.fill();
+        }
+
+        ctx.strokeStyle = options?.color || 'black';
+        ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform.scale) * (options?.highlight ? 2 : 1);
+        ctx.setLineDash(options?.dashed ? [5, 5] : []);
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    getDrawLabelPosition(transform: { scale: number; offsetX: number; offsetY: number }, _options: DrawLabelOptions, _textWidth: number, _textHeight: number): IPoint {
+        return toScreenPoint(this.circle.center.x, this.circle.center.y, transform);
+    }
+}
+
+export type CurveCircleRegionSide = 'above' | 'below';
+
+// 由一段 y=f(x) 曲线和圆弧围成的可填充区域。
+// 曲线本身沿 x 方向采样，圆弧使用 Canvas/SVG 的 arc() 绘制。
+export class CurveCircleRegion extends GeometricObject {
+    public readonly curve: Curve;
+    public readonly circle: Circle;
+    public readonly curvePoints: IPoint[];
+    public readonly arcStartAngle: number;
+    public readonly arcEndAngle: number;
+    public readonly counterclockwise: boolean;
+    public readonly side: CurveCircleRegionSide;
+
+    constructor(
+        name: string,
+        curve: Curve,
+        circle: Circle,
+        curvePoints: IPoint[],
+        arcStartAngle: number,
+        arcEndAngle: number,
+        counterclockwise: boolean,
+        side: CurveCircleRegionSide,
+    ) {
+        super(name, 'curve-circle-region');
+        this.curve = curve;
+        this.circle = circle;
+        this.curvePoints = curvePoints;
+        this.arcStartAngle = arcStartAngle;
+        this.arcEndAngle = arcEndAngle;
+        this.counterclockwise = counterclockwise;
+        this.side = side;
+    }
+
+    public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
+        if (this.curvePoints.length < 2) return;
+
+        const center = toScreenPoint(this.circle.center.x, this.circle.center.y, transform);
+        const radius = Math.abs(this.circle.radius * transform.scale);
+        const first = toScreenPoint(this.curvePoints[0].x, this.curvePoints[0].y, transform);
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(first.x, first.y);
+        for (let i = 1; i < this.curvePoints.length; i++) {
+            const point = toScreenPoint(this.curvePoints[i].x, this.curvePoints[i].y, transform);
+            ctx.lineTo(point.x, point.y);
+        }
+        ctx.arc(center.x, center.y, radius, this.arcStartAngle, this.arcEndAngle, this.counterclockwise);
+        ctx.closePath();
+
+        if (options?.fillColor) {
+            ctx.fillStyle = options.fillColor;
+            ctx.fill();
+        }
+
+        ctx.strokeStyle = options?.color || 'black';
+        ctx.lineWidth = (options?.lineWidth || 1) * (options?.highlight ? 2 : 1);
+        ctx.setLineDash(options?.dashed ? [5, 5] : []);
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    getDrawLabelPosition(transform: { scale: number; offsetX: number; offsetY: number }, _options: DrawLabelOptions, _textWidth: number, _textHeight: number): IPoint {
+        const middle = this.curvePoints[Math.floor(this.curvePoints.length / 2)];
+        return toScreenPoint(middle.x, middle.y, transform);
     }
 }
 

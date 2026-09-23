@@ -8,6 +8,10 @@ import { FaFileMedical, FaFolderPlus } from 'react-icons/fa';
 
 interface ScriptTreePanelProps {
   title: string;
+  files: FileNodeData[];
+  activeFileId: string | null;
+  onFilesChange: (files: FileNodeData[]) => void;
+  onSelectFile: (node: FileNodeData) => void;
 }
 
 // Context Menu State Type
@@ -18,18 +22,13 @@ interface ContextMenuState {
   node: FileNodeData | null;
 }
 
-const ScriptTreePanel: React.FC<ScriptTreePanelProps> = ({ title }) => {
-  const initialFiles: FileNodeData[] = [
-    {
-      id: '1', name: 'scripts', type: 'folder', children: [
-        { id: '2', name: 'create_geometry.geo', type: 'file', content: '#...' },
-      ]
-    },
-    { id: '4', name: 'README.md', type: 'file', content: '#...' },
-  ];
-
-  const [files, setFiles] = useState<FileNodeData[]>(initialFiles);
-  const [activeFile, setActiveFile] = useState<FileNodeData | null>(null);
+const ScriptTreePanel: React.FC<ScriptTreePanelProps> = ({
+  title,
+  files,
+  activeFileId,
+  onFilesChange,
+  onSelectFile,
+}) => {
   const [contextMenu, setContextMenu] = useState<ContextMenuState>({ visible: false, x: 0, y: 0, node: null });
 
   // --- 右键菜单相关逻辑 ---
@@ -56,12 +55,11 @@ const ScriptTreePanel: React.FC<ScriptTreePanelProps> = ({ title }) => {
 
   // 查找并删除节点
   const deleteNodeFromTree = (nodes: FileNodeData[], nodeId: string): FileNodeData[] => {
-    return nodes.filter(node => node.id !== nodeId).map(node => {
-      if (node.children) {
-        node.children = deleteNodeFromTree(node.children, nodeId);
-      }
-      return node;
-    });
+    return nodes
+      .filter(node => node.id !== nodeId)
+      .map(node => node.children
+        ? { ...node, children: deleteNodeFromTree(node.children, nodeId) }
+        : node);
   };
 
   // 查找并重命名节点
@@ -90,21 +88,6 @@ const ScriptTreePanel: React.FC<ScriptTreePanelProps> = ({ title }) => {
     });
   };
 
-  const handleAddNewFile = () => {
-    const newFileName = `new_script_${Math.floor(Math.random() * 100)}.geo`;
-    const newFile: FileNodeData = {
-      id: uuidv4(),
-      name: newFileName,
-      type: 'file',
-      content: `# ${newFileName}\n\n`,
-    };
-
-    // 将新文件添加到根目录
-    setFiles(prevFiles => [...prevFiles, newFile]);
-    // 自动选中新文件
-    setActiveFile(newFile);
-  };
-
   const createNewNode = (type: 'file' | 'folder', name: string): FileNodeData => ({
     id: uuidv4(),
     name,
@@ -117,57 +100,34 @@ const ScriptTreePanel: React.FC<ScriptTreePanelProps> = ({ title }) => {
     const fileName = window.prompt("Enter new file name:", "new_script.geo");
     if (!fileName) return;
     const newNode = createNewNode('file', fileName);
-    if (folderId) {
-      setFiles(prev => addNodeToFolderInTree(prev, folderId, newNode));
-    } else {
-      setFiles(prev => [...prev, newNode]);
-    }
+    const nextFiles = folderId
+      ? addNodeToFolderInTree(files, folderId, newNode)
+      : [...files, newNode];
+    onFilesChange(nextFiles);
+    onSelectFile(newNode);
   };
 
   const handleNewFolder = (folderId?: string) => {
     const folderName = window.prompt("Enter new folder name:", "new_folder");
     if (!folderName) return;
     const newNode = createNewNode('folder', folderName);
-    if (folderId) {
-      setFiles(prev => addNodeToFolderInTree(prev, folderId, newNode));
-    } else {
-      setFiles(prev => [...prev, newNode]);
-    }
+    const nextFiles = folderId
+      ? addNodeToFolderInTree(files, folderId, newNode)
+      : [...files, newNode];
+    onFilesChange(nextFiles);
   };
 
   const handleRename = (node: FileNodeData) => {
     const newName = window.prompt(`Enter new name for "${node.name}":`, node.name);
     if (newName && newName !== node.name) {
-      setFiles(prev => renameNodeInTree(prev, node.id, newName));
-      if (activeFile?.id === node.id) {
-        setActiveFile(prev => prev ? { ...prev, name: newName } : null);
-      }
+      onFilesChange(renameNodeInTree(files, node.id, newName));
     }
   };
 
   const handleDelete = (node: FileNodeData) => {
     if (window.confirm(`Are you sure you want to delete "${node.name}"?`)) {
-      setFiles(prev => deleteNodeFromTree(prev, node.id));
-      if (activeFile?.id === node.id) {
-        setActiveFile(null);
-      }
+      onFilesChange(deleteNodeFromTree(files, node.id));
     }
-  };
-
-  // --- 编辑器相关逻辑 (与之前版本类似) ---
-  const handleSelectFile = useCallback((node: FileNodeData) => {
-    if (node.type === 'file') setActiveFile(node);
-  }, []);
-
-  const handleScriptChange = useCallback((newScript: string) => {
-    if (!activeFile) return;
-    setActiveFile(prev => prev ? { ...prev, content: newScript } : null);
-    setFiles(prevFiles => renameNodeInTree(prevFiles, activeFile.id, activeFile.name).map(n =>
-      n.id === activeFile.id ? { ...n, content: newScript } : n)); // Simplified update for active file
-  }, [activeFile]);
-
-  const handleExecute = (script: string) => {
-    console.log("Executing script:", script);
   };
 
   return (
@@ -188,8 +148,8 @@ const ScriptTreePanel: React.FC<ScriptTreePanelProps> = ({ title }) => {
           <TreeNode
             key={node.id}
             node={node}
-            onSelectFile={handleSelectFile}
-            activeFileId={activeFile?.id || null}
+            onSelectFile={onSelectFile}
+            activeFileId={activeFileId}
             level={0}
             onContextMenu={handleContextMenu}
           />

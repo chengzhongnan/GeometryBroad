@@ -1,4 +1,4 @@
-import { GeometricObject, type IPoint, type DrawOptions, type DrawLabelOptions } from './base';
+import { GeometricObject, type IPoint, type DrawOptions, type DrawLabelOptions, toScreenPoint } from './base';
 import { Point, PointNativeObject } from './Point';
 import { Ray } from './LinearObject';
 
@@ -263,10 +263,7 @@ export class Angle extends GeometricObject {
             labelY += offsetY;
         }
         
-        // 应用变换
-        return {
-            x: labelX * transform.scale + transform.offsetX,
-            y: labelY * transform.scale + transform.offsetY
-        };
+        // 应用变换（逻辑坐标 -> 屏幕坐标）
+        return toScreenPoint(labelX, labelY, transform);
     }
 }

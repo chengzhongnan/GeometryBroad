@@ -1,4 +1,4 @@
-import { GeometricObject, type DrawLabelOptions, type DrawOptions, type IPoint } from './base';
+import { GeometricObject, type DrawLabelOptions, type DrawOptions, type IPoint, toScreenPoint } from './base';
 import { Point, PointNativeObject } from './Point';
 
 export class Curve extends GeometricObject {
@@ -18,6 +18,21 @@ export class Curve extends GeometricObject {
         }
     }
 
+    public get rangeStart(): number {
+        return this.xStart;
+    }
+
+    public get rangeEnd(): number {
+        return this.xEnd;
+    }
+
+    public get sampleStep(): number {
+        return this.stepSize;
+    }
+
+    public evaluate(x: number): number {
+        return this.lambda(x);
+    }
 
 
     public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
@@ -25,7 +40,7 @@ export class Curve extends GeometricObject {
         
         // Apply drawing options
         ctx.strokeStyle = options?.color || 'black';
-        ctx.lineWidth = options?.lineWidth || 1;
+        ctx.lineWidth = (options?.lineWidth || 1) * (options?.highlight ? 2 : 1);
         if (options?.dashed) {
             ctx.setLineDash([5, 5]);
         } else {
@@ -49,6 +64,7 @@ export class Curve extends GeometricObject {
     }
 
     getDrawLabelPosition(transform: { scale: number; offsetX: number; offsetY: number; }, options: DrawLabelOptions, textWidth: number, textHeight: number): IPoint {
-        return new PointNativeObject(this.xStart, this.lambda(this.xStart));
+        const start = new PointNativeObject(this.xStart, this.lambda(this.xStart));
+        return toScreenPoint(start.x, start.y, transform);
     }
 }

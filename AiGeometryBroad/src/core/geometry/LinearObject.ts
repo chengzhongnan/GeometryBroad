@@ -1,5 +1,53 @@
-import { GeometricObject, type DrawOptions, type DrawLabelOptions, type IPoint } from './base';
+import { GeometricObject, type DrawOptions, type DrawLabelOptions, type IPoint, type VisibleRect, toScreenPoint, resolveLineWidth } from './base';
 import { Point, PointNativeObject } from './Point';
+
+// 沿单位方向向量 (ux, uy) 从锚点出发，求直线/射线与可视矩形的相交区间。
+// 参数 t 以锚点为原点，单位为屏幕像素；tMin 是参数下界（直线传 -Infinity，射线传 0）。
+// 返回 null 表示该对象在可视区域内没有可见部分。
+function clipToRect(
+  anchorX: number,
+  anchorY: number,
+  ux: number,
+  uy: number,
+  rect: VisibleRect,
+  tMin: number
+): [number, number] | null {
+  let lower = tMin;
+  let upper = Infinity;
+
+  // x 方向：方向分量接近 0 时，锚点必须落在区间内才可能可见
+  if (Math.abs(ux) < 1e-12) {
+    if (anchorX < rect.x || anchorX > rect.x + rect.width) return null;
+  } else {
+    let t1 = (rect.x - anchorX) / ux;
+    let t2 = (rect.x + rect.width - anchorX) / ux;
+    if (t1 > t2) {
+      const swap = t1;
+      t1 = t2;
+      t2 = swap;
+    }
+    lower = Math.max(lower, t1);
+    upper = Math.min(upper, t2);
+  }
+
+  // y 方向
+  if (Math.abs(uy) < 1e-12) {
+    if (anchorY < rect.y || anchorY > rect.y + rect.height) return null;
+  } else {
+    let t1 = (rect.y - anchorY) / uy;
+    let t2 = (rect.y + rect.height - anchorY) / uy;
+    if (t1 > t2) {
+      const swap = t1;
+      t1 = t2;
+      t2 = swap;
+    }
+    lower = Math.max(lower, t1);
+    upper = Math.min(upper, t2);
+  }
+
+  if (!(upper > lower)) return null;
+  return [lower, upper];
+}
 
 export class LinearNativeObject {
   constructor(p1: PointNativeObject, p2: PointNativeObject) {
@@ -87,11 +135,64 @@ export abstract class LinearObject extends GeometricObject {
       }
     }
 
-    // 应用变换
-    return {
-      x: labelX * transform.scale + transform.offsetX,
-      y: labelY * transform.scale + transform.offsetY
-    };
+    // 应用变换（逻辑坐标 -> 屏幕坐标）
+    return toScreenPoint(labelX, labelY, transform);
+  }
+
+  // 统一的描边样式设置
+  protected applyStrokeStyle(ctx: CanvasRenderingContext2D, transform: { scale: number }, options?: DrawOptions): void {
+    ctx.strokeStyle = options?.color || 'black';
+    ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform.scale) * (options?.highlight ? 2 : 1);
+    if (options?.dashed) {
+      ctx.setLineDash([5, 5]);
+    } else {
+      ctx.setLineDash([]);
+    }
+  }
+
+  /**
+   * 计算线性对象本次实际要绘制的区间。
+   *
+   * 返回值是沿单位方向 (ux, uy)、以锚点 (anchorX, anchorY) 为原点的参数区间 [t0, t1]，
+   * 单位为屏幕像素；返回 null 表示该对象在可视区域内没有可见部分。
+   *
+   * - 指定了 length（逻辑单位）：forwardOnly 为 false 时以锚点为中心向两端各延伸一半（直线），
+   *   为 true 时从锚点向前延伸（射线）。
+   * - 未指定 length：只延伸到可视区域的边缘就停住，不再往外，
+   *   避免无限长的线把导出 SVG 的画布撑得非常大、几何图形显得很小。
+   */
+  protected resolveDrawExtent(
+    ctx: CanvasRenderingContext2D,
+    transform: { scale: number; offsetX: number; offsetY: number },
+    options: DrawOptions | undefined,
+    anchorX: number,
+    anchorY: number,
+    ux: number,
+    uy: number,
+    tMin: number,
+    forwardOnly: boolean
+  ): [number, number] | null {
+    const specified = options?.length;
+    const total = typeof specified === 'number' && Number.isFinite(specified)
+      ? specified * Math.abs(transform.scale)
+      : 0;
+
+    if (total > 0) {
+      if (forwardOnly) {
+        // 射线：从顶点开始向前画 total
+        return [tMin, tMin + total];
+      }
+      // 直线：以锚点为中心，向两端各延伸一半
+      const half = total / 2;
+      return [-half, half];
+    }
+
+    const rect = options?.visibleRect;
+    const visible: VisibleRect = rect && rect.width > 0 && rect.height > 0
+      ? rect
+      : { x: 0, y: 0, width: ctx.canvas.width, height: ctx.canvas.height };
+
+    return clipToRect(anchorX, anchorY, ux, uy, visible, tMin);
   }
 
   // 直线绕着 p1 点旋转指定角度
@@ -322,73 +423,37 @@ export class Line extends LinearObject {
   public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
     ctx.save();
     ctx.beginPath();
+    this.applyStrokeStyle(ctx, transform, options);
 
-    const { scale, offsetX, offsetY } = transform;
+    const start = toScreenPoint(this.p1.x, this.p1.y, transform);
+    const through = toScreenPoint(this.p2.x, this.p2.y, transform);
 
-    // Apply options
-    ctx.strokeStyle = options?.color || 'black';
-    ctx.lineWidth = options?.lineWidth || 1;
-    if (options?.dashed) {
-      ctx.setLineDash([5, 5]);
-    } else {
-      ctx.setLineDash([]);
+    const dx = through.x - start.x;
+    const dy = through.y - start.y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+
+    if (distance < 1e-9) {
+      // 两个定义点重合，方向无法确定，不绘制
+      ctx.restore();
+      return;
     }
 
-    // Transform points
-    const transformedP1 = this.p1.transform(scale, offsetX, offsetY);
-    const transformedP2 = this.p2.transform(scale, offsetX, offsetY);
+    const ux = dx / distance;
+    const uy = dy / distance;
 
-    // Calculate direction vector
-    const dx = transformedP2.x - transformedP1.x;
-    const dy = transformedP2.y - transformedP1.y;
+    // 基准点取两个定义点的中点：指定长度时向两端各延伸一半
+    const anchorX = (start.x + through.x) / 2;
+    const anchorY = (start.y + through.y) / 2;
 
-    // Handle vertical line case
-    if (Math.abs(dx) < 1e-6) { // Effectively vertical
-      ctx.moveTo(transformedP1.x, 0);
-      ctx.lineTo(transformedP1.x, ctx.canvas.height);
-    } else {
-      // Calculate points far outside the canvas
-      const slope = dy / dx;
-      const intercept = transformedP1.y - slope * transformedP1.x;
-
-      // Points at canvas edges
-      const x1 = 0;
-      const y1 = slope * x1 + intercept;
-      const x2 = ctx.canvas.width;
-      const y2 = slope * x2 + intercept;
-
-      const y3 = 0;
-      const x3 = (y3 - intercept) / slope;
-      const y4 = ctx.canvas.height;
-      const x4 = (y4 - intercept) / slope;
-
-      const points = [
-        { x: x1, y: y1 },
-        { x: x2, y: y2 },
-        { x: x3, y: y3 },
-        { x: x4, y: y4 }
-      ].filter(p => p.x >= -10000 && p.x <= ctx.canvas.width + 10000 && p.y >= -10000 && p.y <= ctx.canvas.height + 10000); // Filter out extreme points
-
-      // Sort points by x-coordinate to ensure correct drawing order
-      points.sort((a, b) => a.x - b.x);
-
-      if (points.length >= 2) {
-        ctx.moveTo(points[0].x, 0 - points[0].y);
-        ctx.lineTo(points[points.length - 1].x, 0 - points[points.length - 1].y);
-      } else {
-        // Fallback for very short lines or lines that don't cross canvas edges
-        // Extend a fixed large distance
-        const length = 10000; // A large arbitrary length
-        const angle = Math.atan2(dy, dx);
-        const extP1X = transformedP1.x - length * Math.cos(angle);
-        const extP1Y = transformedP1.y - length * Math.sin(angle);
-        const extP2X = transformedP1.x + length * Math.cos(angle);
-        const extP2Y = transformedP1.y + length * Math.sin(angle);
-
-        ctx.moveTo(extP1X, 0 - extP1Y);
-        ctx.lineTo(extP2X, 0 - extP2Y);
-      }
+    // 直线向两端延伸，参数下界为 -Infinity
+    const extent = this.resolveDrawExtent(ctx, transform, options, anchorX, anchorY, ux, uy, -Infinity, false);
+    if (!extent) {
+      ctx.restore();
+      return;
     }
+
+    ctx.moveTo(anchorX + ux * extent[0], anchorY + uy * extent[0]);
+    ctx.lineTo(anchorX + ux * extent[1], anchorY + uy * extent[1]);
 
     ctx.stroke();
     ctx.restore();
@@ -410,23 +475,13 @@ export class Segment extends LinearObject {
     ctx.save();
     ctx.beginPath();
 
-    const { scale, offsetX, offsetY } = transform;
+    this.applyStrokeStyle(ctx, transform, options);
 
-    // Apply options
-    ctx.strokeStyle = options?.color || 'black';
-    ctx.lineWidth = options?.lineWidth || 1;
-    if (options?.dashed) {
-      ctx.setLineDash([5, 5]);
-    } else {
-      ctx.setLineDash([]);
-    }
+    const start = toScreenPoint(this.p1.x, this.p1.y, transform);
+    const through = toScreenPoint(this.p2.x, this.p2.y, transform);
 
-    // Transform points
-    const transformedP1 = this.p1.transform(scale, offsetX, offsetY);
-    const transformedP2 = this.p2.transform(scale, offsetX, offsetY);
-
-    ctx.moveTo(transformedP1.x, 0 - transformedP1.y);
-    ctx.lineTo(transformedP2.x, 0 - transformedP2.y);
+    ctx.moveTo(start.x, start.y);
+    ctx.lineTo(through.x, through.y);
 
     ctx.stroke();
     ctx.restore();
@@ -464,34 +519,33 @@ export class Ray extends LinearObject {
     ctx.save();
     ctx.beginPath();
 
-    const { scale, offsetX, offsetY } = transform;
+    this.applyStrokeStyle(ctx, transform, options);
 
-    // Apply options
-    ctx.strokeStyle = options?.color || 'black';
-    ctx.lineWidth = options?.lineWidth || 1;
-    if (options?.dashed) {
-      ctx.setLineDash([5, 5]);
-    } else {
-      ctx.setLineDash([]);
+    const start = toScreenPoint(this.p1.x, this.p1.y, transform);
+    const through = toScreenPoint(this.p2.x, this.p2.y, transform);
+
+    const dx = through.x - start.x;
+    const dy = through.y - start.y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+
+    if (distance < 1e-9) {
+      // 顶点与方向点重合，方向无法确定，不绘制
+      ctx.restore();
+      return;
     }
 
-    // Transform points
-    const transformedStart = this.p1.transform(scale, offsetX, offsetY);
-    const transformedThrough = this.p2.transform(scale, offsetX, offsetY);
+    const ux = dx / distance;
+    const uy = dy / distance;
 
-    // Calculate direction vector
-    const dx = transformedThrough.x - transformedStart.x;
-    const dy = transformedThrough.y - transformedStart.y;
+    // 射线只从顶点向前延伸，参数下界为 0
+    const extent = this.resolveDrawExtent(ctx, transform, options, start.x, start.y, ux, uy, 0, true);
+    if (!extent) {
+      ctx.restore();
+      return;
+    }
 
-    // Extend the ray far beyond the canvas
-    const length = 10000; // A large arbitrary length
-    const angle = Math.atan2(dy, dx);
-
-    const endX = transformedStart.x + length * Math.cos(angle);
-    const endY = transformedStart.y + length * Math.sin(angle);
-
-    ctx.moveTo(transformedStart.x, 0 - transformedStart.y);
-    ctx.lineTo(endX, 0 - endY);
+    ctx.moveTo(start.x + ux * extent[0], start.y + uy * extent[0]);
+    ctx.lineTo(start.x + ux * extent[1], start.y + uy * extent[1]);
 
     ctx.stroke();
     ctx.restore();

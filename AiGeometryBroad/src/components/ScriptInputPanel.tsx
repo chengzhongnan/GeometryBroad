@@ -5,6 +5,8 @@ import Editor, { type Monaco } from '@monaco-editor/react'; // 👈 1. 引入 Mo
 interface ScriptInputPanelProps {
   title: string;
   onExecute: (script: string) => void;
+  onSave: () => void;
+  saveStatus?: string;
   script: string;
   onScriptChange: (newScript: string) => void;
 }
@@ -25,7 +27,7 @@ function setupGeoScriptLanguage(monaco: Monaco) {
   // 第二步: 定义 Monarch 词法规则
   monaco.languages.setMonarchTokensProvider(LANGUAGE_ID, {
     ignoreCase: true,
-    keywords:  ['CLEAR', 'SET', 'HELP', 'VIEW', 'TRANSLATE', 'DRAW', 'MEASURE', 'RUN', 'CODE', 'WITH', 'CALCULATE', 'GETOBJ', 'PRINT', 'CREATE'],
+    keywords:  ['CLEAR', 'SET', 'HELP', 'VIEW', 'TRANSLATE', 'DRAW', 'TEXT', 'MEASURE', 'RUN', 'CODE', 'WITH', 'CALCULATE', 'GETOBJ', 'PRINT', 'CREATE'],
     typeKeywords: [
       'POINT', 'LINE', 'SEGMENT', 'RAY', 'MIDPOINT', 'PERPENDICULAR_FOOT', 'REFLECTED_POINT', 'ROTATED_POINT',
       'INTERSECT', 'POINT_ON_LINE', 'PERP_BISECTOR', 'PERPENDICULAR', 'PARALLEL', 'ANGLE_BISECTOR', 'CIRCUMCIRCLE',
@@ -91,7 +93,7 @@ function setupGeoScriptLanguage(monaco: Monaco) {
 
 const initialScript = ``;
 
-const ScriptInputPanel: React.FC<ScriptInputPanelProps> = ({ script, onScriptChange, onExecute }) => {
+const ScriptInputPanel: React.FC<ScriptInputPanelProps> = ({ script, onScriptChange, onExecute, onSave, saveStatus }) => {
   
   // 4. 使用 onMount 回调来设置语言和主题
   function handleEditorWillMount(monaco: Monaco) {
@@ -136,9 +138,10 @@ const ScriptInputPanel: React.FC<ScriptInputPanelProps> = ({ script, onScriptCha
         <ExecuteButton onClick={handleExecuteClick}>
           Execute Script
         </ExecuteButton>
-        <SaveScriptButton>
+        <SaveScriptButton onClick={onSave}>
           Save Script
         </SaveScriptButton>
+        {saveStatus && <SaveStatus role="status">{saveStatus}</SaveStatus>}
       </ButtonWrapper>
     </>
   );
@@ -180,6 +183,13 @@ const ExecuteButton = styled.button`
   &:hover {
     background-color: #5849be;
   }
+`;
+
+const SaveStatus = styled.span`
+  align-self: center;
+  color: #5f6b7a;
+  font-size: 0.85rem;
+  white-space: nowrap;
 `;
 
 const SaveScriptButton = styled.button`

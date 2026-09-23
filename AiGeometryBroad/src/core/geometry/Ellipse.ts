@@ -1,4 +1,4 @@
-import { GeometricObject, type DrawOptions, type DrawLabelOptions, type IPoint } from './base';
+import { GeometricObject, type DrawOptions, type DrawLabelOptions, type IPoint, toScreenPoint, resolveLineWidth } from './base';
 import { Point, PointNativeObject } from './Point';
 import { LinearNativeObject } from './LinearObject';
 
@@ -34,7 +34,7 @@ export class Ellipse extends GeometricObject {
     }
 
     ctx.strokeStyle = options?.color || 'black';
-    ctx.lineWidth = options?.lineWidth || 1;
+    ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform.scale) * (options?.highlight ? 2 : 1);
 
     if (options?.dashed) {
       ctx.setLineDash([5, 5]);
@@ -271,10 +271,7 @@ export class Ellipse extends GeometricObject {
       labelY += Math.sin(defaultAngle) * offsetDistance;
     }
 
-    // 应用变换
-    return {
-      x: labelX * transform.scale + transform.offsetX,
-      y: labelY * transform.scale + transform.offsetY
-    };
+    // 应用变换（逻辑坐标 -> 屏幕坐标）
+    return toScreenPoint(labelX, labelY, transform);
   }
 }

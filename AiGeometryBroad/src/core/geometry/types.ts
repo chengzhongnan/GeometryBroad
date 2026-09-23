@@ -2,7 +2,7 @@
 import { Point, PointNativeObject } from './Point';
 import { Circle } from './Circle';
 import { Ellipse } from './Ellipse';
-import { Polygon, Triangle, Rectangle } from './Polygon';
+import { Polygon, Region, CircularRegion, CurveCircleRegion, Triangle, Rectangle } from './Polygon';
 import { Line, Segment, Ray, LinearNativeObject } from './LinearObject';
 import { Angle } from './Angle';
 import { GeometricObject, type DrawOptions, type IPoint } from './base';
@@ -18,6 +18,9 @@ export {
     Circle,
     Ellipse,
     Polygon,
+    Region,
+    CircularRegion,
+    CurveCircleRegion,
     Line,
     Segment,
     Ray,

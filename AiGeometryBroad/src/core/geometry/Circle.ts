@@ -1,4 +1,4 @@
-import { GeometricObject, type DrawLabelOptions, type DrawOptions, type IPoint } from './base';
+import { GeometricObject, type DrawLabelOptions, type DrawOptions, type IPoint, toScreenPoint, resolveLineWidth } from './base';
 import { Point, PointNativeObject } from './Point';
 import { LinearObject, Segment } from './LinearObject';
 
@@ -405,11 +405,8 @@ export class Circle extends GeometricObject {
             labelY += Math.sin(defaultAngle) * offsetDistance;
         }
 
-        // 应用变换
-        return {
-            x: labelX * transform.scale + transform.offsetX,
-            y: labelY * transform.scale + transform.offsetY
-        };
+        // 应用变换（逻辑坐标 -> 屏幕坐标）
+        return toScreenPoint(labelX, labelY, transform);
     }
 
     public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
@@ -428,7 +425,7 @@ export class Circle extends GeometricObject {
         }
 
         ctx.strokeStyle = options?.color || 'black';
-        ctx.lineWidth = options?.lineWidth || 1;
+        ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform.scale) * (options?.highlight ? 2 : 1);
 
         if (options?.dashed) {
             ctx.setLineDash([5, 5]);

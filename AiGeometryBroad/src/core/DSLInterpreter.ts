@@ -7,6 +7,9 @@ import {
     Circle,
     Ellipse,
     Polygon,
+    Region,
+    CircularRegion,
+    CurveCircleRegion,
     Line,
     Segment,
     Ray,
@@ -20,8 +23,16 @@ import {
     Curve
 } from './geometry/types';
 
+import { toScreenPoint } from './geometry/base';
 import { calculate } from './expression';
 import { getHelpMessages } from './HelpCommand';
+import { splitLatexParts, latexRegionMask } from './latexSplit';
+import {
+    getCachedKatexCanvas,
+    measureKatex,
+    prefetchKatexToCanvas,
+    renderKatexToSvgFragment,
+} from './katexRender';
 import type { CustomFunction } from './geometry/types';
 
 interface AnimationState {
@@ -30,6 +41,7 @@ interface AnimationState {
     slot: string;   // 动画槽位名称，动画的当前帧在这个槽位中
     currentFrame: number; // 当前帧索引
     interval: number; // 帧间隔时间（毫秒）
+    period?: number; // 可选的完整周期帧数（period 参数）
     isRunning: boolean; // 是否正在运行
     isRepeat: boolean; // 是否循环播放
     animationTimer: number; // 计时器
@@ -37,6 +49,18 @@ interface AnimationState {
 
 type onMessageCallback = (level: string, line: number, message: string) => void;
 type canvasRedrawNotify = (canvas: HTMLCanvasElement) => void;
+
+export interface VariableInfo {
+    name: string;
+    expression: string;
+    value: number | string | boolean;
+    kind: 'fixed' | 'random' | 'object';
+    frozen: boolean;
+    objectType?: string;
+    randomObject?: boolean;
+    randomSource?: string;
+    details?: Record<string, string>;
+}
 
 // DSL解释器的主要状态
 interface InterpreterState {
@@ -70,8 +94,27 @@ interface InterpreterState {
         drawLabelForPoints: boolean;
         drawLabelForOthers: boolean;
         drawAfterCreate: boolean;
+        // 直线/射线的绘制长度（逻辑单位）。null 表示未指定，
+        // 此时只延伸到可视区域边缘，避免无限长的线把导出 SVG 撑得非常大。
+        lineLength: number | null;
     },
     onMessage?: onMessageCallback; // 消息回调函数
+    contextPreTransformed: boolean; // 渲染上下文是否已自带视图变换
+    // 额外的渲染变换：Canvas 由 ctx.setTransform 提供，SVG 导出由这里直接应用
+    renderScale: number;
+    renderOffsetX: number;
+    renderOffsetY: number;
+    animationAutoStart: boolean; // 是否自动启动动画计时器
+    variableInfo: Map<string, VariableInfo>; // 用户可见的变量信息
+    frozenRandomValues: Map<string, number>; // 固定后的随机变量值
+    frozenRandomObjects: Map<string, { x: number; y: number }>; // 固定后的随机对象坐标
+    randomObjectSources: Map<string, string>; // 随机对象的创建来源
+    selectedObjectName?: string; // 当前主选中对象（兼容旧接口）
+    selectedObjectNames: Set<string>; // 当前多选对象
+    selectedLabelId?: string; // 当前选中标签
+    labelPositions: Map<string, IPoint>; // 用户拖动后的标签逻辑坐标
+    labelHitRegions: LabelHitRegion[];
+    renderedObjectNames: string[];
 }
 
 // 解析后的指令接口
@@ -82,6 +125,23 @@ interface ParsedCommand {
     rawCommand: string;
     lineNumber: number; // 原始行内容
 }
+
+interface LabelHitRegion {
+    id: string;
+    objectName: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    position: IPoint;
+}
+
+export type CanvasSelection =
+    | { kind: 'object'; name: string }
+    | { kind: 'label'; id: string; objectName: string; position: IPoint; screenAnchor: IPoint }
+    | null;
+
+const SELECTED_OBJECT_COLOR = '#e11d48';
 
 // 几何作图DSL解释器
 export class GeometryDSLInterpreter {
@@ -120,8 +180,25 @@ export class GeometryDSLInterpreter {
                 drawLabelForPoints: true,
                 drawLabelForOthers: false,
                 drawAfterCreate: false,
+                lineLength: null,
             },
             onMessage: onMessage,
+            // Canvas 路径默认认为上下文已带变换，保持既有行为
+            contextPreTransformed: true,
+            renderScale: 1,
+            renderOffsetX: 0,
+            renderOffsetY: 0,
+            animationAutoStart: true,
+            variableInfo: new Map(),
+            frozenRandomValues: new Map(),
+            frozenRandomObjects: new Map(),
+            randomObjectSources: new Map(),
+            selectedObjectName: undefined,
+            selectedObjectNames: new Set(),
+            selectedLabelId: undefined,
+            labelPositions: new Map(),
+            labelHitRegions: [],
+            renderedObjectNames: [],
         };
     }
 
@@ -209,8 +286,11 @@ export class GeometryDSLInterpreter {
         this.state.objects.clear();
         this.state.slots.clear();
         this.state.functions.clear();
+        this.state.variableInfo.clear();
+        this.state.labelHitRegions = [];
+        this.state.renderedObjectNames = [];
 
-        const lines = script.split('\n');
+        const lines = joinMultilineText(script).split('\n');
         this.executeLines(lines, true);
     }
 
@@ -226,8 +306,193 @@ export class GeometryDSLInterpreter {
         this.state.defaultOptions.height = canvas.height / transform.scale;
     }
 
+    // 设置视图中心的逻辑坐标（供 SVG 导出等非交互渲染使用）
+    public setViewCenter(centerX: number, centerY: number): void {
+        this.state.defaultOptions.centerX = centerX;
+        this.state.defaultOptions.centerY = centerY;
+    }
+
+    // 声明渲染上下文是否已自带视图变换。
+    // - Canvas 路径：上下文已经 setTransform(scale/平移)，标签坐标必须传给内部换算后再交给 canvas 二次变换。
+    // - SVG 导出路径：上下文没有预置变换，标签坐标必须自己完成完整换算。
+    // 不设置这个开关，两条路径至少有一条会出现标签错位。
+    public setContextPreTransformed(preTransformed: boolean): void {
+        this.state.contextPreTransformed = preTransformed;
+    }
+
+    // 设置 SVG 等无预置 Canvas 变换场景的额外渲染变换。
+    // Canvas 模式保持默认值（1, 0, 0），由 ctx.setTransform 提供缩放和平移。
+    public setRenderTransform(transform: { scale: number; offsetX: number; offsetY: number }): void {
+        const scale = Number.isFinite(transform.scale) && Math.abs(transform.scale) > this.zeroThresholdValue
+            ? transform.scale
+            : 1;
+        this.state.renderScale = scale;
+        this.state.renderOffsetX = Number.isFinite(transform.offsetX) ? transform.offsetX : 0;
+        this.state.renderOffsetY = Number.isFinite(transform.offsetY) ? transform.offsetY : 0;
+
+        // 外部变换由解释器直接应用时，绘制坐标已经是 SVG/屏幕坐标；
+        // 可视区域和 CLEAR 背景都应覆盖完整的虚拟画布。
+        if (this.state.ctx && !this.state.contextPreTransformed) {
+            this.state.defaultOptions.canvasX = 0;
+            this.state.defaultOptions.canvasY = 0;
+            this.state.defaultOptions.width = this.state.canvas?.width || this.state.defaultOptions.width;
+            this.state.defaultOptions.height = this.state.canvas?.height || this.state.defaultOptions.height;
+        }
+    }
+
+    public setSelectedObjectName(name: string | null): void {
+        this.state.selectedObjectName = name || undefined;
+        this.state.selectedObjectNames = name ? new Set([name]) : new Set();
+    }
+
+    public setSelectedObjectNames(names: string[]): void {
+        this.state.selectedObjectNames = new Set(names.filter(Boolean));
+        this.state.selectedObjectName = names[names.length - 1] || undefined;
+    }
+
+    public setSelectedLabelId(id: string | null): void {
+        this.state.selectedLabelId = id || undefined;
+    }
+
+    public setLabelPositions(positions: Record<string, IPoint>): void {
+        this.state.labelPositions = new Map(
+            Object.entries(positions).map(([id, position]) => [id, { x: position.x, y: position.y }]),
+        );
+    }
+
+    // 导出等离线场景可以关闭自动计时器，再通过 stepAnimation 逐帧采样
+    public setAnimationAutoStart(autoStart: boolean): void {
+        this.state.animationAutoStart = autoStart;
+    }
+
+    public setFrozenRandomVariables(values: Record<string, number>): void {
+        this.state.frozenRandomValues = new Map(Object.entries(values));
+    }
+
+    public setFrozenRandomObjects(values: Record<string, { x: number; y: number }>): void {
+        this.state.frozenRandomObjects = new Map(Object.entries(values));
+    }
+
+    public getVariables(): VariableInfo[] {
+        const variables = Array.from(this.state.variableInfo.values()).map(variable => ({ ...variable }));
+        const objects = Array.from(this.state.objects.values()).map(object => {
+            const frozen = this.state.frozenRandomObjects.has(object.name);
+            const randomSource = this.state.randomObjectSources.get(object.name);
+            return {
+                name: object.name,
+                expression: randomSource || object.type,
+                value: object.type,
+                kind: 'object' as const,
+                frozen,
+                objectType: object.type,
+                randomObject: Boolean(randomSource),
+                randomSource,
+                details: this.getObjectDetails(object),
+            };
+        });
+        return [...variables, ...objects];
+    }
+
+    public setRandomObjectFrozen(name: string, frozen: boolean): void {
+        const object = this.state.objects.get(name);
+        const source = this.state.randomObjectSources.get(name);
+        if (!object || !source || object.type !== 'point') return;
+
+        const point = object as Point;
+        if (frozen) {
+            this.state.frozenRandomObjects.set(name, { x: point.x, y: point.y });
+        } else {
+            this.state.frozenRandomObjects.delete(name);
+        }
+    }
+
+    public getFrozenRandomObjects(): Record<string, { x: number; y: number }> {
+        return Object.fromEntries(this.state.frozenRandomObjects.entries());
+    }
+
+    private getObjectDetails(object: GeometricObject): Record<string, string> {
+        const details: Record<string, string> = { type: object.type };
+        const candidate = object as any;
+        const format = (value: number): string => Number(value.toFixed(6)).toString();
+        const pointDetails = (prefix: string, point: { x: number; y: number } | undefined) => {
+            if (point) {
+                details[`${prefix}.x`] = format(point.x);
+                details[`${prefix}.y`] = format(point.y);
+            }
+        };
+
+        if (typeof candidate.x === 'number' && typeof candidate.y === 'number') {
+            pointDetails('position', candidate);
+            if (typeof candidate.radius === 'number') details.radius = format(candidate.radius);
+            if (typeof candidate.real === 'boolean') details.real = String(candidate.real);
+        }
+        if (candidate.center) pointDetails('center', candidate.center);
+        if (typeof candidate.radius === 'number') details.radius = format(candidate.radius);
+        if (typeof candidate.rx === 'number') details.radiusX = format(candidate.rx);
+        if (typeof candidate.ry === 'number') details.radiusY = format(candidate.ry);
+        if (typeof candidate.rotation === 'number') details.rotation = format(candidate.rotation);
+        if (candidate.p1) pointDetails('p1', candidate.p1);
+        if (candidate.p2) pointDetails('p2', candidate.p2);
+        if (candidate.vertex) pointDetails('vertex', candidate.vertex);
+        if (candidate.vertices && Array.isArray(candidate.vertices)) {
+            details.vertices = String(candidate.vertices.length);
+        }
+        if (typeof candidate.width === 'number') details.width = format(candidate.width);
+        if (typeof candidate.height === 'number') details.height = format(candidate.height);
+        return details;
+    }
+
+    public setRandomVariableFrozen(name: string, frozen: boolean): void {
+        const variable = this.state.variableInfo.get(name);
+        if (!variable || variable.kind !== 'random') return;
+
+        if (frozen) {
+            this.state.frozenRandomValues.set(name, Number(variable.value));
+        } else {
+            this.state.frozenRandomValues.delete(name);
+        }
+        variable.frozen = frozen;
+    }
+
+    public getFrozenRandomVariables(): Record<string, number> {
+        return Object.fromEntries(this.state.frozenRandomValues.entries());
+    }
+
+    public setRenderTarget(canvas: HTMLCanvasElement, context: CanvasRenderingContext2D): void {
+        this.state.canvas = canvas;
+        this.state.ctx = context;
+        this.state.defaultOptions.width = canvas.width;
+        this.state.defaultOptions.height = canvas.height;
+    }
+
+    public getAnimationDefinitions(): Array<{
+        name: string;
+        code: string;
+        slot: string;
+        interval: number;
+        isRepeat: boolean;
+        period?: number;
+    }> {
+        return Array.from(this.state.animations.values()).map(animation => ({
+            name: animation.name,
+            code: animation.code,
+            slot: animation.slot,
+            interval: animation.interval,
+            isRepeat: animation.isRepeat,
+            period: animation.period,
+        }));
+    }
+
+    public stepAnimation(name: string): void {
+        const animation = this.state.animations.get(name);
+        if (!animation) {
+            throw new Error(`Animation ${name} not found`);
+        }
+        this.runAnimationCode(animation);
+    }
+
     private isMetaCommand(cmd: string, includeCreate: boolean = false): boolean {
-        const metaCommands = ['CLEAR', 'SET', 'HELP', 'VIEW', 'TRANSLATE', 'DRAW', 'MEASURE', 'RUN', 'CODE', 'WITH', 'CALCULATE', 'GETOBJ', 'PRINT', 'MESSAGE'];
+        const metaCommands = ['CLEAR', 'SET', 'HELP', 'VIEW', 'TRANSLATE', 'DRAW', 'TEXT', 'FILL', 'MEASURE', 'RUN', 'CODE', 'WITH', 'CALCULATE', 'GETOBJ', 'PRINT', 'MESSAGE'];
         if (includeCreate) {
             metaCommands.push('CREATE');
         }
@@ -292,29 +557,89 @@ export class GeometryDSLInterpreter {
         }
     }
 
-    // 解析参数字符串为键值对
-    private parseParameters(paramString: string): Map<string, string> {
-        const params = new Map<string, string>();
+    // 解析参数字符串为键值对。
+//
+// 这里用手写扫描而不是正则：值里面允许出现 `=`，例如 LaTeX
+// `text="$y=ax^2+bx+c$"`。原来的正则 `(\w+)=([^=\s]+...)` 会把值里的
+// `y=` 当成下一个参数的键，导致真正的 `y=3` 被覆盖成 `ax^2+bx+c$"`，
+// 于是 TEXT 就会报 "requires x and y parameters"。
+private parseParameters(paramString: string): Map<string, string> {
+    const params = new Map<string, string>();
+    let i = 0;
+    const n = paramString.length;
 
-        // 匹配 key=value 格式的参数
-        const paramRegex = /(\w+)=([^=\s]+(?:\s+[^=\s]+)*?)(?=\s+\w+=|$)/g;
-        let match;
+    while (i < n) {
+        // 跳过空白
+        while (i < n && /\s/.test(paramString[i])) i++;
+        if (i >= n) break;
 
-        while ((match = paramRegex.exec(paramString)) !== null) {
-            const key = match[1];
-            let value = match[2].trim();
+        // 读 key：\w+
+        const keyStart = i;
+        while (i < n && /\w/.test(paramString[i])) i++;
+        const key = paramString.slice(keyStart, i);
 
-            // 处理引号包围的值
-            if ((value.startsWith('"') && value.endsWith('"')) ||
-                (value.startsWith("'") && value.endsWith("'"))) {
-                value = value.slice(1, -1);
+        // key 后必须紧跟 `=`，否则整段跳过（并保证至少前进一格）
+        if (key.length === 0 || i >= n || paramString[i] !== '=') {
+            if (i < n && paramString[i] === '=') {
+                i++;
+            } else {
+                while (i < n && !/\s/.test(paramString[i]) && paramString[i] !== '=') i++;
             }
+            continue;
+        }
+        i++; // 吃掉 '='
 
-            params.set(key, value);
+        const quoteChar = paramString[i];
+        if (quoteChar === '"' || quoteChar === "'") {
+            // 引号包围的值：读到配对的闭合引号为止，
+            // 内部的空格和 `=` 都属于值本身。
+            i++;
+            const valueStart = i;
+            while (i < n && paramString[i] !== quoteChar) {
+                if (paramString[i] === '\\' && i + 1 < n) i++; // 跳过被转义的字符
+                i++;
+            }
+            params.set(key, paramString.slice(valueStart, i));
+            if (i < n) i++; // 吃掉闭合引号
+            continue;
         }
 
-        return params;
+        // 无引号的值：值本身可以含 `=`，结束位置是
+        // "空白 + 下一个 key=" 的地方，否则一直到字符串末尾。
+        const afterEq = i;
+        const hadLeadingSpace = i < n && /\s/.test(paramString[i]);
+        while (i < n && /\s/.test(paramString[i])) i++;
+
+        // `key= another=1` 这种空值情况：回退，让下一轮把后面识别成真正的参数。
+        // 只有 `=` 后确实紧跟空白时才成立，否则 `label=a=b` 会被误判。
+        if (hadLeadingSpace) {
+            let probe = i;
+            while (probe < n && /\w/.test(paramString[probe])) probe++;
+            if (probe > i && probe < n && paramString[probe] === '=') {
+                i = afterEq;
+                continue;
+            }
+        }
+
+        const valueStart = i;
+        let end = n;
+        for (let j = i; j < n; j++) {
+            if (!/\s/.test(paramString[j])) continue;
+            let k = j;
+            while (k < n && /\s/.test(paramString[k])) k++;
+            let m = k;
+            while (m < n && /\w/.test(paramString[m])) m++;
+            if (m > k && m < n && paramString[m] === '=') {
+                end = j;
+                break;
+            }
+        }
+        params.set(key, paramString.slice(valueStart, end).trim());
+        i = end;
     }
+
+    return params;
+}
 
     // 执行解析后的指令
     private executeCommand(command: ParsedCommand): void {
@@ -342,6 +667,12 @@ export class GeometryDSLInterpreter {
                 break;
             case 'DRAW':
                 this.executeDraw(params);
+                break;
+            case 'TEXT':
+                this.executeText(params, rawCommand, lineNumber);
+                break;
+            case 'FILL':
+                this.executeFill(params);
                 break;
             case 'MEASURE':
                 this.executeMeasure(params);
@@ -429,6 +760,9 @@ export class GeometryDSLInterpreter {
                 break;
             case 'POLYGON':
                 this.createPolygon(params);
+                break;
+            case 'REGION':
+                this.createRegion(params);
                 break;
             case 'TRIANGLE':
                 this.createTriangle(params);
@@ -555,6 +889,10 @@ export class GeometryDSLInterpreter {
                 case 'drawaftercreate':
                     this.state.defaultOptions.drawAfterCreate = GeometryDSLInterpreter.parseBoolean(value);
                     break;
+                case 'linelength':
+                case 'linelen':
+                    this.state.defaultOptions.lineLength = this.parseLineLength(params, value);
+                    break;
                 case 'geocolor':
                     this.state.defaultOptions.geoColor = value;
                     break;
@@ -583,6 +921,28 @@ export class GeometryDSLInterpreter {
 
         // 可选：向用户反馈设置成功
         this.state.onMessage?.('info', 0, `Set ${item} to ${value}`);
+    }
+
+    // 解析直线/射线的绘制长度：
+    // - 正数（也可以是 {slot} 表达式）：固定长度，单位与几何坐标一致
+    // - auto / screen / default / none，以及 0、负数、非法值：恢复默认（只延伸到可视区域边缘）
+    private parseLineLength(params: Map<string, string>, value: string): number | null {
+        const normalized = value.trim().toLowerCase();
+
+        if (!normalized
+            || normalized === 'auto'
+            || normalized === 'screen'
+            || normalized === 'default'
+            || normalized === 'none') {
+            return null;
+        }
+
+        const parsed = this.getNumberValue(params, 'value');
+        if (parsed === undefined || !Number.isFinite(parsed) || parsed <= 0) {
+            return null;
+        }
+
+        return parsed;
     }
 
     // 帮助信息
@@ -633,6 +993,9 @@ export class GeometryDSLInterpreter {
     }
 
     private drawObject(ctx: CanvasRenderingContext2D, params: Map<string, string>, obj: GeometricObject, label: string | undefined): void {
+        // 记录实际绘制顺序，命中检测时让视觉上层的对象优先。
+        this.state.renderedObjectNames.push(obj.name);
+
         // 解析绘制选项
         const options: DrawOptions = {};
         if (params.has('color')) options.color = this.parseColor(params, 'color') || this.parseColor(params, 'c') || this.state.defaultOptions.geoColor;
@@ -640,12 +1003,38 @@ export class GeometryDSLInterpreter {
         if (params.has('fill')) options.fillColor = this.parseColor(params, 'fill') || this.parseColor(params, 'f') || this.state.defaultOptions.backgroundColor;
         if (params.has('style') && params.get('style') === 'dashed') options.dashed = true;
         if (params.has('s') && params.get('s') === 'dashed') options.dashed = true;
+        const isObjectSelected = this.state.selectedObjectNames.has(obj.name)
+            || this.state.selectedObjectName === obj.name;
+        if (isObjectSelected) {
+            options.highlight = true;
+            options.color = SELECTED_OBJECT_COLOR;
+            // 点和显式填充区域需要同时改变填充色；普通线框对象不额外填充。
+            if (obj instanceof Point || params.has('fill')) {
+                options.fillColor = SELECTED_OBJECT_COLOR;
+            }
+        }
 
-        // 计算变换参数
+        // 直线/射线的绘制长度：未指定时只画到可视区域边缘
+        if (this.state.defaultOptions.lineLength != null) {
+            options.length = this.state.defaultOptions.lineLength;
+        }
+        // 可视区域（画布坐标），供直线/射线裁剪使用
+        options.visibleRect = {
+            x: this.state.defaultOptions.canvasX,
+            y: this.state.defaultOptions.canvasY,
+            width: this.state.defaultOptions.width,
+            height: this.state.defaultOptions.height,
+        };
+
+        // 计算变换参数。Canvas 的外层缩放/平移由 ctx.setTransform 提供；
+        // SVG 导出没有这个外层矩阵，因此由 renderScale/renderOffset 直接合并进来。
+        const viewScale = this.state.defaultOptions.scale;
+        const baseOffsetX = this.state.canvas!.width / 2 - this.state.defaultOptions.centerX * viewScale;
+        const baseOffsetY = this.state.canvas!.height / 2 - this.state.defaultOptions.centerY * viewScale;
         const transform = {
-            scale: this.state.defaultOptions.scale,
-            offsetX: this.state.canvas!.width / 2 - this.state.defaultOptions.centerX * this.state.defaultOptions.scale,
-            offsetY: this.state.canvas!.height / 2 - this.state.defaultOptions.centerY * this.state.defaultOptions.scale
+            scale: this.state.renderScale * viewScale,
+            offsetX: this.state.renderScale * baseOffsetX + this.state.renderOffsetX,
+            offsetY: this.state.renderScale * baseOffsetY + this.state.renderOffsetY
         };
 
         obj.draw(ctx, transform, options);
@@ -653,7 +1042,11 @@ export class GeometryDSLInterpreter {
         // 处理标签
         if (label != null || params.has('label') || params.has('l')) {
             const _label = label || params.get('label') || params.get('l');
-            this.drawLabel(obj, _label!, params, transform);
+            // 标签与几何对象一样，都需要完整的逻辑坐标到画布坐标换算。
+            // Canvas 的 ctx 只预置了拖拽平移/缩放，不包含 centerX/centerY 的视图偏移；
+            // SVG 上下文也没有预置变换，因此两种渲染路径都传入完整 transform。
+            const labelId = `label:${obj.name}:${this.state.labelHitRegions.length}`;
+            this.drawLabel(obj, _label!, params, transform, labelId);
         }
     }
 
@@ -677,6 +1070,44 @@ export class GeometryDSLInterpreter {
             }
 
             this.drawObject(this.state.ctx, params, obj, undefined);
+        }
+    }
+
+    // 为一个已创建的封闭对象填充颜色。
+    // FILL 的 color 表示填充色；borderColor 可选，用于控制边界线颜色。
+    private executeFill(params: Map<string, string>): void {
+        const objName = params.get('obj') || params.get('region') || params.get('o');
+        if (!objName) {
+            throw new Error('FILL command requires obj or region parameter');
+        }
+
+        const fillColor = this.parseColor(params, 'color')
+            || this.parseColor(params, 'fill')
+            || this.parseColor(params, 'f');
+        if (!fillColor) {
+            throw new Error('FILL command requires color (or fill) parameter');
+        }
+
+        if (!this.state.ctx) {
+            throw new Error('No canvas context available for drawing');
+        }
+
+        const borderColor = this.parseColor(params, 'borderColor') || this.state.defaultOptions.geoColor;
+        const drawParams = new Map(params);
+        drawParams.set('obj', objName);
+        drawParams.set('fill', fillColor);
+        drawParams.set('color', borderColor);
+
+        for (const rawName of objName.split(',')) {
+            const name = rawName.trim();
+            const obj = this.getObject(name);
+            if (!obj) {
+                throw new Error(`Object ${name} not found`);
+            }
+            if (!(obj instanceof Polygon || obj instanceof CircularRegion || obj instanceof CurveCircleRegion || obj instanceof Circle || obj instanceof Ellipse)) {
+                throw new Error(`FILL only supports closed objects: region, circular-region, curve-circle-region, polygon, triangle, rectangle, circle, or ellipse. Object ${name} is ${obj.type}`);
+            }
+            this.drawObject(this.state.ctx, drawParams, obj, undefined);
         }
     }
 
@@ -996,13 +1427,26 @@ export class GeometryDSLInterpreter {
      * @param {string} text 需要解析的原始字符串。
      * @returns {string[]} 包含所有提取出的完整表达式的字符串数组。
      */
+    // 找出文本里的槽位表达式 `{...}`。
+    // LaTeX 片段内部的 `{}` 是数学语法（例如 `\frac{a}{b}`），
+    // 必须跳过，否则 `{a}` 会被当成槽位去求值并报 "Variable 'a' not found"。
     extractExpressions(text: string): string[] {
         const expressions: string[] = [];
         const stack: number[] = [];
         let start = -1;
+        const inLatex = latexRegionMask(text);
 
         for (let i = 0; i < text.length; i++) {
             const char = text[i];
+            if (inLatex[i]) {
+                // 位于 LaTeX 片段内：不参与槽位识别，
+                // 同时丢弃已经开始的半个表达式，避免跨段拼接。
+                if (stack.length > 0) {
+                    stack.length = 0;
+                    start = -1;
+                }
+                continue;
+            }
             if (char === '{') {
                 if (stack.length === 0) {
                     // 找到一个潜在的表达式起点
@@ -1011,7 +1455,7 @@ export class GeometryDSLInterpreter {
                 stack.push(i);
             } else if (char === '}') {
                 if (stack.length > 0) {
-                    const openIndex = stack.pop();
+                    stack.pop();
                     if (stack.length === 0) {
                         // 找到一个完整的顶层表达式
                         expressions.push(text.substring(start, i + 1));
@@ -1023,6 +1467,170 @@ export class GeometryDSLInterpreter {
             }
         }
         return expressions;
+    }
+
+    private executeText(params: Map<string, string>, rawCommand: string, lineNumber: number): void {
+        if (!this.state.ctx || !this.state.canvas) return;
+
+        const x = this.getNumberValue(params, 'x');
+        const y = this.getNumberValue(params, 'y');
+        if (x === undefined || y === undefined) {
+            throw new Error('TEXT command requires x and y parameters');
+        }
+
+        const textMatch = /\b(?:text|t)=([\s\S]*?)(?=\s+(?:color|c|fontSize|fs|fontFamily|font|fontStyle|fontWeight|backgroundColor|bgc|padding|p)=|$)/i.exec(rawCommand);
+        if (!textMatch) {
+            throw new Error('TEXT command requires text parameter');
+        }
+
+        let text = textMatch[1].trim();
+        if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+            text = text.slice(1, -1);
+        }
+        for (const expression of this.extractExpressions(text)) {
+            const slotName = expression.slice(1, -1);
+            const slotValue = this.executeSlotExpression(slotName);
+            if (slotValue !== undefined) text = text.replace(expression, slotValue.toString());
+        }
+
+        const fontSize = this.getNumberValue(params, 'fontSize')
+            || this.getNumberValue(params, 'fs')
+            || this.state.defaultOptions.labelSize;
+        const fontFamily = params.get('fontFamily') || params.get('font') || 'Arial';
+        const fontStyle = params.get('fontStyle') || 'normal';
+        const fontWeight = params.get('fontWeight') || 'normal';
+        const color = this.parseColor(params, 'color')
+            || this.parseColor(params, 'c')
+            || this.state.defaultOptions.labelColor;
+        const padding = this.getNumberValue(params, 'padding')
+            || this.getNumberValue(params, 'p')
+            || 0;
+        const transform = this.getTextRenderTransform();
+        const screenPoint = toScreenPoint(x, y, transform);
+
+        const ctx = this.state.ctx;
+        // SVG 导出没有真正的 Canvas 上下文，drawKatex 只在 SvgRenderContext 上有意义。
+        const isSvg = !this.state.contextPreTransformed;
+
+        ctx.save();
+        ctx.font = `${fontStyle} ${fontWeight} ${fontSize}px ${fontFamily}`;
+
+        // 先把 text 切成普通文本 / LaTeX 片段，分别测宽，累出整体宽度与垂直范围。
+        const parts = splitLatexParts(text);
+        interface Layout {
+            kind: 'text' | 'latex';
+            value: string;
+            displayMode?: boolean;
+            width: number;
+            height: number;
+            ascent: number;
+            descent: number;
+            x: number;
+        }
+        const layouts: Layout[] = [];
+        let cursorX = screenPoint.x;
+        let maxAscent = 0;
+        let maxDescent = 0;
+        for (const part of parts) {
+            if (part.kind === 'text') {
+                const value = part.value;
+                const m = ctx.measureText(value);
+                const width = m.width;
+                const ascent = (m as any).fontBoundingBoxAscent ?? fontSize * 0.8;
+                const descent = (m as any).fontBoundingBoxDescent ?? fontSize * 0.2;
+                layouts.push({ kind: 'text', value, width, height: ascent + descent, ascent, descent, x: cursorX });
+                cursorX += width;
+                maxAscent = Math.max(maxAscent, ascent);
+                maxDescent = Math.max(maxDescent, descent);
+            } else {
+                const measured = this.measureKatexForLayout(part.value, fontSize, color, part.displayMode === true);
+                const ascent = measured.height * 0.75;
+                const descent = measured.height * 0.25;
+                layouts.push({
+                    kind: 'latex',
+                    value: part.value,
+                    displayMode: part.displayMode,
+                    width: measured.width,
+                    height: measured.height,
+                    ascent,
+                    descent,
+                    x: cursorX,
+                });
+                cursorX += measured.width + 2;
+                maxAscent = Math.max(maxAscent, ascent);
+                maxDescent = Math.max(maxDescent, descent);
+            }
+        }
+        const totalWidth = cursorX - screenPoint.x;
+
+        // 背景框（可选）
+        const backgroundColor = this.parseColor(params, 'backgroundColor')
+            || this.parseColor(params, 'bgc');
+        if (backgroundColor && backgroundColor !== 'transparent' && backgroundColor !== 'none') {
+            ctx.fillStyle = backgroundColor;
+            ctx.fillRect(
+                screenPoint.x - padding,
+                screenPoint.y - maxAscent - padding,
+                totalWidth + padding * 2,
+                (maxAscent + maxDescent) + padding * 2,
+            );
+            ctx.fillStyle = color;
+        }
+
+        ctx.fillStyle = color;
+        for (const layout of layouts) {
+            if (layout.kind === 'text') {
+                ctx.fillText(layout.value, layout.x, screenPoint.y);
+                continue;
+            }
+            // LaTeX 段：基线在 screenPoint.y，片段顶端放
+            // 在 screenPoint.y - ascent 处，与普通文字顶部齐平。
+            const top = screenPoint.y - layout.ascent;
+            if (isSvg) {
+                const svgCtx = ctx as unknown as { drawKatex: (fragment: string, x: number, y: number) => void };
+                if (typeof svgCtx.drawKatex === 'function') {
+                    const { fragment } = renderKatexToSvgFragment(layout.value, fontSize, color, {
+                        includeCss: false,
+                        displayMode: layout.displayMode === true,
+                    });
+                    svgCtx.drawKatex(fragment, layout.x, top);
+                    continue;
+                }
+                // 兜底：纯文本 fallback
+                ctx.fillText(`$${layout.value}$`, layout.x, screenPoint.y);
+                continue;
+            }
+            // Canvas 路径：先看缓存有没有渲染好的离屏 canvas
+            let cached = getCachedKatexCanvas(layout.value, fontSize, color, layout.displayMode === true);
+            if (!cached) {
+                prefetchKatexToCanvas(layout.value, fontSize, color, layout.displayMode === true);
+                // 还没渲好：用原文当占位，避免整段布局塌掉
+                const previousFont = ctx.font;
+                ctx.font = `italic ${fontWeight} ${fontSize}px ${fontFamily}`;
+                ctx.fillText(`$${layout.value}$`, layout.x, screenPoint.y);
+                ctx.font = previousFont;
+            } else {
+                ctx.drawImage(cached, layout.x, top);
+            }
+        }
+        ctx.restore();
+    }
+
+    // 同步测 LaTeX 尺寸。Canvas 与 SVG 都走这里，
+    // Node 离线导出由 katexRender 内部回退到字符数近似。
+    private measureKatexForLayout(latex: string, fontSize: number, color: string, displayMode = false): { width: number; height: number } {
+        return measureKatex(latex, fontSize, color, displayMode);
+    }
+
+    private getTextRenderTransform(): { scale: number; offsetX: number; offsetY: number } {
+        const viewScale = this.state.defaultOptions.scale;
+        const baseOffsetX = this.state.canvas!.width / 2 - this.state.defaultOptions.centerX * viewScale;
+        const baseOffsetY = this.state.canvas!.height / 2 - this.state.defaultOptions.centerY * viewScale;
+        return {
+            scale: this.state.renderScale * viewScale,
+            offsetX: this.state.renderScale * baseOffsetX + this.state.renderOffsetX,
+            offsetY: this.state.renderScale * baseOffsetY + this.state.renderOffsetY,
+        };
     }
 
     private executePrint(params: Map<string, string>, rawCommand: string, lineNumber: number): void {
@@ -1536,7 +2144,7 @@ export class GeometryDSLInterpreter {
                 const draw = params.get('draw');
                 // 第一个点已经命名了，并且与当前点的命名相同，就不做操作，否则再创建一个点
                 if (findPoint0.name != names[0]) {
-                    const intersectionPoint = new Point(names[0], points[0].x, points[0].y);
+                    const intersectionPoint = new Point(names[0], points[1].x, points[1].y);
                     this.state.objects.set(intersectionPoint.name, intersectionPoint);
 
                     if (draw != null && draw == 'true' && this.state.ctx) {
@@ -1560,7 +2168,7 @@ export class GeometryDSLInterpreter {
                 const draw = params.get('draw');
                 // 第二个点已经命名了，并且与当前点的命名相同，就不做操作，否则再创建一个点
                 if (findPoint1.name != names[1]) {
-                    const intersectionPoint = new Point(names[1], points[1].x, points[1].y);
+                    const intersectionPoint = new Point(names[1], points[0].x, points[0].y);
                     this.state.objects.set(intersectionPoint.name, intersectionPoint);
 
                     if (draw != null && draw == 'true' && this.state.ctx) {
@@ -2021,6 +2629,378 @@ export class GeometryDSLInterpreter {
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
             this.drawObject(this.state.ctx, params, polygon, undefined);
+        }
+    }
+
+    /**
+     * 创建一个由有序点边界围成的可填充区域。
+     *
+     * 算法约定：boundary/points 中的点按边界行走顺序提供，最后一个点会
+     * 自动与第一个点闭合；因此每条边都是确定的直线段，区域描述不会依赖
+     * Canvas 当前缩放或像素采样。
+     */
+    private createRegion(params: Map<string, string>): void {
+        const name = params.get('name');
+        if (!name) {
+            throw new Error('REGION command requires name parameter');
+        }
+
+        const circleName = params.get('circle') || params.get('c');
+        const lineName = params.get('line') || params.get('l');
+        const curveName = params.get('curve') || params.get('curve1');
+        if (curveName || params.has('curve1')) {
+            if (!circleName || !curveName) {
+                throw new Error('REGION curve-circle form requires both curve and circle parameters');
+            }
+            const side = (params.get('side') || params.get('s') || '').trim().toLowerCase();
+            if (side !== 'above' && side !== 'below') {
+                throw new Error('REGION curve-circle form requires side=above or side=below');
+            }
+            const region = this.createCurveCircleRegion(name, curveName, circleName, side);
+            this.state.objects.set(name, region);
+
+            const draw = params.get('draw');
+            if (draw === 'true' && this.state.ctx) {
+                this.drawObject(this.state.ctx, params, region, undefined);
+            }
+            return;
+        }
+        if (circleName || lineName) {
+            if (!circleName || !lineName) {
+                throw new Error('REGION circle-line form requires both circle and line parameters');
+            }
+            const side = (params.get('side') || params.get('s') || '').trim().toLowerCase();
+            if (side !== 'left' && side !== 'right') {
+                throw new Error('REGION circle-line form requires side=left or side=right');
+            }
+            const region = this.createCircularRegion(name, circleName, lineName, side);
+            this.state.objects.set(name, region);
+
+            const draw = params.get('draw');
+            if (draw === 'true' && this.state.ctx) {
+                this.drawObject(this.state.ctx, params, region, undefined);
+            }
+            return;
+        }
+
+        const pointsParam = params.get('boundary') || params.get('points') || params.get('p');
+        if (!pointsParam) {
+            throw new Error('REGION command requires boundary, circle + line + side, or curve + circle + side parameters');
+        }
+
+        const pointNames = pointsParam.split(',').map(value => value.trim()).filter(Boolean);
+        // 允许用户显式写回首点，但内部只保留一份首点，统一由 Polygon.closePath 闭合。
+        if (pointNames.length > 1 && pointNames[0] === pointNames[pointNames.length - 1]) {
+            pointNames.pop();
+        }
+        if (pointNames.length < 3) {
+            throw new Error('REGION command requires at least 3 boundary points');
+        }
+
+        const points: Point[] = [];
+        for (const pointName of pointNames) {
+            const point = this.getObject(pointName);
+            if (!point || !(point instanceof Point)) {
+                throw new Error(`Point ${pointName} not found or is not a valid point object`);
+            }
+            points.push(point);
+        }
+
+        this.validateSimpleRegionBoundary(name, points);
+        const region = new Region(name, points);
+        this.state.objects.set(name, region);
+
+        const draw = params.get('draw');
+        if (draw === 'true' && this.state.ctx) {
+            this.drawObject(this.state.ctx, params, region, undefined);
+        }
+    }
+
+    /**
+     * 创建由 y=f(x) 曲线和圆弧围成的区域。
+     * side=above/below 按圆弧中点相对曲线的 y 值选择边界，要求恰有两个交点。
+     */
+    private createCurveCircleRegion(name: string, curveName: string, circleName: string, side: 'above' | 'below'): CurveCircleRegion {
+        const curve = this.getObject(curveName);
+        if (!(curve instanceof Curve)) {
+            throw new Error(`Object ${curveName} is not a function curve`);
+        }
+
+        const circle = this.getObject(circleName);
+        if (!(circle instanceof Circle)) {
+            throw new Error(`Object ${circleName} is not a circle`);
+        }
+
+        const rangeStart = Math.min(curve.rangeStart, curve.rangeEnd);
+        const rangeEnd = Math.max(curve.rangeStart, curve.rangeEnd);
+        const range = rangeEnd - rangeStart;
+        if (!Number.isFinite(range) || range <= 1e-9) {
+            throw new Error(`CURVE ${curveName} must have a non-zero x range`);
+        }
+
+        const circleEquation = (x: number): number => {
+            const y = curve.evaluate(x);
+            return (x - circle.center.x) * (x - circle.center.x)
+                + (y - circle.center.y) * (y - circle.center.y)
+                - circle.radius * circle.radius;
+        };
+
+        const sampleCount = Math.min(10000, Math.max(512, Math.ceil(range / Math.max(Math.abs(curve.sampleStep), 0.01))));
+        const sampleStep = range / sampleCount;
+        const roots: number[] = [];
+        const rootEpsilon = 1e-8 * Math.max(1, circle.radius * circle.radius);
+        const addRoot = (x: number): void => {
+            if (!Number.isFinite(x)) return;
+            if (!roots.some(existing => Math.abs(existing - x) <= Math.max(1e-7, sampleStep * 1e-3))) {
+                roots.push(x);
+            }
+        };
+
+        let previousX = rangeStart;
+        let previousValue = circleEquation(previousX);
+        if (Math.abs(previousValue) <= rootEpsilon) addRoot(previousX);
+
+        for (let index = 1; index <= sampleCount; index++) {
+            const currentX = index === sampleCount ? rangeEnd : rangeStart + index * sampleStep;
+            const currentValue = circleEquation(currentX);
+            if (Math.abs(currentValue) <= rootEpsilon) addRoot(currentX);
+
+            if ((previousValue < 0 && currentValue > 0) || (previousValue > 0 && currentValue < 0)) {
+                let left = previousX;
+                let right = currentX;
+                let leftValue = previousValue;
+                for (let iteration = 0; iteration < 60; iteration++) {
+                    const middle = (left + right) / 2;
+                    const middleValue = circleEquation(middle);
+                    if (Math.abs(middleValue) <= rootEpsilon) {
+                        left = middle;
+                        right = middle;
+                        break;
+                    }
+                    if ((leftValue < 0 && middleValue > 0) || (leftValue > 0 && middleValue < 0)) {
+                        right = middle;
+                    } else {
+                        left = middle;
+                        leftValue = middleValue;
+                    }
+                }
+                addRoot((left + right) / 2);
+            }
+
+            previousX = currentX;
+            previousValue = currentValue;
+        }
+
+        roots.sort((a, b) => a - b);
+        if (roots.length < 2) {
+            throw new Error(`REGION ${name} cannot be created: CURVE ${curveName} and CIRCLE ${circleName} do not have two intersections in the curve range`);
+        }
+        if (roots.length > 2) {
+            throw new Error(`REGION ${name} is ambiguous: CURVE ${curveName} and CIRCLE ${circleName} have ${roots.length} intersections; exactly two are required`);
+        }
+
+        const leftX = roots[0];
+        const rightX = roots[1];
+        const leftPoint = { x: leftX, y: curve.evaluate(leftX) };
+        const rightPoint = { x: rightX, y: curve.evaluate(rightX) };
+        const curveSampleCount = Math.min(4096, Math.max(16, Math.ceil((rightX - leftX) / Math.max(Math.abs(curve.sampleStep), 0.01))));
+        const curvePoints: IPoint[] = [];
+        for (let index = 0; index <= curveSampleCount; index++) {
+            const x = leftX + (rightX - leftX) * index / curveSampleCount;
+            curvePoints.push({ x, y: curve.evaluate(x) });
+        }
+        curvePoints[0] = leftPoint;
+        curvePoints[curvePoints.length - 1] = rightPoint;
+
+        const screenAngle = (point: IPoint): number =>
+            Math.atan2(-(point.y - circle.center.y), point.x - circle.center.x);
+        const arcStartAngle = screenAngle(rightPoint);
+        const arcEndAngle = screenAngle(leftPoint);
+        const twoPi = Math.PI * 2;
+        const normalizedDelta = (from: number, to: number, counterclockwise: boolean): number => {
+            let delta = to - from;
+            if (counterclockwise) {
+                while (delta > 0) delta -= twoPi;
+                while (delta < -twoPi) delta += twoPi;
+            } else {
+                while (delta < 0) delta += twoPi;
+                while (delta > twoPi) delta -= twoPi;
+            }
+            return delta;
+        };
+        const candidateIsOnRequestedSide = (counterclockwise: boolean): boolean => {
+            const delta = normalizedDelta(arcStartAngle, arcEndAngle, counterclockwise);
+            const middleAngle = arcStartAngle + delta / 2;
+            const middlePoint = {
+                x: circle.center.x + circle.radius * Math.cos(middleAngle),
+                y: circle.center.y - circle.radius * Math.sin(middleAngle),
+            };
+            const curveY = curve.evaluate(Math.min(rightX, Math.max(leftX, middlePoint.x)));
+            const difference = middlePoint.y - curveY;
+            const epsilon = 1e-8 * Math.max(1, circle.radius);
+            return side === 'above' ? difference > epsilon : difference < -epsilon;
+        };
+
+        const counterclockwise = candidateIsOnRequestedSide(true)
+            ? true
+            : candidateIsOnRequestedSide(false)
+                ? false
+                : (() => {
+                    throw new Error(`REGION ${name} could not determine the ${side} circle arc`);
+                })();
+
+        return new CurveCircleRegion(
+            name,
+            curve,
+            circle,
+            curvePoints,
+            arcStartAngle,
+            arcEndAngle,
+            counterclockwise,
+            side,
+        );
+    }
+
+    /**
+     * 创建由圆弧和弦线围成的圆弓形区域。
+     * side 按 line.p1 -> line.p2 的方向判断：left 为有向直线左侧，right 为右侧。
+     */
+    private createCircularRegion(name: string, circleName: string, lineName: string, side: 'left' | 'right'): CircularRegion {
+        const circle = this.getObject(circleName);
+        if (!(circle instanceof Circle)) {
+            throw new Error(`Object ${circleName} is not a circle`);
+        }
+
+        const line = this.getObject(lineName);
+        if (!(line instanceof Line)) {
+            throw new Error(`Object ${lineName} is not a LINE; circle-line REGION requires a LINE object`);
+        }
+
+        const dx = line.p2.x - line.p1.x;
+        const dy = line.p2.y - line.p1.y;
+        const directionLengthSquared = dx * dx + dy * dy;
+        if (directionLengthSquared <= 1e-18) {
+            throw new Error(`LINE ${lineName} has coincident defining points and cannot cut a circle`);
+        }
+
+        const intersections = circle.getIntersectionWithLine(line);
+        if (intersections.length < 2) {
+            if (intersections.length === 1) {
+                throw new Error(`REGION ${name} cannot be created: LINE ${lineName} is tangent to CIRCLE ${circleName}, so it does not enclose an area`);
+            }
+            throw new Error(`REGION ${name} cannot be created: LINE ${lineName} does not intersect CIRCLE ${circleName}`);
+        }
+
+        // 按有向直线上的参数排序，保证弦段从 line.p1 一侧走到 line.p2 一侧。
+        const ordered = intersections
+            .slice(0, 2)
+            .sort((a, b) => {
+                const ta = ((a.x - line.p1.x) * dx + (a.y - line.p1.y) * dy) / directionLengthSquared;
+                const tb = ((b.x - line.p1.x) * dx + (b.y - line.p1.y) * dy) / directionLengthSquared;
+                return ta - tb;
+            });
+        const startPoint = ordered[0];
+        const endPoint = ordered[1];
+        const center = circle.center;
+        const radius = circle.radius;
+
+        // 几何对象最终写入的是 Canvas 坐标，因此角度中的 y 轴需要翻转。
+        const screenAngle = (point: IPoint): number =>
+            Math.atan2(-(point.y - center.y), point.x - center.x);
+        const arcStartAngle = screenAngle(endPoint);
+        const arcEndAngle = screenAngle(startPoint);
+        const twoPi = Math.PI * 2;
+
+        const normalizedDelta = (from: number, to: number, counterclockwise: boolean): number => {
+            let delta = to - from;
+            if (counterclockwise) {
+                while (delta > 0) delta -= twoPi;
+                while (delta < -twoPi) delta += twoPi;
+            } else {
+                while (delta < 0) delta += twoPi;
+                while (delta > twoPi) delta -= twoPi;
+            }
+            return delta;
+        };
+
+        const candidateIsOnRequestedSide = (counterclockwise: boolean): boolean => {
+            const delta = normalizedDelta(arcStartAngle, arcEndAngle, counterclockwise);
+            const middleAngle = arcStartAngle + delta / 2;
+            const middlePoint = {
+                x: center.x + radius * Math.cos(middleAngle),
+                y: center.y - radius * Math.sin(middleAngle),
+            };
+            const sideCross = dx * (middlePoint.y - line.p1.y) - dy * (middlePoint.x - line.p1.x);
+            const epsilon = 1e-8 * Math.max(1, radius * Math.sqrt(directionLengthSquared));
+            return side === 'left' ? sideCross > epsilon : sideCross < -epsilon;
+        };
+
+        const counterclockwise = candidateIsOnRequestedSide(true)
+            ? true
+            : candidateIsOnRequestedSide(false)
+                ? false
+                : (() => {
+                    throw new Error(`REGION ${name} could not determine the ${side} arc of CIRCLE ${circleName}`);
+                })();
+
+        return new CircularRegion(
+            name,
+            circle,
+            line,
+            startPoint,
+            endPoint,
+            arcStartAngle,
+            arcEndAngle,
+            counterclockwise,
+            side,
+        );
+    }
+
+    // 区域填充使用简单多边形的非零填充规则；自交边界会造成歧义，因此提前拒绝。
+    private validateSimpleRegionBoundary(name: string, points: Point[]): void {
+        const epsilon = 1e-9;
+        const samePoint = (a: Point, b: Point): boolean =>
+            Math.abs(a.x - b.x) <= epsilon && Math.abs(a.y - b.y) <= epsilon;
+        const cross = (a: Point, b: Point, c: Point): number =>
+            (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        const onSegment = (a: Point, b: Point, p: Point): boolean =>
+            Math.min(a.x, b.x) - epsilon <= p.x && p.x <= Math.max(a.x, b.x) + epsilon
+            && Math.min(a.y, b.y) - epsilon <= p.y && p.y <= Math.max(a.y, b.y) + epsilon;
+        const intersects = (a: Point, b: Point, c: Point, d: Point): boolean => {
+            const abC = cross(a, b, c);
+            const abD = cross(a, b, d);
+            const cdA = cross(c, d, a);
+            const cdB = cross(c, d, b);
+
+            if (((abC > epsilon && abD < -epsilon) || (abC < -epsilon && abD > epsilon))
+                && ((cdA > epsilon && cdB < -epsilon) || (cdA < -epsilon && cdB > epsilon))) {
+                return true;
+            }
+            return (Math.abs(abC) <= epsilon && onSegment(a, b, c))
+                || (Math.abs(abD) <= epsilon && onSegment(a, b, d))
+                || (Math.abs(cdA) <= epsilon && onSegment(c, d, a))
+                || (Math.abs(cdB) <= epsilon && onSegment(c, d, b));
+        };
+
+        for (let i = 0; i < points.length; i++) {
+            if (samePoint(points[i], points[(i + 1) % points.length])) {
+                throw new Error(`REGION ${name} has two consecutive boundary points at the same position`);
+            }
+        }
+
+        for (let i = 0; i < points.length; i++) {
+            const a = points[i];
+            const b = points[(i + 1) % points.length];
+            for (let j = i + 1; j < points.length; j++) {
+                // 相邻边共享端点是合法的，不算自交。
+                const adjacent = j === i + 1 || (i === 0 && j === points.length - 1);
+                if (adjacent) continue;
+                const c = points[j];
+                const d = points[(j + 1) % points.length];
+                if (intersects(a, b, c, d)) {
+                    throw new Error(`REGION ${name} boundary self-intersects between edges ${i + 1} and ${j + 1}`);
+                }
+            }
         }
     }
 
@@ -2597,6 +3577,8 @@ export class GeometryDSLInterpreter {
 
         const start = params.get('start') || params.get('s');
         const end = params.get('end') || params.get('e');
+        const randomSource = `RANDOMPOINT obj=${objName}${start !== undefined ? ` start=${start}` : ''}${end !== undefined ? ` end=${end}` : ''}`;
+        const frozenPoint = this.state.frozenRandomObjects.get(name);
 
         const obj = this.getObject(objName);
         if (!obj) {
@@ -2608,9 +3590,10 @@ export class GeometryDSLInterpreter {
             const line = obj as LinearObject;
             const startPos = parseFloat(start || '0');
             const endPos = parseFloat(end || '1');
-            const randomPoint = line.randomPointOnLine(startPos, endPos);
+            const randomPoint = frozenPoint || line.randomPointOnLine(startPos, endPos);
             const point = new Point(name, randomPoint.x, randomPoint.y);
             this.state.objects.set(name, point);
+            this.state.randomObjectSources.set(name, randomSource);
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
@@ -2625,9 +3608,10 @@ export class GeometryDSLInterpreter {
             const circle = obj as Circle;
             const startAngle = parseFloat(start || '0');
             const endAngle = parseFloat(end || '360');
-            const randomPoint = circle.randomPointOnEdge(startAngle, endAngle);
+            const randomPoint = frozenPoint || circle.randomPointOnEdge(startAngle, endAngle);
             const point = new Point(name, randomPoint.x, randomPoint.y);
             this.state.objects.set(name, point);
+            this.state.randomObjectSources.set(name, randomSource);
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
@@ -2642,9 +3626,10 @@ export class GeometryDSLInterpreter {
             const ellipse = obj as Ellipse;
             const startAngle = parseFloat(start || '0');
             const endAngle = parseFloat(end || '360');
-            const randomPoint = ellipse.randomPointOnEdge(startAngle, endAngle);
+            const randomPoint = frozenPoint || ellipse.randomPointOnEdge(startAngle, endAngle);
             const point = new Point(name, randomPoint.x, randomPoint.y);
             this.state.objects.set(name, point);
+            this.state.randomObjectSources.set(name, randomSource);
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
@@ -2671,13 +3656,29 @@ export class GeometryDSLInterpreter {
 
         // Slot 类型，默认为数值（包括表达式），如果需要设置字符串类型的Slot，则需要设置为string
         const slotType = params.get('type') || params.get('t') || 'number';
+        const isRandomExpression = /\brandom\s*\(/i.test(valueString);
         if (slotType.toLowerCase() === 'string') {
             this.state.slots.set(name, valueString);
+            this.state.variableInfo.set(name, {
+                name,
+                expression: valueString,
+                value: valueString,
+                kind: 'fixed',
+                frozen: false,
+            });
         } else {
-            const value = this.getNumberValue(params, 'value') || this.getNumberValue(params, 'v')
-                || this.getNumberValue(params, 'expression') || this.getNumberValue(params, 'e') || 0;
+            const existingFrozenValue = isRandomExpression ? this.state.frozenRandomValues.get(name) : undefined;
+            const value = existingFrozenValue ?? (this.getNumberValue(params, 'value') || this.getNumberValue(params, 'v')
+                || this.getNumberValue(params, 'expression') || this.getNumberValue(params, 'e') || 0);
 
             this.state.slots.set(name, value);
+            this.state.variableInfo.set(name, {
+                name,
+                expression: valueString,
+                value,
+                kind: isRandomExpression ? 'random' : 'fixed',
+                frozen: isRandomExpression && existingFrozenValue !== undefined,
+            });
         }
 
     }
@@ -2775,6 +3776,11 @@ export class GeometryDSLInterpreter {
         const name = params.get('name');
         const interval = parseFloat(params.get('interval') || '1000'); // 默认1秒
         const repeat = GeometryDSLInterpreter.parseBoolean(params.get('repeat') || 'false');
+        // period 表示一个完整周期包含的帧数，主要供 SVG 导出采样。
+        // frames / periodFrames 作为兼容别名保留，period 是推荐写法。
+        const periodValue = params.get('period') || params.get('frames') || params.get('periodFrames');
+        const parsedPeriod = periodValue === undefined ? NaN : Number(periodValue);
+        const period = Number.isInteger(parsedPeriod) && parsedPeriod > 0 ? parsedPeriod : undefined;
         // 执行代码
         const code = params.get('code') || params.get('c');
         const slotName = params.get('slot') || params.get('s');
@@ -2807,15 +3813,18 @@ export class GeometryDSLInterpreter {
             isRepeat: repeat,
             currentFrame: 0,
             interval: interval,
+            period,
             isRunning: true,
             animationTimer: 0
         };
 
 
-        // 启动计时器执行动画，立即执行动画第一帧
-        animation.animationTimer = setTimeout(() => {
-            this.runAnimationCode(animation);
-        }, 0);
+        // 交互模式启动计时器；离线导出模式由 stepAnimation 手动逐帧采样
+        if (this.state.animationAutoStart) {
+            animation.animationTimer = setTimeout(() => {
+                this.runAnimationCode(animation);
+            }, 0);
+        }
 
 
         this.state.animations.set(name, animation);
@@ -2846,12 +3855,12 @@ export class GeometryDSLInterpreter {
         animation.currentFrame++;
         // 更新slot
         this.state.slots.set(animation.slot, animation.currentFrame);
-        if (animation.isRepeat) {
+        if (animation.isRepeat && this.state.animationAutoStart) {
             // 如果是循环动画，则重新开始
             animation.animationTimer = setTimeout(() => {
                 this.runAnimationCode(animation);
             }, animation.interval);
-        } else {
+        } else if (!animation.isRepeat) {
             // 如果不是循环动画，则停止
             animation.isRunning = false;
             console.log(`Animation ${animation.name} completed after ${animation.currentFrame} frames`);
@@ -2906,39 +3915,335 @@ export class GeometryDSLInterpreter {
     }
 
     // 辅助方法
-    private drawLabel(obj: GeometricObject, label: string, params: Map<string, string>, transform: { scale: number; offsetX: number; offsetY: number }): void {
+    private drawLabel(
+        obj: GeometricObject,
+        label: string,
+        params: Map<string, string>,
+        transform: { scale: number; offsetX: number; offsetY: number },
+        labelId: string,
+    ): void {
         if (!this.state.ctx) return;
 
-        // 默认标签位置为对象中心下方
         let direction = params.get('direction') || params.get('d') || 'down';
-        if (direction === 'down' || direction === 'd') {
-            direction = 'down'
-        }
-
-        if (direction === 'up' || direction === 'u') {
-            direction = 'up';
-        }
-
-        if (direction === 'left' || direction === 'l') {
-            direction = 'left';
-        }
-
-        if (direction === 'right' || direction === 'r') {
-            direction = 'right';
-        }
-
+        if (direction === 'down' || direction === 'd') direction = 'down';
+        if (direction === 'up' || direction === 'u') direction = 'up';
+        if (direction === 'left' || direction === 'l') direction = 'left';
+        if (direction === 'right' || direction === 'r') direction = 'right';
         if (direction !== 'down' && direction !== 'up' && direction !== 'left' && direction !== 'right') {
             throw new Error(`Invalid label direction: ${direction}. Use 'up', 'down', 'left', or 'right'.`);
         }
 
-        // 绘制标签
-        obj.drawLabel(this.state.ctx, transform, label, {
-            drawDirection: direction,
-            fontSize: parseFloat(params.get('fontSize') || params.get('fs') || '12'),
-            color: this.parseColor(params, 'color') || this.parseColor(params, 'c') || this.state.defaultOptions.labelColor,
+        const fontSize = parseFloat(params.get('fontSize') || params.get('fs') || '12');
+        const padding = parseFloat(params.get('padding') || params.get('p') || '2');
+        const savedPosition = this.state.labelPositions.get(labelId);
+        const isSelected = this.state.selectedObjectNames.has(obj.name)
+            || this.state.selectedObjectName === obj.name;
+        const isLabelSelected = this.state.selectedLabelId === labelId;
+        const labelOptions = {
+            drawDirection: direction as 'down' | 'up' | 'left' | 'right',
+            fontSize,
+            color: isSelected || isLabelSelected
+                ? SELECTED_OBJECT_COLOR
+                : this.parseColor(params, 'color') || this.parseColor(params, 'c') || this.state.defaultOptions.labelColor,
             backgroundColor: this.parseColor(params, 'backgroundColor') || this.parseColor(params, 'bgc') || 'transparent',
-            padding: parseFloat(params.get('padding') || params.get('p') || '2'),
+            padding,
+            position: savedPosition,
+        };
+
+        this.state.ctx.save();
+        this.state.ctx.font = `normal normal ${fontSize}px Arial`;
+        const textWidth = this.state.ctx.measureText(label).width;
+        const textHeight = fontSize > 0 ? fontSize : 12;
+        const defaultPosition = obj.getDrawLabelPosition(transform, labelOptions, textWidth, textHeight);
+        const labelPosition = savedPosition
+            ? toScreenPoint(savedPosition.x, savedPosition.y, transform)
+            : defaultPosition;
+        this.state.ctx.restore();
+
+        // 记录标签的实际绘制位置和屏幕包围盒，供独立选择与拖动使用。
+        const logicalPosition = savedPosition || {
+            x: (defaultPosition.x - transform.offsetX) / transform.scale,
+            y: (transform.offsetY - defaultPosition.y) / transform.scale,
+        };
+        const labelOptionsWithPosition = { ...labelOptions, position: logicalPosition };
+        obj.drawLabel(this.state.ctx, transform, label, labelOptionsWithPosition);
+        this.state.labelHitRegions.push({
+            id: labelId,
+            objectName: obj.name,
+            x: labelPosition.x - padding,
+            y: labelPosition.y - textHeight - padding,
+            width: textWidth + padding * 2,
+            height: textHeight + padding * 2,
+            position: logicalPosition,
         });
+    }
+
+    /**
+     * 在当前画布视图中查找命中的对象或标签。
+     * 标签返回独立 id，不再与所属几何对象混用选择状态。
+     */
+    public hitTestSelection(
+        screenX: number,
+        screenY: number,
+        tolerancePx: number,
+        view: { x: number; y: number; scale: number },
+    ): CanvasSelection {
+        const canvas = this.state.canvas;
+        if (!canvas || !Number.isFinite(view.scale) || view.scale <= 0) return null;
+
+        const viewScale = this.state.defaultOptions.scale;
+        const baseOffsetX = canvas.width / 2 - this.state.defaultOptions.centerX * viewScale;
+        const baseOffsetY = canvas.height / 2 - this.state.defaultOptions.centerY * viewScale;
+        const transform = {
+            scale: view.scale * viewScale,
+            offsetX: view.x + view.scale * baseOffsetX,
+            offsetY: view.y + view.scale * baseOffsetY,
+        };
+        const point = { x: screenX, y: screenY };
+        const tolerance = Math.max(6, tolerancePx);
+        const pointTolerance = Math.min(tolerance, 7);
+        const labelTolerance = Math.min(tolerance, 6);
+
+        const checked = new Set<string>();
+        // 点标记优先于标签、线或区域，避免标签的矩形区域遮住点本身。
+        for (let i = this.state.renderedObjectNames.length - 1; i >= 0; i--) {
+            const name = this.state.renderedObjectNames[i];
+            if (checked.has(name)) continue;
+            checked.add(name);
+            const object = this.state.objects.get(name);
+            if (object instanceof Point && this.hitTestObject(object, point, pointTolerance, transform)) {
+                return { kind: 'object', name: object.name };
+            }
+        }
+        // 即使点没有单独的 DRAW 命令，也允许在其可见位置附近选中。
+        for (const [name, object] of this.state.objects) {
+            if (checked.has(name)) continue;
+            if (object instanceof Point && this.hitTestObject(object, point, pointTolerance, transform)) {
+                return { kind: 'object', name: object.name };
+            }
+        }
+
+        // 标签文字仍然优先于线和区域，点击文字本身会返回独立标签选择。
+        for (let i = this.state.labelHitRegions.length - 1; i >= 0; i--) {
+            const region = this.state.labelHitRegions[i];
+            const labelX = view.x + region.x * view.scale;
+            const labelY = view.y + region.y * view.scale;
+            const labelWidth = region.width * view.scale;
+            const labelHeight = region.height * view.scale;
+            if (
+                point.x >= labelX - labelTolerance &&
+                point.x <= labelX + labelWidth + labelTolerance &&
+                point.y >= labelY - labelTolerance &&
+                point.y <= labelY + labelHeight + labelTolerance
+            ) {
+                return {
+                    kind: 'label',
+                    id: region.id,
+                    objectName: region.objectName,
+                    position: { ...region.position },
+                    screenAnchor: toScreenPoint(region.position.x, region.position.y, transform),
+                };
+            }
+        }
+
+        // 先按绘制顺序命中，再用完整对象表兜底，避免线/段因没有进入绘制序列而不可选。
+        checked.clear();
+        const candidates = [
+            ...this.state.renderedObjectNames.slice().reverse(),
+            ...Array.from(this.state.objects.keys()),
+        ];
+        for (const name of candidates) {
+            if (checked.has(name)) continue;
+            checked.add(name);
+            const object = this.state.objects.get(name);
+            if (object && !(object instanceof Point) && this.hitTestObject(object, point, tolerance, transform)) {
+                return { kind: 'object', name: object.name };
+            }
+        }
+
+        return null;
+    }
+
+    public screenToLogicalPoint(
+        screenX: number,
+        screenY: number,
+        view: { x: number; y: number; scale: number },
+    ): IPoint | null {
+        const canvas = this.state.canvas;
+        if (!canvas || !Number.isFinite(view.scale) || view.scale <= 0) return null;
+        const viewScale = this.state.defaultOptions.scale;
+        const baseOffsetX = canvas.width / 2 - this.state.defaultOptions.centerX * viewScale;
+        const baseOffsetY = canvas.height / 2 - this.state.defaultOptions.centerY * viewScale;
+        const fullScale = view.scale * viewScale;
+        return {
+            x: (screenX - view.x - view.scale * baseOffsetX) / fullScale,
+            y: (view.y + view.scale * baseOffsetY - screenY) / fullScale,
+        };
+    }
+
+    // 保留旧的对象名命中接口，便于非 UI 调用方继续使用。
+    public hitTest(
+        screenX: number,
+        screenY: number,
+        tolerancePx: number,
+        view: { x: number; y: number; scale: number },
+    ): string | null {
+        const selection = this.hitTestSelection(screenX, screenY, tolerancePx, view);
+        if (!selection) return null;
+        return selection.kind === 'label' ? selection.objectName : selection.name;
+    }
+
+    private hitTestObject(
+        object: GeometricObject,
+        point: IPoint,
+        tolerance: number,
+        transform: { scale: number; offsetX: number; offsetY: number },
+    ): boolean {
+        if (object instanceof Point) {
+            const center = toScreenPoint(object.x, object.y, transform);
+            return Math.hypot(point.x - center.x, point.y - center.y) <= Math.max(tolerance, object.radius * Math.abs(transform.scale) + 4);
+        }
+
+        if (object instanceof LinearObject) {
+            return this.hitTestLinear(object, point, tolerance, transform);
+        }
+
+        if (object instanceof Circle) {
+            const center = toScreenPoint(object.center.x, object.center.y, transform);
+            const radius = Math.abs(object.radius * transform.scale);
+            return Math.abs(Math.hypot(point.x - center.x, point.y - center.y) - radius) <= tolerance;
+        }
+
+        if (object instanceof Ellipse) {
+            const samples: IPoint[] = [];
+            for (let i = 0; i <= 96; i++) {
+                const angle = (i / 96) * Math.PI * 2;
+                const cos = Math.cos(angle);
+                const sin = Math.sin(angle);
+                const rotationCos = Math.cos(object.rotation);
+                const rotationSin = Math.sin(object.rotation);
+                samples.push(toScreenPoint(
+                    object.center.x + object.rx * cos * rotationCos - object.ry * sin * rotationSin,
+                    object.center.y + object.rx * cos * rotationSin + object.ry * sin * rotationCos,
+                    transform,
+                ));
+            }
+            return this.hitTestPolyline(samples, point, tolerance);
+        }
+
+        if (object instanceof Polygon) {
+            const vertices = object.vertices.map(vertex => toScreenPoint(vertex.x, vertex.y, transform));
+            if (this.hitTestPolyline([...vertices, vertices[0]], point, tolerance)) return true;
+            return this.isPointInsidePolygon(point, vertices);
+        }
+
+        if (object instanceof Curve) {
+            const samples: IPoint[] = [];
+            const step = Math.max(object.sampleStep, (object.rangeEnd - object.rangeStart) / 800);
+            for (let x = object.rangeStart; x <= object.rangeEnd; x += step) {
+                samples.push(toScreenPoint(x, object.evaluate(x), transform));
+            }
+            samples.push(toScreenPoint(object.rangeEnd, object.evaluate(object.rangeEnd), transform));
+            return this.hitTestPolyline(samples, point, tolerance);
+        }
+
+        if (object instanceof Angle) {
+            const line1 = object.line1;
+            const line2 = object.line2;
+            return Boolean(
+                (line1 && this.hitTestLinear(line1, point, tolerance, transform)) ||
+                (line2 && this.hitTestLinear(line2, point, tolerance, transform))
+            );
+        }
+
+        if (object instanceof CircularRegion) {
+            const samples = this.sampleCircularRegion(object, transform);
+            return this.hitTestPolyline(samples, point, tolerance) || this.isPointInsidePolygon(point, samples);
+        }
+
+        if (object instanceof CurveCircleRegion) {
+            const samples = object.curvePoints.map(sample => toScreenPoint(sample.x, sample.y, transform));
+            return this.hitTestPolyline(samples, point, tolerance) || this.isPointInsidePolygon(point, samples);
+        }
+
+        return false;
+    }
+
+    private hitTestLinear(
+        line: LinearObject,
+        point: IPoint,
+        tolerance: number,
+        transform: { scale: number; offsetX: number; offsetY: number },
+    ): boolean {
+        const start = toScreenPoint(line.p1.x, line.p1.y, transform);
+        const end = toScreenPoint(line.p2.x, line.p2.y, transform);
+        const dx = end.x - start.x;
+        const dy = end.y - start.y;
+        const lengthSquared = dx * dx + dy * dy;
+        if (lengthSquared < 1e-9) return Math.hypot(point.x - start.x, point.y - start.y) <= tolerance;
+
+        const projectedT = ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared;
+        let t = projectedT;
+        if (line instanceof Segment) {
+            if (t < 0 || t > 1) return false;
+        } else if (line instanceof Ray) {
+            if (t < 0) return false;
+        }
+        // Line 使用无限延伸，Ray 只限制起点方向；只有 Segment 需要夹在两个端点之间。
+        if (line instanceof Segment) t = Math.max(0, Math.min(1, t));
+        const closest = { x: start.x + t * dx, y: start.y + t * dy };
+        return Math.hypot(point.x - closest.x, point.y - closest.y) <= tolerance;
+    }
+
+    private hitTestPolyline(points: IPoint[], point: IPoint, tolerance: number): boolean {
+        for (let i = 1; i < points.length; i++) {
+            const start = points[i - 1];
+            const end = points[i];
+            const dx = end.x - start.x;
+            const dy = end.y - start.y;
+            const lengthSquared = dx * dx + dy * dy;
+            const t = lengthSquared < 1e-9
+                ? 0
+                : Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared));
+            const closest = { x: start.x + t * dx, y: start.y + t * dy };
+            if (Math.hypot(point.x - closest.x, point.y - closest.y) <= tolerance) return true;
+        }
+        return false;
+    }
+
+    private isPointInsidePolygon(point: IPoint, vertices: IPoint[]): boolean {
+        let inside = false;
+        for (let i = 0, j = vertices.length - 1; i < vertices.length; j = i++) {
+            const a = vertices[i];
+            const b = vertices[j];
+            const intersects = ((a.y > point.y) !== (b.y > point.y)) &&
+                point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x;
+            if (intersects) inside = !inside;
+        }
+        return inside;
+    }
+
+    private sampleCircularRegion(region: CircularRegion, transform: { scale: number; offsetX: number; offsetY: number }): IPoint[] {
+        const samples: IPoint[] = [
+            toScreenPoint(region.startPoint.x, region.startPoint.y, transform),
+            toScreenPoint(region.endPoint.x, region.endPoint.y, transform),
+        ];
+        const span = region.counterclockwise
+            ? region.arcStartAngle - region.arcEndAngle
+            : region.arcEndAngle - region.arcStartAngle;
+        const steps = Math.max(16, Math.ceil(Math.abs(span) * 24));
+        for (let i = 0; i <= steps; i++) {
+            const ratio = i / steps;
+            const angle = region.counterclockwise
+                ? region.arcStartAngle - span * ratio
+                : region.arcStartAngle + span * ratio;
+            samples.push(toScreenPoint(
+                region.circle.center.x + region.circle.radius * Math.cos(angle),
+                region.circle.center.y - region.circle.radius * Math.sin(angle),
+                transform,
+            ));
+        }
+        return samples;
     }
 
     // 公共方法，获取命名对象
@@ -2992,4 +4297,50 @@ export class GeometryDSLInterpreter {
         this.state.canvas = canvas;
         this.state.ctx = canvas.getContext('2d') || undefined;
     }
+}
+
+// TEXT 指令的 text="..." 值如果因为太长被作者换行写，原始脚本是按 \n
+// 拆成多行的，第二行会被当成新指令丢掉。这里在切行前先扫描，
+// 把 text=" 或 t=" 后面缺少闭合引号的行与后续行直接拼接（不加分隔符，
+// 避免破坏 LaTeX 的连续性，如 "$m=a^2+bn\n+c$" 必须拼成 "$m=a^2+bn+c$"）。
+function joinMultilineText(script: string): string {
+    const lines = script.split('\n');
+    const out: string[] = [];
+    let i = 0;
+    while (i < lines.length) {
+        let line = lines[i];
+        while (hasUnclosedTextQuote(line)) {
+            if (i + 1 >= lines.length) break;
+            i++;
+            line = line + lines[i];
+        }
+        out.push(line);
+        i++;
+    }
+    return out.join('\n');
+}
+
+// 行内是否出现 text=" 或 t=" 之后缺少成对引号的情况。
+// 仅作为粗略判别：用 `\b(?:text|t)="` 锁定引号起点，再统计从这个 `"` 到行末
+// 之间未转义的 `"` 个数（奇数 = 未闭合）。
+function hasUnclosedTextQuote(line: string): boolean {
+    const re = /\b(?:text|t)="/g;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(line)) !== null) {
+        const quoteIdx = match.index + match[0].length - 1;
+        let count = 1;
+        let k = quoteIdx + 1;
+        while (k < line.length) {
+            const ch = line[k];
+            if (ch === '\\' && k + 1 < line.length) {
+                k += 2;
+                continue;
+            }
+            if (ch === '"') count++;
+            k++;
+        }
+        if (count % 2 === 1) return true;
+        re.lastIndex = quoteIdx + 1;
+    }
+    return false;
 }

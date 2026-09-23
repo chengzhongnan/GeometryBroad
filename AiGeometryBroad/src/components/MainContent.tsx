@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import styled from 'styled-components';
 
 import TabsPanel from './TabsPanel';
@@ -6,11 +6,53 @@ import AIChatPanel from './AIChatPanel';
 import ScriptInputPanel from './ScriptInputPanel';
 import OutputPanel, { type LogMessage } from './OutputPanel';
 import GeometricCanvas from './GeometryCanvas';
+import type { GeometryOperation } from './GeometryCanvas';
 import ScriptTreePanel from './ScriptTreePanel';
+import type { FileNodeData } from './TreeNode';
 
 import { useContainerSize } from '../hooks/useContainerSize';
 
 import { INITIAL_USER_INPUT } from './InitScript';
+import type { VariableInfo } from '../core/DSLInterpreter';
+import type { IPoint } from '../core/geometry/base';
+
+const SCRIPT_STORAGE_KEY = 'geo-script-last-code';
+const FILES_STORAGE_KEY = 'geo-script-files';
+
+const DEFAULT_FILES: FileNodeData[] = [
+    {
+        id: '1',
+        name: 'scripts',
+        type: 'folder',
+        children: [
+            { id: '2', name: 'create_geometry.geo', type: 'file', content: INITIAL_USER_INPUT },
+        ],
+    },
+    { id: '4', name: 'README.md', type: 'file', content: '# GeometryBroad scripts\\n' },
+];
+
+function updateFileContent(nodes: FileNodeData[], fileId: string, content: string): FileNodeData[] {
+    return nodes.map(node => {
+        if (node.id === fileId && node.type === 'file') {
+            return { ...node, content };
+        }
+        if (node.children) {
+            return { ...node, children: updateFileContent(node.children, fileId, content) };
+        }
+        return node;
+    });
+}
+
+function findFile(nodes: FileNodeData[], fileId: string): FileNodeData | null {
+    for (const node of nodes) {
+        if (node.id === fileId && node.type === 'file') return node;
+        if (node.children) {
+            const match = findFile(node.children, fileId);
+            if (match) return match;
+        }
+    }
+    return null;
+}
 
 function MainContent() {
 
@@ -19,16 +61,32 @@ function MainContent() {
     const [isLoading, setIsLoading] = useState<boolean>(false);
     const [error, setError] = useState<string | null>(null);
     const [revision, setRevision] = useState<number>(0);
+    const [files, setFiles] = useState<FileNodeData[]>(() => {
+        const savedFiles = localStorage.getItem(FILES_STORAGE_KEY);
+        if (!savedFiles) return DEFAULT_FILES;
+        try {
+            const parsed = JSON.parse(savedFiles) as FileNodeData[];
+            return Array.isArray(parsed) ? parsed : DEFAULT_FILES;
+        } catch {
+            return DEFAULT_FILES;
+        }
+    });
+    const [activeFileId, setActiveFileId] = useState<string | null>(null);
+    const [saveStatus, setSaveStatus] = useState<string>('');
 
     const [canvasWrapperRef, canvasDimensions] = useContainerSize<HTMLDivElement>();
 
     // 创建 state 存储日志消息
     const [logMessages, setLogMessages] = useState<LogMessage[]>([]);
+    const [variables, setVariables] = useState<VariableInfo[]>([]);
+    const [frozenRandomVariables, setFrozenRandomVariables] = useState<Record<string, number>>({});
+    const [frozenRandomObjects, setFrozenRandomObjects] = useState<Record<string, { x: number; y: number }>>({});
+    const [selectedObjectNames, setSelectedObjectNames] = useState<string[]>([]);
+    const selectedObjectName = selectedObjectNames[selectedObjectNames.length - 1] || null;
+    const [selectedLabelId, setSelectedLabelId] = useState<string | null>(null);
+    const [labelPositions, setLabelPositions] = useState<Record<string, IPoint>>({});
     // 使用 useRef 来为每条消息生成一个唯一的ID，避免不必要的重渲染
     const messageIdCounter = useRef(0);
-
-    // 定义一个用于本地存储的常量键
-    const SCRIPT_STORAGE_KEY = 'geo-script-last-code';
 
     const [script, setScript] = useState<string>(() => {
         const savedScript = localStorage.getItem(SCRIPT_STORAGE_KEY);
@@ -36,18 +94,151 @@ function MainContent() {
         return savedScript || INITIAL_USER_INPUT;
     });
 
+    const handleSelectFile = useCallback((file: FileNodeData) => {
+        if (file.type !== 'file') return;
+        setActiveFileId(file.id);
+        setScript(file.content || '');
+        setSaveStatus('');
+    }, []);
+
+    const handleSaveScript = useCallback(() => {
+        localStorage.setItem(SCRIPT_STORAGE_KEY, script);
+        if (activeFileId) {
+            const nextFiles = updateFileContent(files, activeFileId, script);
+            setFiles(nextFiles);
+            localStorage.setItem(FILES_STORAGE_KEY, JSON.stringify(nextFiles));
+            const activeFile = findFile(nextFiles, activeFileId);
+            setSaveStatus(activeFile ? `Saved ${activeFile.name}` : 'Saved script');
+        } else {
+            setSaveStatus('Saved last script');
+        }
+    }, [activeFileId, files, script]);
+
+    const handleFilesChange = useCallback((nextFiles: FileNodeData[]) => {
+        setFiles(nextFiles);
+        localStorage.setItem(FILES_STORAGE_KEY, JSON.stringify(nextFiles));
+    }, []);
+
     const handleExecuteScript = () => {
         localStorage.setItem(SCRIPT_STORAGE_KEY, script);
         setLogMessages([]);
         setGeneratedScript(script);
-        setRevision(revision + 1);
+        setRevision(previous => previous + 1);
     };
 
-    const handleClearOutputMessage = () => {
+    const handleClearOutputMessage = useCallback(() => {
         setLogMessages([]);
-    }
+    }, []);
 
-    const handleGeometryMessage = (level: string, line: number, message: string) => {
+    const handleVariablesChange = useCallback((nextVariables: VariableInfo[]) => {
+        setVariables(nextVariables);
+    }, []);
+
+    const handleCanvasSelectObject = useCallback((name: string | null, additive = false) => {
+        setSelectedObjectNames(previous => {
+            let next: string[];
+            if (!name) {
+                next = [];
+            } else if (additive) {
+                next = previous.includes(name)
+                    ? previous.filter(item => item !== name)
+                    : [...previous, name];
+            } else {
+                next = [name];
+            }
+            return next;
+        });
+        setSelectedLabelId(null);
+    }, []);
+
+    const handleCanvasSelectLabel = useCallback((labelId: string | null) => {
+        setSelectedLabelId(labelId);
+        setSelectedObjectNames([]);
+    }, []);
+
+    const handleLabelPositionChange = useCallback((labelId: string, position: IPoint) => {
+        setLabelPositions(previous => ({
+            ...previous,
+            [labelId]: position,
+        }));
+    }, []);
+
+    const handleGeometryOperation = useCallback((operation: GeometryOperation, objectNames: string[]) => {
+        const makeUniqueName = (prefix: string) => {
+            let candidate = prefix;
+            let suffix = 2;
+            while (script.includes(`name=${candidate}`)) {
+                candidate = `${prefix}_${suffix++}`;
+            }
+            return candidate;
+        };
+
+        let command: string;
+        if (operation === 'segment' || operation === 'line' || operation === 'perpBisector') {
+            if (objectNames.length !== 2) return;
+            const [p1, p2] = objectNames;
+            const commandName = makeUniqueName(`${operation === 'segment' ? 'seg' : operation === 'line' ? 'line' : 'pb'}_${p1}_${p2}`);
+            const commandType = operation === 'segment'
+                ? 'SEGMENT'
+                : operation === 'line'
+                    ? 'LINE'
+                    : 'PERP_BISECTOR';
+            command = `CREATE ${commandType} name=${commandName} p1=${p1} p2=${p2} draw=true`;
+        } else {
+            if (objectNames.length !== 2) return;
+            const pointName = objectNames.find(name => variables.find(variable => variable.name === name)?.objectType === 'point');
+            const lineName = objectNames.find(name => {
+                const type = variables.find(variable => variable.name === name)?.objectType;
+                return type === 'line' || type === 'segment' || type === 'ray';
+            });
+            if (!pointName || !lineName) return;
+            const commandName = makeUniqueName(`perp_${pointName}_${lineName}`);
+            command = `CREATE PERPENDICULAR name=${commandName} point=${pointName} line=${lineName} draw=true`;
+        }
+
+        const nextScript = script.trim()
+            ? `${script.trimEnd()}\n\n${command}`
+            : command;
+        setScript(nextScript);
+        setGeneratedScript(nextScript);
+        localStorage.setItem(SCRIPT_STORAGE_KEY, nextScript);
+        setLogMessages([]);
+        setRevision(previous => previous + 1);
+    }, [script, variables]);
+
+    const handleToggleRandomVariable = useCallback((name: string, frozen: boolean) => {
+        setFrozenRandomVariables(previous => {
+            const next = { ...previous };
+            if (frozen) {
+                const variable = variables.find(item => item.name === name);
+                if (variable && typeof variable.value === 'number') {
+                    next[name] = variable.value;
+                }
+            } else {
+                delete next[name];
+            }
+            return next;
+        });
+    }, [variables]);
+
+    const handleToggleRandomObject = useCallback((name: string, frozen: boolean) => {
+        setFrozenRandomObjects(previous => {
+            const next = { ...previous };
+            if (frozen) {
+                const object = variables.find(item => item.name === name && item.randomObject);
+                const x = object?.details?.['position.x'];
+                const y = object?.details?.['position.y'];
+                if (x !== undefined && y !== undefined) {
+                    next[name] = { x: Number(x), y: Number(y) };
+                }
+            } else {
+                delete next[name];
+            }
+            return next;
+        });
+    }, [variables]);
+
+    const handleGeometryMessage = useCallback((level: string, line: number, message: string) => {
         const newMessage: LogMessage = {
             id: messageIdCounter.current++,
             level,
@@ -56,18 +247,26 @@ function MainContent() {
         };
         // 使用函数式更新来安全地追加新消息
         setLogMessages(prevMessages => [...prevMessages, newMessage]);
-    }
+    }, []);
 
     return (
         <PageContainer>
             <IntegratedWorkspace>
                 <TabsPanel >
-                    <ScriptTreePanel title='ScriptFiles'></ScriptTreePanel>
+                    <ScriptTreePanel
+                        title='ScriptFiles'
+                        files={files}
+                        activeFileId={activeFileId}
+                        onFilesChange={handleFilesChange}
+                        onSelectFile={handleSelectFile}
+                    />
                     <ScriptInputPanel
                         title="Script Input"
                         script={script}
                         onScriptChange={setScript}
                         onExecute={handleExecuteScript}
+                        onSave={handleSaveScript}
+                        saveStatus={saveStatus}
                     />
                     <AIChatPanel
                         title='AI Chat'
@@ -83,11 +282,29 @@ function MainContent() {
                             revision={revision}
                             onGeometryMessage={handleGeometryMessage}
                             onClearMessage={handleClearOutputMessage}
+                            frozenRandomVariables={frozenRandomVariables}
+                            frozenRandomObjects={frozenRandomObjects}
+                            selectedObjectNames={selectedObjectNames}
+                            selectedLabelId={selectedLabelId}
+                            labelPositions={labelPositions}
+                            onSelectObject={handleCanvasSelectObject}
+                            onSelectLabel={handleCanvasSelectLabel}
+                            onLabelPositionChange={handleLabelPositionChange}
+                            onGeometryOperation={handleGeometryOperation}
+                            onVariablesChange={handleVariablesChange}
                         />
                     )}
                 </CanvasWrapper>
 
-                <OutputPanel title="Output Panel" logs={logMessages} />
+                <OutputPanel
+                    title="Output Panel"
+                    logs={logMessages}
+                    variables={variables}
+                    onToggleRandomVariable={handleToggleRandomVariable}
+                    onToggleRandomObject={handleToggleRandomObject}
+                    selectedObjectName={selectedObjectName}
+                    onSelectObject={handleCanvasSelectObject}
+                />
             </IntegratedWorkspace>
         </PageContainer>
     );

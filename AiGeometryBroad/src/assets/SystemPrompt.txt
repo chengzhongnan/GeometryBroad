@@ -72,7 +72,23 @@
         * `DRAW obj=seg_AB width=3 color=blue style=dashed label=线段AB`
         * `DRAW obj=A,B,C color=red radius=5`
 
-#### **1.4 `MEASURE`**
+#### **1.4 `TEXT`**
+
+* `TEXT x=<num> y=<num> text=<text> [options...]`
+    * **描述**: 在绘图区绘制普通文字，Canvas 和 SVG 导出均支持。
+    * **参数**: `x`, `y` 为逻辑坐标；`text` 或 `t` 为文字内容（可包含空格，建议放在行尾）；可选 `color/c`, `fontSize/fs`, `fontFamily`, `fontStyle`, `fontWeight`, `backgroundColor/bgc`, `padding/p`。文字中可使用 `{slot}`。
+    * **示例**: `TEXT x=2 y=3 text="距离 AB = {dist_AB}" color=blue fontSize=16`
+
+#### **1.5 `FILL`**
+
+* `FILL obj=<object> color=<color> [borderColor=<color>] [width=<num>]`
+    * **描述**: 给一个已创建的封闭对象填充颜色。支持普通 `REGION`、圆弓形 `REGION`、曲线-圆 `REGION`、`POLYGON`、`TRIANGLE`、`RECTANGLE`、`CIRCLE` 和 `ELLIPSE`。
+    * `color`: 填充颜色，支持 CSS 颜色名、十六进制颜色和 `{slot}`。
+    * `borderColor`: (可选) 边界线颜色，默认使用当前几何图形颜色。
+    * **示例**: `FILL obj=R color=lightblue borderColor=blue`
+    * **准确性说明**: 区域边界由实际几何坐标组成，Canvas 和 SVG 都直接绘制同一条闭合路径，不使用截图或像素取样。
+
+#### **1.5 `MEASURE`**
 
 * `MEASURE type=<type> ... slot=<s>`
     * **描述**: 测量几何对象的属性（如距离、角度、面积）并将结果存入一个插槽 (Slot) 中。
@@ -113,8 +129,29 @@
     * **参数**:
         * `message` 或 `m`: (必须) 要显示的文本。**注意**：`message=` 后面的所有内容都将被视为消息文本，直到行尾，因此不需要使用引号。
     * **示例**: `PRINT message=当前距离是 {dist_AB} 个单位。`
+    * **LaTeX**: 消息中的 `$...$`、`$$...$$`、`\\(...\\)` 和 `\\[...\\]` 会在消息面板中渲染为 LaTeX。
 
-#### **1.8 `CODE` / `RUN` / `WITH`**
+#### **1.8 `SET`**
+
+* `SET item=<item> value=<value>`
+    * **描述**: 修改一个全局默认参数，影响之后创建/绘制的所有对象。
+    * **参数**:
+        * `item` (必须): 要设置的选项名称。
+        * `value` (必须): 要设置的值，可以是数字，也可以是 `{slot}` 表达式。
+    * **可用 item**:
+        * `backgroundColor`: 画布背景色。
+        * `penColor` / `geoColor`: 默认画笔/几何图形颜色。
+        * `penSize`: 默认画笔粗细。
+        * `labelFont` / `labelColor` / `labelSize`: 标签字体、颜色、字号。
+        * `pointRadius` / `pointFill`: 默认点半径、是否填充。
+        * `drawLabelForPoints` / `drawLabelForOthers` / `drawAfterCreate`: 是否自动绘制标签/创建对象后自动绘制。
+        * `centerX` / `centerY` / `scale`: 视图中心与缩放。
+        * **`lineLength`**: 直线(`LINE`)与射线(`RAY`)的绘制长度，单位为几何坐标。
+            * 未设置（或设为 `auto`、`0`）时，直线/射线默认**只画到屏幕边缘就停住**，不会无限延伸；这样导出 SVG 时画布不会被一条超长的直线撑大，几何图形也不会显得很小。
+            * 设置为正数 `n` 后：直线以 `p1`、`p2` 的中点为基准向两端各延伸 `n/2`（总长 `n`）；射线从顶点向前延伸 `n`。
+            * **示例**: `SET item=lineLength value=200`、`SET item=lineLength value=auto`
+
+#### **1.9 `CODE` / `RUN` / `WITH`**
 
 * **描述**: 用于定义、执行和有条件地执行代码块，以组织和重用指令序列。
 * **`CODE name=<block_name>`**: 开始一个命名代码块的定义。后续行直到 `]` 结束都属于该块。
@@ -163,15 +200,20 @@
     * **示例**: `CREATE POINT name=A x=100 y=200 radius=5`
 
 * **2.1.2 `CREATE LINE`**: `name=<name> p1=<point> p2=<point>`
-    * **描述**: 定义一条穿过两个已知点的无限长的直线。
-    * **示例**: `CREATE LINE name=l_AB p1=A p2=B`
+    * **描述**: 定义一条穿过两个已知点的直线。几何意义上它仍然可以向两端无限延伸（求交点等操作不受影响），但**绘制出来的长度是有限的**。
+    * **绘制长度**: 由 `SET item=lineLength value=<n>` 控制，以 `p1`、`p2` 的中点为基准向两端各延伸 `n/2`。未设置时默认只画到屏幕边缘。
+    * **示例**:
+        ```
+        SET item=lineLength value=200
+        CREATE LINE name=l_AB p1=A p2=B draw=true
+        ```
 
 * **2.1.3 `CREATE SEGMENT`**: `name=<name> p1=<point> p2=<point>`
     * **描述**: 定义一条连接两个已知点的线段。
     * **示例**: `CREATE SEGMENT name=seg_AB p1=A p2=B`
 
 * **2.1.4 `CREATE RAY`**: `name=<name> vertex=<point> p1=<point>`
-    * **描述**: 定义一条从`vertex`点出发，穿过`p1`点的射线。
+    * **描述**: 定义一条从`vertex`点出发，穿过`p1`点的射线。绘制长度同样受 `SET item=lineLength value=<n>` 控制（从顶点向前延伸 `n`），未设置时只画到屏幕边缘。
     * **参数**: `name`, `vertex`(或`v`), `p1`。
     * **示例**: `CREATE RAY name=ray_A vertex=A p1=B`
 
@@ -251,7 +293,23 @@
     * **参数**: `name`(必须), `points`(或`p`, 必须, 值为逗号分隔的点名列表)。
     * **示例**: `CREATE POLYGON name=my_quad points=A,B,C,D`
 
-* **2.5.2 `CREATE TRIANGLE`**: `name=<name> p1=<p1> p2=<p2> p3=<p3>`
+* **2.5.2 `CREATE REGION`**:
+    * 普通区域：`name=<name> boundary=<p1,p2,...>`
+    * 圆弓形区域：`name=<name> circle=<circle> line=<line> side=<left|right>`
+    * **普通区域描述**: `boundary` 中的点必须按照沿区域边界行走的顺序给出，系统会自动连接最后一点和第一点。
+    * **普通区域约束**: 区域采用简单多边形模型，支持凸多边形和凹多边形；边界不能自交，连续两个点不能重合。若最后再次写出第一点，系统会自动去重。
+    * **圆弓形描述**: `circle` 指定圆对象，`line` 必须指定 `LINE` 对象，且该直线必须与圆有两个交点；系统自动计算两个交点，并用一段精确圆弧和交点之间的弦线构成区域。
+    * `side=left` 或 `side=right` 按 `line.p1 -> line.p2` 的方向选择直线左侧或右侧的圆弓形区域，必须显式指定以避免歧义。
+    * **填充**: 使用 `FILL obj=<name> color=<color>`。
+    * **普通区域示例**: `CREATE REGION name=R boundary=A,B,C,D` 然后 `FILL obj=R color=lightblue borderColor=blue`。
+    * **圆弓形示例**: `CREATE CIRCLE name=C center=O radius=100`、`CREATE LINE name=L p1=P p2=Q`、`CREATE REGION name=cap circle=C line=L side=left`，然后 `FILL obj=cap color=lightblue borderColor=blue`。
+    * **错误检查**: 直线与圆不相交或相切时，不能形成有面积的圆弓形区域，系统会给出错误。
+    * **曲线-圆区域语法**: `CREATE REGION name=<name> curve=<curve> circle=<circle> side=<above|below>`。
+    * `curve` 必须是 `CREATE CURVE` 创建的 `y=f(x)` 曲线；系统在曲线的 `xstart` 到 `xend` 范围内数值寻找交点，要求恰有两个交点。
+    * `side=above` 选择圆弧中点位于曲线上方的区域，`side=below` 选择下方的区域。曲线边界按确定的采样点绘制，圆边界使用精确圆弧。
+    * **曲线-圆示例**: `CREATE FUNCTION name=square args=1 value={args[1]^2}`、`CREATE CURVE name=P func=square xstart=-1 xend=1`、`CREATE POINT name=O x=0 y=0`、`CREATE CIRCLE name=C center=O radius=1`、`CREATE REGION name=R curve=P circle=C side=above`，然后 `FILL obj=R color=lightgreen borderColor=green`。
+
+* **2.5.3 `CREATE TRIANGLE`**: `name=<name> p1=<p1> p2=<p2> p3=<p3>`
     * **描述**: 通过三个顶点创建一个**三角形**。
     * **参数**: `name`(必须), `p1`(必须), `p2`(必须), `p3`(必须)。
     * **示例**: `CREATE TRIANGLE name=tri1 p1=A p2=B p3=C`
@@ -385,9 +443,12 @@
 
 #### **3.3 `CREATE ANIMATION`**
 
-* `CREATE ANIMATION name=<name> code=<code> slot=<s> [interval=<ms>] [repeat=<bool>]`
+* `CREATE ANIMATION name=<name> code=<code> slot=<s> [interval=<ms>] [repeat=<bool>] [period=<n>]`
     * **描述**: 定义并启动一个动画。动画的核心机制是一个定时器，它会以固定的时间间隔（`interval`）重复执行一个已定义的**代码块**（`code`）。最关键的是，每执行一次代码块（即每播放一“帧”），`CREATE ANIMATION`指令会自动将指定的**插槽**（`slot`）的值加1。任何依赖于这个插槽的几何对象都会因此而更新位置或形态，从而形成动画。
+    * **SVG 导出**: 当 `repeat=true` 时，导出按钮会采样一个完整周期并生成循环 SVG。使用可选参数 `period=<n>` 明确指定一个完整周期包含的帧数，导出时会严格采样这 `n` 帧；未指定 `period` 时，如果动画表达式中能识别 `slot % n`，会自动推断周期；两者都没有时默认采样 60 帧。
     * **参数**:
+        * `period`: (可选) 完整动画周期的帧数，必须是正整数。例如 `period=40` 表示每 40 帧回到同一周期状态。该参数主要影响 SVG 导出采样，不改变 `interval` 的实时播放速度。
+        * 兼容别名: `frames`、`periodFrames`（推荐使用 `period`）。
         * `name`: (必须) 为这个动画进程指定一个唯一的名称。
         * `code` 或 `c`: (必须) 在每一帧需要被执行的 `CODE` 代码块的名称。
         * `slot` 或 `s`: (必须) 与动画绑定的插槽名称。该插槽的值会从`0`开始，每帧自动递增。
@@ -408,7 +469,7 @@
         create triangle name=ABC p1=A p2=B p3=C draw=true color=red
         ] 
         
-        create ANIMATION name=ani1 interval=100 repeat=true code=triangle slot=slot_ani
+        create ANIMATION name=ani1 interval=100 repeat=true period=40 code=triangle slot=slot_ani
         ```
 
 #### **3.4  `CREATE FUNCTION`
