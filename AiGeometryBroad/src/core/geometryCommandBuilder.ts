@@ -29,7 +29,8 @@ export type SelectionOperation =
     | 'circumcircle'
     | 'incircle'
     | 'angleBisector'
-    | 'parallelogram';
+    | 'parallelogram'
+    | 'circleWithDiameter';
 
 /** 需要三个点才能做的操作。菜单按这个集合决定要不要给「三点作图」那一组。 */
 export const THREE_POINT_OPERATIONS: readonly SelectionOperation[] = ['triangle', 'circumcircle', 'incircle'];
@@ -39,6 +40,9 @@ export const TWO_LINEAR_OPERATIONS: readonly SelectionOperation[] = ['angleBisec
 
 /** 需要两个圆的操作。 */
 export const TWO_CIRCLE_OPERATIONS: readonly SelectionOperation[] = ['circleIntersect'];
+
+/** 需要两个点、以这两点连线为直径作圆的操作。 */
+export const TWO_POINT_DIAMETER_OPERATIONS: readonly SelectionOperation[] = ['circleWithDiameter'];
 
 /** 需要一个点 + 一个圆的操作（过点作切线）。 */
 export const POINT_CIRCLE_OPERATIONS: readonly SelectionOperation[] = ['pointCircleTangent'];
@@ -77,13 +81,14 @@ export type PickOperation =
     | 'perpendicular'
     | 'reflectPoint'
     | 'tangentToCircle'
+    // —— 点：以该点为圆心，再点一个点定半径
+    | 'circleWithCenter'
     // —— 线：多数只需要填参数，不需要再点选
     | 'pointOnLine'
     | 'divide'
     | 'extend'
     | 'intersect'
-    | 'perpBisector'
-    | 'cutSegment';
+    | 'perpBisector';
 
 /** 对话框里允许用户点选的目标类型；null 表示这个操作不需要点选。 */
 export type PickKind = 'point' | 'linear' | 'circle';
@@ -101,9 +106,6 @@ export type ExtendMode = 'length' | 'line';
 
 /** 「延长」的方向。射线只有向前一个方向，所以它不会拿到 start/both。 */
 export type ExtendSide = 'both' | 'start' | 'end';
-
-/** 「截取线段」从哪一端开始量。 */
-export type CutFrom = 'start' | 'end';
 
 /** 解释器里对象的类型名（与几何类的 type 字段一致）。 */
 export const POINT_TYPE = 'point';
@@ -338,10 +340,10 @@ export const PICK_OPERATION_LABELS: Record<PickOperation, string> = {
     perpendicular: '过该点作垂线…',
     reflectPoint: '关于直线作对称点…',
     tangentToCircle: '过该点作圆的切线…',
+    circleWithCenter: '以该点为圆心作圆…',
     pointOnLine: '在线上取点…',
     divide: '取 N 等分点…',
     extend: '延长…',
-    cutSegment: '截取线段…',
     perpBisector: '作中垂线',
     intersect: '与另一条线求交点…',
 };
@@ -351,12 +353,14 @@ export const PICK_OPERATION_LABELS: Record<PickOperation, string> = {
 const PICK_OPERATIONS_BY_TYPE: Record<string, PickOperation[]> = {
     // 「过该点作圆的切线」放最前：右键一个点时它是最常见的诉求之一，
     // 也是唯一一个需要再点选「圆」这个第三类目标的操作。
-    point: ['tangentToCircle', 'connect', 'parallel', 'perpendicular', 'reflectPoint'],
-    // 等分 / 延长 / 截取都要求对象有确定的「两个定义点」，线段和射线都满足。
+    point: ['tangentToCircle', 'circleWithCenter', 'connect', 'parallel', 'perpendicular', 'reflectPoint'],
+    // 等分 / 延长都要求对象有确定的「两个定义点」，线段和射线都满足。
     // 「在线上取点」排在最前：它是线上最基础的操作，其余都是在它的基础上派生的。
-    segment: ['pointOnLine', 'divide', 'extend', 'cutSegment', 'perpBisector', 'intersect'],
-    ray: ['pointOnLine', 'divide', 'extend', 'cutSegment', 'perpBisector', 'intersect'],
-    // 直线是无限长的，「等分」「延长」「截取」都没有意义，只留取点、中垂线与求交点。
+    // 「截取」不在这张表里：它走右键菜单里独立的 `trimMode` 会话（见 GeometryCanvas），
+    // 只改写原对象的 cutPoints、不生成任何新点/新对象，三种线性对象共用同一条路径。
+    segment: ['pointOnLine', 'divide', 'extend', 'perpBisector', 'intersect'],
+    ray: ['pointOnLine', 'divide', 'extend', 'perpBisector', 'intersect'],
+    // 直线是无限长的，「等分」「延长」都没有意义，只留取点、中垂线与求交点。
     line: ['pointOnLine', 'perpBisector', 'intersect'],
     // 圆：过某点作圆的切线（切点 + 切线）。点和圆一起选中时也有同样的菜单。
     circle: ['tangentToCircle'],
@@ -472,6 +476,14 @@ export function describePickOperation(
                 ],
                 defaults: { showTangentPoints: true },
             };
+        case 'circleWithCenter':
+            return {
+                title: '以该点为圆心作圆',
+                hint: `点击另一个点，以 ${anchorName} 为圆心、两点的距离为半径作圆`,
+                pick: 'point',
+                fields: [],
+                defaults: {},
+            };
         case 'pointOnLine':
             return {
                 title: '在线上取点',
@@ -511,32 +523,6 @@ export function describePickOperation(
                     ? [EXTEND_MODE_FIELD, EXTEND_LENGTH_FIELD]
                     : [EXTEND_MODE_FIELD, EXTEND_LENGTH_FIELD, EXTEND_SIDE_FIELD],
                 defaults: { mode: 'length', length: 2, side: 'end' },
-            };
-        case 'cutSegment':
-            return {
-                title: '截取线段',
-                hint: `从 ${anchorName} 的一端量出指定长度，生成一段新的线段`,
-                pick: null,
-                fields: [
-                    {
-                        kind: 'number',
-                        key: 'length',
-                        label: '截取长度',
-                        min: 0.1,
-                        max: 10000,
-                        step: 0.5,
-                    },
-                    {
-                        kind: 'select',
-                        key: 'from',
-                        label: '从哪一端',
-                        options: [
-                            { value: 'start', label: '起点端' },
-                            { value: 'end', label: '终点端' },
-                        ],
-                    },
-                ],
-                defaults: { length: 2, from: 'start' },
             };
         case 'perpBisector':
             return {
@@ -720,76 +706,62 @@ export function listLinearPieces(
     return { pieces, cuts: inDomain };
 }
 
-export interface LinearTrimResult {
-    /** 结果对象名。新的截止点算法通常只有一个结果并沿用原对象名。 */
-    name: string;
-    /** 结果类型；LINE 保持为 line，RAY/SEGMENT 只在需要改变端点时使用。 */
-    resultType: 'line' | 'segment' | 'ray';
-    /** 线段是起点，射线是顶点。 */
-    keepP1: string;
-    /** 线段是终点，射线是方向点。 */
-    keepP2: string;
-}
-
-export interface LinearPieceTrimPlan {
-    /** 删掉一段之后的定义结果。新的 LINE/RAY 算法通常只有一个结果。 */
-    results: LinearTrimResult[];
-    /** 写入原定义行的截止点数组，带方向前缀：`+A` 砍正方向一侧，`-A` 砍负方向一侧。 */
-    cutPointNames?: string[];
-    /**
-     * 需要在删除**之前**追加到脚本的指令。
-     *
-     * 鼠标停在无界尾部（`−∞ → A` / `A → +∞`）时，这一段的边界点根本不存在，
-     * 只能按鼠标投影位置现场造一个点当边界 —— 这一条就是那条 `MEASURE` + `POINT_ON_LINE`。
-     * 生成的点沿用「在线上取点」的槽位表达式写法，所以拖动原线端点后它依旧贴在线上同一相对位置。
-     */
-    preludeCommands?: string[];
+/**
+ * 一次「截取」的规划结果 —— **只有一串要写回 `cutPoints=` 的点名**。
+ *
+ * 这里刻意什么都不多给：没有「结果对象」、没有替换端点、没有待追加的指令。
+ * 截取的语义就是「把原定义行的 cutPoints 换成这一串」，对象本身不动，
+ * 因此这条路径**不可能**创建任何新点或新对象。
+ *
+ * token 带方向前缀（`+A` 砍正方向一侧、`-A` 砍负方向一侧）；
+ * 无界那一侧刻意不写 token，等于把那条无限延伸的部分整条删掉。
+ */
+export interface LinearTrimPlan {
+    /** 写入原定义行的截止点数组，带方向前缀。 */
+    cutPoints: string[];
 }
 
 export interface LinearPieceTrimOutcome {
-    plan: LinearPieceTrimPlan | null;
+    plan: LinearTrimPlan | null;
     /** 不能截取的原因，直接给用户看。 */
     blocked?: string;
 }
 
-
 /**
- * 规划一次「删掉线上某一段」的截止点写回。
+ * 规划一次「删掉线上某一段」。
  *
- * 规划结果始终沿用原对象名和原定义点，只返回要追加到 cutPoints 的**带方向**点名：
+ * 只返回要写回 `cutPoints=` 的**带方向**点名：
  *   - `+A` 隐藏 A 的正方向一侧（保留参数 ≤ A 的部分）；
  *   - `-A` 隐藏 A 的负方向一侧（保留参数 ≥ A 的部分）。
  *
- * 于是「删掉 A→B 这一段」= `+A,-B`，`-∞ → A` = `-A`，`B → +∞` = `+B`，
- * 三段情形一套写法，不需要为射线头部 / 直线左尾各写一个特例，
- * 也不需要交换定义点（派生线的定义点本来就交换不了）。
+ * 于是「删掉 A→B 这一段」= `+A,-B`，`−∞ → A` = `-A`，`B → +∞` = `+B`，
+ * 三段情形一套写法，不需要为射线头部 / 直线左尾各写一个特例。
  *
- * 脚本因此只需修改原定义行，不创建替代对象、遮罩对象或额外 DRAW。
+ * **无界的那一侧（`startName` / `endName` 为 `null`）刻意不写 token**：
+ * 少一个 token 就等于把那一整条无限延伸的部分删干净。这里绝不按鼠标位置
+ * 现场造截点 —— `getVisibleParameterIntervals` 的语义是「最靠左那个截止点的
+ * 方向决定起点状态，之后逐个翻转」，多插一个鼠标截点只会让尾巴从截点处
+ * 留一小截（`+cut,-A` 保留 `(−∞, cut]`），无限长的部分照旧画着。
  *
  * ---
  *
  * `pieceIndex` 是给「点菜单里第 n 段」这种确定位置用的。鼠标交互走的是
- * `tMouse`：只交出鼠标在线上投影的参数位置，由这里**按绝对值最近**找界的那个已知点，
- * 再删掉鼠标所在的相邻两点之间那一段。
+ * `tMouse`：只交出鼠标在线上投影的参数位置，由这里**按区间包含**找出
+ * 鼠标所在的相邻两点之间那一段。
  *
  * 为什么必须按鼠标重新算而不是用界面高亮的 index：
  * 界面上的分段按「定义点」划分，鼠标常离某个界点很近却落在相邻段里，
  * 直接按 index 删会多砍一截。按 `tMouse` 就近吸附才符合「删除不要过长」的直觉。
- *
- * 鼠标落在无界尾部时（`−∞ → A` 或 `A → +∞`），这一段的远端界点不存在，
- * 就在鼠标投影处现场造一个点当边界（`preludeCommands`），返回的名字由调用方一起写进 cutPoints。
  */
 export function planLinearPieceRemoval(
-    spec: { anchorName: string; anchorType: string; pieceIndex?: number; tMouse?: number; mousePoint?: Point2D },
+    spec: { anchorName: string; anchorType: string; pieceIndex?: number; tMouse?: number },
     context: CommandBuildContext,
 ): LinearPieceTrimOutcome {
     const { anchorName, anchorType } = spec;
+    if (!anchorName) return { plan: null, blocked: '没有可截取的对象' };
+
     const set = listLinearPieces({ anchorName, anchorType }, context);
     if (set.blocked) return { plan: null, blocked: set.blocked };
-
-    const endpoints = context.getLinearEndpoints?.(anchorName);
-    if (!endpoints) return { plan: null, blocked: `拿不到 ${anchorName} 的定义点，无法截取` };
-    const { p1, p2 } = endpoints;
 
     const domainLo = anchorType === 'line' ? null : 0;
     const domainHi = anchorType === 'segment' ? 1 : null;
@@ -804,42 +776,20 @@ export function planLinearPieceRemoval(
 
     if (!target) return { plan: null, blocked: '这一段不存在' };
 
-    const resultType = anchorType === 'segment' ? 'segment' : anchorType === 'ray' ? 'ray' : 'line';
-    const results: LinearTrimResult[] = [{ name: anchorName, resultType, keepP1: p1, keepP2: p2 }];
-
-    let cutPointNames = [
+    // 有界的那一侧照旧翻转：「删掉 A→B」= `+A,-B`。
+    // 无界的那一侧不写任何 token —— 少一个 token 就等于把那一整条尾巴删干净。
+    const cutPoints = [
         target.startName ? `+${target.startName}` : null,
         target.endName ? `-${target.endName}` : null,
     ].filter((name): name is string => name !== null);
 
-    // 鼠标那一侧的界点不存在（无界尾部）：现场造一个点补上。
-    const needsStartPoint = target.startName === null;
-    const needsEndPoint = target.endName === null;
-
-    if (needsStartPoint || needsEndPoint) {
-        if (!spec.mousePoint) return { plan: null, blocked: '拿不到鼠标位置，无法在这一侧生成截点' };
-        const coords = context.getLinearEndpointCoords?.(anchorName);
-        if (!coords) return { plan: null, blocked: `拿不到 ${anchorName} 的坐标，无法生成截点` };
-
-        const t = projectOntoLinear(spec.mousePoint, coords.p1, coords.p2, 'line');
-        if (t === null) return { plan: null, blocked: '鼠标位置无法投影到线上' };
-
-        const allocated = allocateBoundaryPoint(anchorName, t, p1, p2, context);
-        if (!allocated) return { plan: null, blocked: '无法生成截取用的边界点' };
-
-        if (needsStartPoint) cutPointNames = [`+${allocated.name}`, ...cutPointNames];
-        if (needsEndPoint) cutPointNames = [...cutPointNames, `-${allocated.name}`];
-
-        return {
-            plan: {
-                results,
-                cutPointNames,
-                preludeCommands: allocated.commands,
-            },
-        };
+    // 两端全无界（整条对象都是无限延伸的部分）说明分段根本没算出来，
+    // listLinearPieces 那边已经挡过；这里兜底，绝不返回空串把线整条抹掉。
+    if (cutPoints.length === 0) {
+        return { plan: null, blocked: `${anchorName} 上找不到可用的截取边界` };
     }
 
-    return { plan: { results, cutPointNames } };
+    return { plan: { cutPoints } };
 }
 
 /**
@@ -867,34 +817,6 @@ function resolvePieceByMouse(
     return set.pieces.find(piece =>
         t >= (piece.startT ?? -Infinity) - PIECE_EPSILON
         && t <= (piece.endT ?? Infinity) + PIECE_EPSILON);
-}
-
-/**
- * 在鼠标投影位置生成一个可写回脚本的边界点。
- *
- * 用「在线上取点」那一套槽位表达式（`MEASURE type=distance` + `POINT_ON_LINE`），
- * 而不是写死坐标：这样拖动原线端点、重跑脚本后，截点会跟着回到线上同一个相对位置。
- * 距离一律从 `p1` 量出，`t < 0` 时改用 `p2` 作参考点（表达式里不出现负数字面量）。
- */
-function allocateBoundaryPoint(
-    anchorName: string,
-    t: number,
-    p1: string,
-    p2: string,
-    context: CommandBuildContext,
-): { name: string; commands: string[] } | null {
-    const allocate = createNameAllocator(context);
-    const reference = t >= 0 ? p1 : p2;
-    const ratio = t >= 0 ? t : 1 - t;
-    const slot = `${sanitizeIdentifier(anchorName)}_len`;
-    const name = allocate('cut');
-    return {
-        name,
-        commands: [
-            `MEASURE type=distance slot=${slot} p1=${p1} p2=${p2}`,
-            `CREATE POINT_ON_LINE name=${name} line=${anchorName} point=${reference} distance={${slot} * ${formatNumber(ratio)}} draw=true`,
-        ],
-    };
 }
 
 // ---------------------------------------------------------------- 点选规则
@@ -1216,6 +1138,37 @@ export function planSelectionOperation(
         };
     }
 
+    // 以两点的连线为直径作圆。
+    //
+    // DSL 的 CIRCLE 没有「直径」这种写法，但可以拆成两条已经有语义的指令：
+    //   1. 中点 M = midpoint(P1, P2)  → 它就是圆心；
+    //   2. 半径 r = |P1P2| / 2。
+    // 半径不能写死数字：写死了拖动 P1/P2 圆就不会跟着变。所以借 MEASURE 把
+    // |P1P2| 存进 slot，再用 `{slot / 2}` 表达式当 radius —— 每次脚本重跑都会
+    // 重新测量，圆因此跟着两点走（和「在线上取点」「截取」用的是同一套机制）。
+    //
+    // 中点按 `draw=false` 建：它是推导用的，画出来会多一个用户没要的点。
+    if (TWO_POINT_DIAMETER_OPERATIONS.includes(operation)) {
+        if (objects.length !== 2) return { commands: [], blocked: '需要选中两个点' };
+        const [p1, p2] = objects;
+        if (!isPointType(p1.type) || !isPointType(p2.type)) {
+            return { commands: [], blocked: '这个操作需要两个点' };
+        }
+        if (p1.name === p2.name) return { commands: [], blocked: '两个点是同一个点' };
+
+        const centerName = allocate('mid');
+        const circleName = allocate('C');
+        // slot 名要唯一且是合法标识符：不同点对不能撞车，否则后写的测量会覆盖前一个。
+        const slot = `${sanitizeIdentifier(p1.name)}_${sanitizeIdentifier(p2.name)}_d`;
+        return {
+            commands: [
+                `MEASURE type=distance slot=${slot} p1=${p1.name} p2=${p2.name}`,
+                `CREATE MIDPOINT name=${centerName} p1=${p1.name} p2=${p2.name} draw=false`,
+                `CREATE CIRCLE name=${circleName} center=${centerName} radius={${slot} / 2} draw=true`,
+            ],
+        };
+    }
+
     if (operation === 'segment' || operation === 'line' || operation === 'perpBisector') {
         if (objects.length !== 2) return { commands: [] };
         const [p1, p2] = objects;
@@ -1452,9 +1405,22 @@ export function buildPickOperationCommands(
     if (
         kind === 'connect' || kind === 'parallel' || kind === 'perpendicular'
         || kind === 'reflectPoint' || kind === 'tangentToCircle'
+        || kind === 'circleWithCenter'
     ) {
         if (!targetName) return [];
 
+        if (kind === 'circleWithCenter') {
+            // 右键的点当圆心，点选的那个点只是「圆上一点」——用来定半径。
+            // 半径不写死数字：借 MEASURE 把两点的距离存进 slot，再用 `{slot}` 当 radius，
+            // 这样拖动任一点圆都跟着变（和「两点为直径」用的是同一套机制，只是不除以 2）。
+            // 圆上那个点不用「点出圆心再量」的方式，因为中心点是 anchor 自己，没必要再造。
+            const circleName = allocate('C');
+            const slot = `${sanitizeIdentifier(anchorName)}_${sanitizeIdentifier(targetName)}_r`;
+            return [
+                `MEASURE type=distance slot=${slot} p1=${anchorName} p2=${targetName}`,
+                `CREATE CIRCLE name=${circleName} center=${anchorName} radius={${slot}} draw=true`,
+            ];
+        }
         if (kind === 'connect') {
             const connectType = optionString(options, 'connectType', 'segment') === 'line' ? 'line' : 'segment';
             // 名字前缀与指令名要分开：指令是 SEGMENT / LINE，但名字用 seg / line，
@@ -1552,18 +1518,6 @@ export function buildPickOperationCommands(
             );
         }
         return commands;
-    }
-
-    if (kind === 'cutSegment') {
-        const length = Math.max(0.1, optionNumber(options, 'length', 2));
-        const fromStart = optionString(options, 'from', 'start') !== 'end';
-        const origin = fromStart ? p1 : p2;
-        const name = allocate('C1');
-        const segmentName = allocate('cut');
-        return [
-            `CREATE POINT_ON_LINE name=${name} line=${anchorName} point=${origin} distance=${formatNumber(length)} draw=true`,
-            `CREATE SEGMENT name=${segmentName} p1=${origin} p2=${name} draw=true`,
-        ];
     }
 
     // kind === 'extend'

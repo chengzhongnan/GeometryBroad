@@ -329,7 +329,7 @@ const OverlayCanvas = styled.canvas<OverlayCanvasProps>`
   left: 0;
   width: 100%;
   height: 100%;
-  /* 不需要点选目标的操作（等分、延长、截取、中垂线）里，这层只负责显示高亮。 */
+  /* 不需要点选目标的操作（在线上取点、等分、延长、中垂线）里，这层只负责显示高亮。 */
   cursor: ${({ $pickable }) => ($pickable ? 'crosshair' : 'default')};
 `;
 

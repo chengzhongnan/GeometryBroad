@@ -169,13 +169,13 @@ interface TrimSession {
 /**
  * 鼠标压在线上时解析出来的结果。
  *
- * `index` 只用来画高亮；`t` / `point` 是同一份投影结果，交给删除逻辑按
- * 「离鼠标最近的已知点」重算真正要删的那一段（无界尾部会用到 `point` 生成边界点）。
+ * `index` 只用来画高亮；`t` 是同一份投影结果，交给删除逻辑按
+ * 「鼠标所在的相邻两点之间」重算真正要删的那一段。`point` 是投影点，
+ * 只用于画高亮预览 —— 删除**不会**拿它去生成任何新点。
  */
 interface TrimHover {
     index: number;
     t: number;
-    point: Point2D;
 }
 
 interface GeometryCanvasProps {
@@ -266,7 +266,7 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
     const trimSessionRef = useRef<TrimSession | null>(null);
     const trimHoverRef = useRef<number | null>(null);
     const exitTrimModeRef = useRef<() => void>(() => {});
-    const commitTrimPieceRef = useRef<(tMouse: number, mousePoint: Point2D) => void>(() => {});
+    const commitTrimPieceRef = useRef<(tMouse: number) => void>(() => {});
     // 「挑截止点」的会话。和截取模式同一套做法：ref 给事件处理函数读最新值，
     // state 只负责驱动提示条重渲染。
     const cutPointPickRef = useRef<CutPointPickRequest | null>(null);
@@ -699,9 +699,9 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
          * 先要求光标离这条线足够近（借用同一个 12px 容差，换算成逻辑单位），
          * 否则鼠标在画布任何位置都会高亮某一段，看着像失灵。
          *
-         * 除了段号，这里还把鼠标投影到线上的参数 `t` 和投影点一起返回 ——
-         * 高亮按 `t` 落在哪段来定，但真正删哪一段由 `planLinearPieceRemoval`
-         * 按「离鼠标最近的已知点」重算，两者必须是同一份投影结果，
+         * 除了段号，这里还把鼠标投影到线上的参数 `t` 一起返回 ——
+         * 高亮按 `t` 落在哪段来定，真正删哪一段也由 `planLinearPieceRemoval`
+         * 按同一个 `t` 重算，两者必须是同一份投影结果，
          * 否则会出现「高亮这段、删的是另一段」。
          */
         const resolveTrimHover = (canvasX: number, canvasY: number): TrimHover | null => {
@@ -728,14 +728,11 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
             const t = projectOntoLinear(logical, p1, p2, 'line');
             if (t === null) return null;
 
-            // 投影点（逻辑坐标）—— 生成边界点时要拿它反过来算参数，也用不到端点钳制。
-            const projected = { x: p1.x + t * dx, y: p1.y + t * dy };
-
             for (let i = 0; i < session.pieces.length; i++) {
                 const piece = session.pieces[i];
                 const lo = piece.startT ?? -Infinity;
                 const hi = piece.endT ?? Infinity;
-                if (t >= lo && t <= hi) return { index: i, t, point: projected };
+                if (t >= lo && t <= hi) return { index: i, t };
             }
             return null;
         };
@@ -784,7 +781,7 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
             if (trimSessionRef.current) {
                 const point = getCanvasPoint(e);
                 const hover = resolveTrimHover(point.x, point.y);
-                if (hover) commitTrimPieceRef.current(hover.t, hover.point);
+                if (hover) commitTrimPieceRef.current(hover.t);
                 return;
             }
             if (isLockedRef.current || !interpreterRef.current) return;
@@ -908,14 +905,19 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
                 // 截取：进入选择模式，鼠标在线上移动时高亮光标所在的那一段，单击删掉它。
                 // 段的分界全部来自线上已有的点，所以生成的对象能随原图形一起变化。
                 // 能切出几段是算出来的，一段都切不出来（比如线段上还没取点）就置灰说明原因。
+                // 直线/射线两端的无限延伸部分也是可点的「段」（标签写作 `−∞ → A` / `B → +∞`），
+                // 点一下就整条删掉 —— 想「把直线截成线段」就依次点掉两条尾巴。
                 if (isLinearType(anchor.type)) {
                     const pieceSet = listLinearPieces(
                         { anchorName: anchor.name, anchorType: anchor.type },
                         buildContext(),
                     );
+                    const hasUnbounded = pieceSet.pieces.some(
+                        piece => piece.startName === null || piece.endName === null,
+                    );
                     items.push({
                         id: 'trim',
-                        label: '截取线段（选要删除的一段）',
+                        label: hasUnbounded ? '截取线段（含两端无限延伸部分）' : '截取线段（选要删除的一段）',
                         title: pieceSet.blocked,
                         trimMode: true,
                         disabled: Boolean(pieceSet.blocked),
@@ -1008,6 +1010,12 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
                         { id: 'segment', label: '连接线段', selectionOperation: 'segment' },
                         { id: 'line', label: '连接直线', selectionOperation: 'line' },
                         { id: 'perpBisector', label: '作垂直平分线', selectionOperation: 'perpBisector' },
+                        {
+                            id: 'circleWithDiameter',
+                            label: '以这两点为直径作圆',
+                            title: '圆心是两点的中点，半径是两点距离的一半；拖动任一点圆会跟着变',
+                            selectionOperation: 'circleWithDiameter',
+                        },
                     );
                 } else if (pointRef && circleRef) {
                     // 一个点 + 一个圆：过该点作圆的切线（并标出切点）。
@@ -1434,13 +1442,13 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
         redrawRef.current();
     }, []);
 
-    // 删掉鼠标所在的那一段。真正删哪一段由 planner 按「离鼠标最近的已知点」重算，
-    // 这里只把鼠标在线上投影的位置（参数 t + 投影点）交下去。
+    // 删掉鼠标所在的那一段。真正删哪一段由 planner 按「鼠标在线上投影的参数位置」重算，
+    // 这里只把那个参数 `t` 交下去。
     //
-    // 鼠标落在无界尾部时 planner 会返回 preludeCommands（现场造一个边界点）：
-    // 那些指令要先追加进脚本、并和 cutPoints 一起写回，所以走 onLinearTrim 的
-    // 一次性入口，由上层把两件事合到同一次脚本更新里。
-    const commitTrimPiece = useCallback((tMouse: number, mousePoint: Point2D) => {
+    // planner 只返回一串新的 `cutPoints=`，**不产生任何指令、也不创建任何点**：
+    // 鼠标落在无界尾部（`−∞ → A` / `B → +∞`）时直接省掉无界那一侧的 token，
+    // 于是整条尾巴一次删干净。
+    const commitTrimPiece = useCallback((tMouse: number) => {
         const session = trimSessionRef.current;
         const interpreter = interpreterRef.current;
         if (!session || !interpreter) return;
@@ -1448,15 +1456,12 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
             anchorName: session.anchorName,
             anchorType: session.anchorType,
             tMouse,
-            mousePoint,
         }, buildContext());
         exitTrimMode();
         if (!outcome.plan) return;
         onLinearTrim({
             name: session.anchorName,
-            results: outcome.plan.results,
-            cutPointNames: outcome.plan.cutPointNames,
-            preludeCommands: outcome.plan.preludeCommands,
+            cutPoints: outcome.plan.cutPoints,
         }, interpreter.getTopLevelCommands());
     }, [buildContext, exitTrimMode, onLinearTrim]);
 
@@ -1605,7 +1610,11 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
                             ? '把鼠标移到这条线上，高亮的那一段会被删除'
                             : `单击删除这一段：${trimSession.pieces[trimHover]?.label ?? ''}`}
                     </span>
-                    <TrimHintMuted>Esc 或右键退出</TrimHintMuted>
+                    <TrimHintMuted>
+                        {trimSession.pieces.some(piece => piece.startName === null || piece.endName === null)
+                            ? '带 ∞ 的段是无限延伸部分，点一下整条删除；Esc 或右键退出'
+                            : 'Esc 或右键退出'}
+                    </TrimHintMuted>
                 </TrimHint>
             )}
             {cutPointPick && (

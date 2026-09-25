@@ -413,12 +413,11 @@ function MainContent() {
         handleCutPointsChange(request.objectName, entries.join(','), property?.lineNumber);
     }, [cutPointPick, variables, handleCutPointsChange]);
 
-    // 把直线/射线/线段裁掉某一侧。新的实现会把「截止点数组」写回原对象定义，
-    // 由原对象绘制时跳过对应区间，不再覆盖原线，也不再创建背景色遮罩。
+    // 把直线/射线/线段裁掉某一侧。实现是把「截止点数组」写回原对象定义，
+    // 由原对象绘制时跳过对应区间，不覆盖原线、也不创建背景色遮罩。
     //
-    // 鼠标停在无界尾部时，planner 会额外给一条 preludeCommands（`MEASURE` + `POINT_ON_LINE`），
-    // 但那是**上一个 revision** 的脚本里还不存在的点。它和截止点写回必须落在
-    // 同一个 string 里一次性提交：先追加指令、再改定义行，这样脚本一重跑全都成立。
+    // 无界尾部（`−∞ → A` / `B → +∞`）删的是整条尾巴：planner 直接省掉无界那一侧的
+    // token，不生成任何新点，所以这里只需要改定义行这一处。
     const handleLinearTrim = useCallback((
         rewrite: LinearTrimRewrite,
         commands: ReadonlyArray<TopLevelCommandInfo>,

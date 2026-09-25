@@ -265,39 +265,21 @@ function isSingleLineCommand(line: string): boolean {
     return !inSingle && !inDouble;
 }
 
-export interface LinearTrimResultObject {
-    /** 仍然沿用原对象名；不再生成替代对象。 */
-    name: string;
-    /** 原对象类型，截止点算法支持三种线性对象。 */
-    resultType: 'line' | 'segment' | 'ray';
-    /**
-     * 线段是起点，射线是顶点。
-     *
-     * 只作说明用途：带方向的截止点已经能删掉任意一侧，定义点不再被改写
-     * （派生线的定义点是内部合成点，也改不了）。
-     */
-    keepP1: string;
-    /** 线段是终点，射线是方向点。同上，不再写回脚本。 */
-    keepP2: string;
-}
-
+/**
+ * 一次线性截取要写回脚本的内容 —— **只有对象名和一串新截止点**。
+ *
+ * 这里刻意不再带 `results` / `resultType` / `keepP1` / `keepP2` 这类字段：
+ * 它们是从「重建原对象、替换定义点」那套旧实现里遗留下来的，实际从未被读取，
+ * 却让截取看起来像是在造新对象。截取的真身就是「换掉原定义行的 `cutPoints=`」。
+ */
 export interface LinearTrimRewrite {
     /** 被截取的原对象名。 */
     name: string;
-    /** 截止点算法一次只更新原对象，不创建多个结果。 */
-    results: readonly LinearTrimResultObject[];
     /**
      * 写入原定义的截止点数组，带方向前缀：`+A` 隐藏 A 的正方向一侧，`-A` 隐藏负方向一侧。
-     * 必须存在，即使本次数组为空也表示新算法路径。
+     * 空数组表示把 `cutPoints` 参数整个删掉（恢复完整直线/射线/线段）。
      */
-    cutPointNames?: readonly string[];
-    /**
-     * 需要先追加到脚本末尾的指令。
-     *
-     * 鼠标停在无界尾部时会在这里生成一个边界点（`MEASURE` + `POINT_ON_LINE`），
-     * 这些指令必须比「改写原定义行」先落地，否则截取写回时引用的点名还不存在。
-     */
-    preludeCommands?: readonly string[];
+    cutPoints: readonly string[];
 }
 
 /** 把参数值换成新值（跳过引号内的同名片段）。 */
@@ -344,11 +326,13 @@ function upsertParamValue(line: string, key: string, value: string): string {
 }
 
 /**
- * 把线性对象的定义改写成截止点数组。
+ * 把线性对象的定义行改写成新的截止点数组。**这是唯一的线性截取写回路径。**
  *
- * 这是唯一的线性裁剪写回路径：只修改原来的创建行（LINE/SEGMENT/RAY 以及
- * PERP_BISECTOR/PERPENDICULAR/PARALLEL/ANGLE_BISECTOR 这些派生线），
- * 不中和原对象、不删除 DRAW、不追加背景色遮罩，也不创建替代对象。
+ * 它只做一件事：找到原定义行（LINE/SEGMENT/RAY 以及 PERP_BISECTOR/PERPENDICULAR/
+ * PARALLEL/ANGLE_BISECTOR 这些派生线），把 `cutPoints=`（或它的别名）换成新的值。
+ *
+ * 不中和原对象、不删除 DRAW、不追加背景色遮罩、不创建替代对象，
+ * **也不生成任何新点** —— 传进来的 token 必须已经是脚本里存在的点名。
  *
  * 写入的截止点带方向（`+A` 砍正方向一侧、`-A` 砍负方向一侧），因此**不需要**
  * 交换定义点就能删掉任意一侧 —— 派生线的定义点是内部合成点，本来就交换不了。
@@ -360,8 +344,6 @@ export function rewriteLinearDefinition(
     commands: ReadonlyArray<TopLevelCommandInfo>,
     rewrite: LinearTrimRewrite,
 ): string | null {
-    if (rewrite.results.length !== 1 || rewrite.cutPointNames === undefined) return null;
-
     // 同名定义以后者为生效对象，连续编辑时应更新最后一条定义。
     let definition: TopLevelCommandInfo | null = null;
     for (const command of commands) {
@@ -375,26 +357,28 @@ export function rewriteLinearDefinition(
     if (definitionIndex < 0 || definitionIndex >= lines.length) return null;
     if (!isSingleLineCommand(lines[definitionIndex])) return null;
 
-    // 新算法不重建对象、也不改定义点，所以只校验「结果类型和原定义类型一致」，
-    // 防止把一条射线写成 line 之类的错配。
-    const expectedType = definition.command === 'RAY'
-        ? 'ray'
-        : definition.command === 'SEGMENT' ? 'segment' : 'line';
-    if (rewrite.results[0].resultType !== expectedType) return null;
+    // 参数改名成 `cutPoints`（别名 cutoffPoints / cuts 归一到主名）。
+    //
+    // 两种语义分得很清楚：
+    //   - `cutPoints` 非空 → 这是「再截一刀」，与已有截止点合并。同一个点只保留最后一次
+    //     写入的方向（后一次操作覆盖前一次对它的设定），否则 `+A,-B` 之后再删右尾会写出
+    //     `+A,-B,+B`，两个方向互相抵消。
+    //   - `cutPoints` 为空 → 这是「撤销全部截取」，**不能**再把旧截止点并回来，
+    //     直接把参数整条删掉、恢复完整对象。
+    const clearAll = rewrite.cutPoints.length === 0;
+    const previousCuts = clearAll
+        ? []
+        : [
+            definition.params.get('cutPoints'),
+            definition.params.get('cutoffPoints'),
+            definition.params.get('cuts'),
+        ]
+            .filter((value): value is string => value !== undefined)
+            .flatMap(value => value.split(','));
 
-    const previousCuts = [
-        definition.params.get('cutPoints'),
-        definition.params.get('cutoffPoints'),
-        definition.params.get('cuts'),
-    ]
-        .filter((value): value is string => value !== undefined)
-        .flatMap(value => value.split(','));
-
-    // 同一个点只保留最后一次写入的方向：连续裁剪时后一次操作应该覆盖前一次对它的设定，
-    // 否则 `+A,-B` 之后再删右尾会写出 `+A,-B,+B`，两个方向互相抵消、整条线直接消失。
     const seen = new Set<string>();
     const orderedCuts: string[] = [];
-    for (const token of [...previousCuts, ...rewrite.cutPointNames].reverse()) {
+    for (const token of [...previousCuts, ...rewrite.cutPoints].reverse()) {
         const trimmed = token.trim();
         if (!trimmed) continue;
         const key = normalizeCutToken(trimmed);
@@ -402,11 +386,26 @@ export function rewriteLinearDefinition(
         seen.add(key);
         orderedCuts.unshift(trimmed);
     }
-    if (orderedCuts.length === 0) return null;
 
     // 用户可能写的是 cutoffPoints / cuts，原地改那一个，别留下两份互相打架的参数。
-    const value = orderedCuts.join(',');
     let line = lines[definitionIndex];
+    if (orderedCuts.length === 0) {
+        // 全部截止点都被撤掉 → 把参数整个删掉，恢复完整直线/射线/线段。
+        for (const alias of ['cutPoints', 'cutoffPoints', 'cuts']) {
+            const pattern = new RegExp('(\\s*\\b' + alias + '\\s*=\\s*)(?:"[^"]*"|\'[^\']*\'|\\S+)', 'gi');
+            const stripped = line.replace(pattern, '');
+            if (stripped !== line) {
+                line = stripped;
+                break;
+            }
+        }
+        if (line === lines[definitionIndex]) return null;
+        const cleared = [...lines];
+        cleared[definitionIndex] = line;
+        return cleared.join('\n');
+    }
+
+    const value = orderedCuts.join(',');
     for (const alias of ['cutPoints', 'cutoffPoints', 'cuts']) {
         const replaced = replaceParamValue(line, alias, value);
         if (replaced !== line) {
@@ -421,14 +420,6 @@ export function rewriteLinearDefinition(
 
     const rewritten = [...lines];
     rewritten[definitionIndex] = line;
-
-    // 「在鼠标处生成截点」的情形：先把这个新点的指令追加到脚本末尾。
-    // 追加而不是插在原定义行之前，是为了不改动任何已有行号 —— 调用方（和其他
-    // cutPoints 写回路径）都按行号定位，插行会让它们全部错位。
-    // 新点在定义行之后才创建，但脚本是整体重跑、解释器一次执行完，引用不会落空。
-    if (rewrite.preludeCommands && rewrite.preludeCommands.length > 0) {
-        rewritten.push(...rewrite.preludeCommands);
-    }
 
     return rewritten.join('\n');
 }
