@@ -43,8 +43,9 @@
     * **参数**:
         * `color` 或 `c`: (可选) 用于填充画布背景的颜色。默认为 `white`。
         * `geoColor` 或 `g`: (可选) 设置后续 `DRAW` 指令的默认几何图形颜色。默认为 `black`。
-        * `labelColor` 或 `l`: (可选) 设置后续 `DRAW` 指令的默认标签颜色。默认为 `black`。
-    * **示例**: `CLEAR color=lightblue geoColor=white`
+        * `labelColor` 或 `l`: (可选) 设置后续 `DRAW` 指令的默认标签颜色。默认为 `black`（与默认的白色画布底相配）。
+    * **注意**: 标签色不会跟着 `color=` 自动反色。用深色背景（如 `CLEAR color=black`）时，要**显式**写上 `labelColor=white`，否则默认的黑色标签会隐在深色底里看不见。
+    * **示例**: `CLEAR color=lightblue geoColor=white`；深色底加白标签：`CLEAR color=black labelColor=white`
 
 #### **1.2 `VIEW`**
 
@@ -84,7 +85,8 @@
 * `TEXT x=<num> y=<num> text=<text> [options...]`
     * **描述**: 在绘图区绘制普通文字，Canvas 和 SVG 导出均支持。
     * **参数**: `x`, `y` 为逻辑坐标；`text` 或 `t` 为文字内容（可包含空格，建议放在行尾）；可选 `color/c`, `fontSize/fs`, `fontFamily`, `fontStyle`, `fontWeight`, `backgroundColor/bgc`, `padding/p`。文字中可使用 `{slot}`。
-    * **示例**: `TEXT x=2 y=3 text="距离 AB = {dist_AB}" color=blue fontSize=16`
+    * **多行**: 内容是**带引号**的字符串时，其中的 `\n` 会被还原成换行，`\"` / `\\` 分别还原成引号与反斜杠（不带引号的老写法保持原样，不受影响）。多行文本按行排版，背景框会框住整个文本块。画布右键「创建 → 文字」的对话框写出来的就是这种转义形式。
+    * **示例**: `TEXT x=2 y=3 text="距离 AB = {dist_AB}" color=blue fontSize=16`；多行：`TEXT x=0 y=0 text="第一行\n第二行"`
 
 #### **1.5 `FILL`**
 
@@ -141,12 +143,15 @@
 
 #### **1.10 `SET`**
 
-* `SET item=<item> value=<value>`
-    * **描述**: 修改一个全局默认参数，影响之后创建/绘制的所有对象。
+* **推荐写法（简写）**: `SET <属性名>=<值> [<属性名>=<值> ...]`
+    * 直接写属性名，**一行可以同时设置多个不同属性**，不必写 `item=` / `value=`。
+    * **示例**: `SET labelColor=white`、`SET labelColor=white pointRadius=6 penSize=2`、`SET lineLength=200`
+* 兼容写法（旧）: `SET item=<item> value=<value>`（一次只能设一个属性）
+    * **描述**: 修改全局默认参数，影响之后创建/绘制的所有对象。两种写法可混用；同一属性只生效一次（老写法优先），因此书写顺序不会改变结果。
     * **参数**:
         * `item` (必须): 要设置的选项名称。
         * `value` (必须): 要设置的值，可以是数字，也可以是 `{slot}` 表达式。
-    * **可用 item**:
+    * **可用属性**（两种写法下名字相同）:
         * `backgroundColor`: 画布背景色。
         * `penColor` / `geoColor`: 默认画笔/几何图形颜色。
         * `penSize`: 默认线宽，单位**屏幕像素**（缺省 1）。指令里写 `width=<n>` 可单独覆盖。
@@ -157,9 +162,26 @@
         * **`lineLength`**: 直线(`LINE`)与射线(`RAY`)的绘制长度，单位为几何坐标。
             * 未设置（或设为 `auto`、`0`）时，直线/射线默认**只画到屏幕边缘就停住**，不会无限延伸；这样导出 SVG 时画布不会被一条超长的直线撑大，几何图形也不会显得很小。
             * 设置为正数 `n` 后：直线以 `p1`、`p2` 的中点为基准向两端各延伸 `n/2`（总长 `n`）；射线从顶点向前延伸 `n`。
-            * **示例**: `SET item=lineLength value=200`、`SET item=lineLength value=auto`
+            * **示例**: `SET lineLength=200`、`SET lineLength=auto`
 
-#### **1.11 `CODE` / `RUN` / `WITH`**
+#### **1.11 `SETLABEL`**
+
+* `SETLABEL name=<对象名> label=<文本>`
+    * **描述**: 给**某个具体对象**设置显示标签，覆盖脚本里写的 `label=`，改完立刻重画。
+    * 和 `SET` 的区别：`SET` 改的是**全局默认值**（只影响之后新画的对象）；`SETLABEL` 只改指定的那一个（几个）对象。
+    * **参数**:
+        * `name` (必须; 别名 `n` / `obj` / `o`): 对象名，逗号分隔可一次设置多个（`name=A,B`）。
+        * `label` (必须; 别名 `l` / `text` / `t`): 标签文本。**留空表示不显示标签**。带引号时内容里的 `\n` 还原为换行、`\"` 与 `\\` 分别还原为引号与反斜杠。
+    * **为什么需要它**: 有些对象在脚本里**没有独立的定义行**，因而没地方写 `label=` —— 典型是 `CREATE TANGENT` 顺带建出的切点 `T2` 与切线 `T2_tan`、以及自动命名的 `seg_2` 之类。这些对象在变量面板和右键菜单里同样可以改标签，走的正是 `SETLABEL`。对普通对象它一样好使，写起来比回头去改某一行更省事。
+    * **示例**:
+        ```
+        SETLABEL name=P label=点P
+        SETLABEL obj=A,B label=端点
+        SETLABEL name=T2 label=切点T          # 派生对象，只能用 SETLABEL
+        SETLABEL name=T2 label=                # 清除标签
+        ```
+
+#### **1.12 `CODE` / `RUN` / `WITH`**
 
 * **描述**: 用于定义、执行和有条件地执行代码块，以组织和重用指令序列。
 * **`CODE name=<block_name>`**: 开始一个命名代码块的定义。后续行直到 `]` 结束都属于该块。
@@ -202,32 +224,45 @@
 >
 > 想控制层级就用 `DRAW obj=<name>`：它按原样**立即**绘制（显式指定 `color` / `width` / `label` 等样式）。若目标对象本身也写了 `draw=true`，`DRAW` 只覆盖它的样式，不会重复画一遍。
 >
-> 您可以在 `CREATE` 同一行中附加任何 `DRAW` 指令支持的绘图选项（如 `color`, `width`, `label` 等）来控制其样式。**标签只认显式写出来的 `label=`**：`name` 是给引用用的标识符，不会自动画到图上。点的标签由 `SET item=drawLabelForPoints` 总控（默认开），其它对象的标签由 `SET item=drawLabelForOthers` 总控（默认关）—— 总开关打开时，也只有写了 `label=` 的对象才会出现文字。
+> 您可以在 `CREATE` 同一行中附加任何 `DRAW` 指令支持的绘图选项（如 `color`, `width`, `label` 等）来控制其样式。**标签只认显式写出来的 `label=`**：`name` 是给引用用的标识符，不会自动画到图上。点的标签由 `SET drawLabelForPoints` 总控（默认开），其它对象的标签由 `SET drawLabelForOthers` 总控（默认关）—— 总开关打开时，也只有写了 `label=` 的对象才会出现文字。
 >
 > **示例**: `CREATE POINT name=A x=50 y=50 draw=true color=green radius=5 label=起始点`
 >
-> **标签的三种改法**（都写回脚本里的 `label=`，改完立刻重画）：
-> 1. 直接在脚本里写 `label=文本`；写 `label=""`（或把 `label=` 整个删掉）表示不显示。
-> 2. 在变量面板里选中对象，展开「可编辑属性」后改 **标签** 那一行；留空即清除。
-> 3. 在画布上右键对象，选「修改标签…」，在弹出的对话框里改（对话框里有「这一行将变成」的实时预览，还有「清除标签」按钮）。
+> **标签的四种改法**（都改完立刻重画）：
+> 1. 直接在脚本里写 `label=文本`（挂在定义行或 `DRAW` 行上）；写 `label=""`（或把 `label=` 整个删掉）表示不显示。
+> 2. 用 `SETLABEL` 指令按对象名设置 —— 见下面 1.11 小节。**任何**对象都能用，包括没有独立定义行的自动派生对象。
+> 3. 在变量面板里选中对象，展开「可编辑属性」后改 **标签** 那一行；留空即清除。
+> 4. 在画布上右键对象，选「修改标签…」，在弹出的对话框里改（对话框里有实时预览，还有「清除标签」按钮）。
 >
 > 标签文本里带空格时会被自动加引号（`label="点 P"`）；也可以写 `$LaTeX$`。
+>
+> **改标签时优先改 `DRAW` 行**：如果对象是靠 `DRAW obj=X` 画出来的，`label=` 就写在那条 `DRAW` 上；只有当定义行自己带 `draw=true` 时才写定义行。写在没有 `draw=true` 的定义行上不会生效。
+>
+> **在空白处右键**会给出「在此处创建」菜单（点 / 线 / 圆 / 文字 / 多边形 / 坐标系）。其中选「文字」会先弹出一个**文字输入与渲染对话框**：左侧填内容、字体、字号、粗体斜体、颜色、背景色与内边距，右侧实时渲染预览（支持 `$LaTeX$`），底部显示将要插入的那条 `TEXT` 指令。确认后才把指令追加到脚本末尾。多行内容用 Ctrl+Enter 换行，写进脚本时是字面量 `\n`，画布与 SVG 导出都会按多行排版。
 >
 > **关于自动生成的名称**：画布上右键作图（连接、垂线、对称点、等分点……）生成的对象名是「短前缀 + 序号」，例如 `seg1`、`perp2`、`foot`、`refl_2`，与嵌套层数无关。派生关系看指令自身的参数即可（`point=P1 line=L`），不必编码进名字里。
 >
 > **多选作图**（ctrl+左键逐个点选）：
 > - 选三个点 → 右键菜单给「作三角形 / 作外接圆 / 作内切圆」；三点共线时置灰并说明原因。
 > - 选两条共端点的线 → 右键菜单给「作角平分线（第一条 → 第二条）/ 以这两条边作平行四边形 / 求两条线的交点」。
+> - 选一个点 + 一个圆 → 右键菜单给「过该点作圆的切线」（点在圆外作两条切线并标出两个切点；点在圆内时置灰）。
+> - 选一个圆 + 一条线（直线/线段/射线）→ 右键菜单给「求线与圆的交点」（已有的交点不重复创建，菜单上会写明还要补建几个点）。
+> - 选两个圆 → 右键菜单给「求两圆交点」（同样只补建尚不存在的交点）。
 > - 角平分线不区分选中顺序 —— 内部走 `ANGLE + ANGLE_BISECTOR`，`ANGLE` 取的是 |值|≤180° 的有符号角，两条顺序给出同一条内角平分线（DSL 当前行为）。
 > - 平行四边形 = `MIDPOINT + REFLECTED_POINT + POLYGON`：用 BC 的中点 M，把 A 关于 M 中心对称得 D = B+C−A，再用 `POLYGON points=A,B,D,C`。
+>
+> **单选作图**：
+> - 右键一个点 → 「过该点作圆的切线…」（对话框里再点选一个圆）。
+> - 右键一个圆 → 「在圆周上创建点 / 创建圆心 / 过该点作切线 / 过该点作法线」（切点取圆周上离右键处最近的位置），以及「过某个已有点作切线…」（对话框里再点选一个点）。
+> - 右键一条线 → 「在线上取点 / 求 N 等分点 / 延长 / 截取 / 作中垂线 / 与另一条线求交点…」。
 
 #### **2.1 基础对象**
 
 * **2.1.1 `CREATE POINT`**: `name=<name> x=<num> y=<num> [radius=<num>] [real=<bool>] [frozen=<bool>]`
     * **描述**: 定义一个点。
     * **参数**: `name`(必须), `x`(必须), `y`(必须), `radius`(可选), `real`(可选,标记是否为“实”点), `frozen`(可选,冻结后该点在画布上无法拖动)。
-    * **关于 `radius`**: 单位是**屏幕像素**，与 `VIEW scale` 无关，也不随画布缩放变化。不写时为 **4 像素**（与解释器自动生成的点——中点、垂足、交点等——保持一致），全局默认可用 `SET item=pointRadius` 改。想画大一点的点直接写 `radius=8`，不要靠调大 `VIEW scale`。
-    * **关于线宽**: 不写 `width=` 时默认 **1 像素**，同样与 `VIEW scale` 无关。全局默认线宽用 `SET item=penSize value=<像素>` 设置（单位屏幕像素），单条指令仍可用 `DRAW ... width=` 覆盖。
+    * **关于 `radius`**: 单位是**屏幕像素**，与 `VIEW scale` 无关，也不随画布缩放变化。不写时为 **4 像素**（与解释器自动生成的点——中点、垂足、交点等——保持一致），全局默认可用 `SET pointRadius` 改。想画大一点的点直接写 `radius=8`，不要靠调大 `VIEW scale`。
+    * **关于线宽**: 不写 `width=` 时默认 **1 像素**，同样与 `VIEW scale` 无关。全局默认线宽用 `SET penSize=<像素>` 设置（单位屏幕像素），单条指令仍可用 `DRAW ... width=` 覆盖。
     * **关于 `frozen`**: 冻结的点在画布上无法用鼠标拖动，避免误改关键点。冻结只影响拖动：该点仍然可以在变量面板里直接改坐标，也仍然正常参与求交点等计算。不写时为 `false`。变量面板里每个点后面都有 Freeze / Unfreeze 按钮，点击会把这个属性写回代码。
     * **示例**: `CREATE POINT name=A x=100 y=200 radius=5`
 
@@ -239,10 +274,10 @@
         * `+A`（「到 A 为止」）：A 的正方向一侧不画，保留参数 ≤ A 的部分。
         因此 `cutPoints=-A,+B` 把直线截成线段 [A,B]，`cutPoints=+A,-B` 则是挖掉中间一段。截止点只影响绘制和命中测试，不改变直线的几何定义、求交和点的依赖关系。
     * **前向引用**: 截止点可以在直线**之后**才定义（线上的点、交点都只能这样写）。这种线会推迟到脚本末尾再画，因此层级排在其它对象之上。
-    * **绘制长度**: 由 `SET item=lineLength value=<n>` 控制，以 `p1`、`p2` 的中点为基准向两端各延伸 `n/2`。未设置时默认只画到屏幕边缘。
+    * **绘制长度**: 由 `SET lineLength=<n>` 控制，以 `p1`、`p2` 的中点为基准向两端各延伸 `n/2`。未设置时默认只画到屏幕边缘。
     * **示例**:
         ```
-        SET item=lineLength value=200
+        SET lineLength=200
         CREATE LINE name=l_AB p1=A p2=B draw=true
         ```
 
@@ -252,7 +287,7 @@
     * **示例**: `CREATE SEGMENT name=seg_AB p1=A p2=B`
 
 * **2.1.4 `CREATE RAY`**: `name=<name> vertex=<point> p1=<point> [cutPoints=<point1,point2,...>]`
-    * **描述**: 定义一条从`vertex`点出发，穿过`p1`点的射线。绘制长度同样受 `SET item=lineLength value=<n>` 控制（从顶点向前延伸 `n`），未设置时只画到屏幕边缘。
+    * **描述**: 定义一条从`vertex`点出发，穿过`p1`点的射线。绘制长度同样受 `SET lineLength=<n>` 控制（从顶点向前延伸 `n`），未设置时只画到屏幕边缘。
     * **截止点**: 语义与 `CREATE LINE` 相同（`-A` / `+A` / `A`）。`cutPoints=A` 表示只绘制从顶点到 A；`cutPoints=+A` 把射线截成线段 [vertex, A]；`cutPoints=-A` 去掉顶点到 A 的一段。截止点必须是位于射线上的点。
     * **参数**: `name`, `vertex`(或`v`), `p1`。
     * **示例**: `CREATE RAY name=ray_A vertex=A p1=B`
@@ -414,13 +449,13 @@
     * **注意**: 它同时会自动创建其内心，命名为 `<circle_name>_inccenter`。
     * **示例**: `CREATE INCIRCLE name=incirc p1=A p2=B p3=C`
 
-* **2.5.7 `CREATE TANGENT`**: `name=<name(s)> circle=<c> point=<p>`
-    * **描述**: 创建从一个点到圆的**切线**（或切点）。
-    * **参数**: `name`(必须), `circle`(或`c`), `point`(或`p`)。
-    * **注意**: 若点在圆上，则创建一个切点；若点在圆外，则创建两个切点，此时 `name` 应用逗号分隔两个名称。
+* **2.5.7 `CREATE TANGENT`**: `name=<切点名> circle=<c> point=<p>`
+    * **描述**: 过一点作圆的**切线**，并创建**切点**。
+    * **参数**: `name`(必须，**切点的名字**，逗号分隔), `circle`(或`c`), `point`(或`p`)。
+    * **注意**: 点在圆上 → 一条切线、一个切点（即该点）；点在圆外 → 两条切线、两个切点。切线自动命名：`<切点名>_tan`（圆外时两条分别为 `T1_tan` / `T2_tan`）；只给一个名字时第二个切点自动取名 `<名字>_2`。若切点位置上已有点，则复用该点而不重复创建。
     * **示例**:
-        * `CREATE TANGENT name=T circle=c1 point=P_on_circle`
-        * `CREATE TANGENT name=T1,T2 circle=c1 point=P_outside`
+        * `CREATE TANGENT name=T circle=c1 point=P_on_circle` → 切点 `T`，切线 `T_tan`
+        * `CREATE TANGENT name=T1,T2 circle=c1 point=P_outside` → 切点 `T1`/`T2`，切线 `T1_tan`/`T2_tan`
 
 * **2.5.8 `CREATE ELLIPSE`**: `name=<name> center=<c> radiusX=<rX> radiusY=<rY> [rotation=<rot>]`
     * **描述**: 创建一个**椭圆**。

@@ -3,7 +3,7 @@
 export const INITIAL_USER_INPUT = `# 圆内蝴蝶定理
 
 VIEW scale=1.5
-CLEAR color=black
+CLEAR color=black labelColor=white
 
 CREATE SLOT name=slot_r value=150
 

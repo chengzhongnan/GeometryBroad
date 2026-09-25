@@ -1,3 +1,4 @@
+import React, { useCallback, useRef, useState } from 'react';
 import styled from 'styled-components';
 
 /**
@@ -35,6 +36,89 @@ export const Panel = styled.div`
   box-shadow: 0 24px 60px rgba(15, 23, 42, 0.28);
   box-sizing: border-box;
 `;
+
+/**
+ * 可拖动的对话框外壳。
+ *
+ * 为什么单独做一个而不是给 `Panel` 加 prop：拖动会改变定位方式（从「Backdrop 的
+ * flex 居中」变成「fixed + translate」），而 `Panel` 自己还要被不需要拖动的对话框
+ * 原样使用。这里用 `styled(Panel)` 继承全部外观，只覆写定位，两边的颜色/圆角不会分叉。
+ *
+ * 拖动用手柄而不是整个面板：面板里全是输入框和画布，按在它们身上要正常交互，
+ * 不能顺手把对话框拖走。所以只有 `DialogDragHandle`（标题栏）负责拖动。
+ */
+export const DraggablePanel = styled(Panel)`
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  margin: 0;
+  /* 位移由 JS 通过内联 style 写入；这里给一个初始值，避免首次渲染跳动。 */
+  transform: translate(-50%, -50%);
+  will-change: transform;
+`;
+
+/**
+ * 标题栏拖动条。包在 `DragHandle` 里的区域才响应拖动。
+ *
+ * `cursor: move` 之外还给了 `user-select: none`：不然拖动时会顺手把标题选中，
+ * 松手后标题保持高亮，看起来像是出了 bug。
+ */
+export const DragHandle = styled.div`
+  cursor: move;
+  user-select: none;
+  touch-action: none;
+`;
+
+/**
+ * 让一个「固定在屏幕中央」的元素可以被拖走。
+ *
+ * 位置用**相对初始居中位置的像素偏移**表示，而不是绝对 left/top —— 面板的居中
+ * 是 CSS `translate(-50%, -50%)` 算出来的，改成绝对定位就得自己量宽高，窗口一
+ * 变化还要重算。存偏移量的话，面板尺寸、窗口大小怎么变都不会错位。
+ *
+ * 返回的 `offset` 加上 `translate` 即可；拖动距离用 `pointerdown` 那一刻的指针
+ * 位置做基准，中途不会因为元素移动而累积漂移。
+ */
+export function useDragOffset(enabled = true) {
+    const [offset, setOffset] = useState({ x: 0, y: 0 });
+    const dragRef = useRef<{ pointerId: number; startX: number; startY: number; originX: number; originY: number } | null>(null);
+
+    const onPointerDown = useCallback((event: React.PointerEvent) => {
+        if (!enabled) return;
+        // 只响应鼠标左键 / 主指针，避免右键和中键也把面板拖走。
+        if (event.button !== 0) return;
+        // 点在关闭按钮之类的交互元素上时不要开始拖动：用户是想点它，不是想拖窗口。
+        const target = event.target as HTMLElement;
+        if (target.closest('button, input, select, textarea, a')) return;
+        dragRef.current = {
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            originX: offset.x,
+            originY: offset.y,
+        };
+        (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+        event.preventDefault();
+    }, [enabled, offset.x, offset.y]);
+
+    const onPointerMove = useCallback((event: React.PointerEvent) => {
+        const drag = dragRef.current;
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        setOffset({
+            x: drag.originX + (event.clientX - drag.startX),
+            y: drag.originY + (event.clientY - drag.startY),
+        });
+    }, []);
+
+    const endDrag = useCallback((event: React.PointerEvent) => {
+        const drag = dragRef.current;
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        dragRef.current = null;
+        (event.currentTarget as HTMLElement).releasePointerCapture?.(event.pointerId);
+    }, []);
+
+    return { offset, dragHandleProps: { onPointerDown, onPointerMove, onPointerUp: endDrag, onPointerCancel: endDrag } };
+}
 
 export const Header = styled.div`
   display: flex;

@@ -263,7 +263,11 @@ function renderObjectDetails(
       ))}
       {(hasEditableProperties || cutPoints || label) && (
         <EditableProperties>
-          <EditablePropertiesTitle>可编辑属性 · 第 {lineNumber} 行</EditablePropertiesTitle>
+          {/* 自动派生的对象（TANGENT 的 T2 / T2_tan 等）在脚本里没有独立定义行，
+              解释器给的行号是 0。显示「第 0 行」只会让人以为坏了，改成说明性文案。 */}
+          <EditablePropertiesTitle>
+            {lineNumber ? `可编辑属性 · 第 ${lineNumber} 行` : '可编辑属性 · 自动派生对象（标签由 SETLABEL 写入）'}
+          </EditablePropertiesTitle>
           {object.editableProperties?.map(property => (
             <EditablePropertyRow key={property.key}>
               <EditablePropertyLabel title={property.reason}>{property.label}</EditablePropertyLabel>

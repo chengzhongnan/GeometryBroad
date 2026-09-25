@@ -130,6 +130,22 @@ export interface EditableLabelProperty {
     reason?: string;
 }
 
+/**
+ * 一段画布文字（TEXT）的可编辑信息。
+ *
+ * 和 `EditableLabelProperty` 分开是因为两者定位方式完全不同：标签靠「对象名 → 定义行」，
+ * 而 TEXT 是匿名指令，解释器内部给它合成一个 `text_<行号>` 的名字，真正能定位的只有**行号**。
+ * 所以这里直接给出 `lineNumber`，调用方按行号去脚本里原地改写。
+ */
+export interface EditableTextProperty {
+    /** 解释器内部给这段文字合成的名字（`text_<行号>`），仅用于选择/命中标识。 */
+    name: string;
+    /** 这条 TEXT 指令所在行（1-based）。 */
+    lineNumber: number;
+    editable: boolean;
+    reason?: string;
+}
+
 // DSL解释器的主要状态
 interface InterpreterState {
     objects: Map<string, GeometricObject>; // 存储所有已定义的几何对象
@@ -201,6 +217,21 @@ interface InterpreterState {
     selectedObjectNames: Set<string>; // 当前多选对象
     selectedLabelId?: string; // 当前选中标签
     labelPositions: Map<string, IPoint>; // 用户拖动后的标签逻辑坐标
+    /**
+     * 「对象名 -> 标签文本」映射，由 `SETLABEL` 指令写入。
+     *
+     * 为什么要单独存一份：标签文本原本**不是对象自身属性**，它只活在脚本源码的
+     * `label=` 参数里，靠 `PendingDraw.label` / `params.get('label')` 在绘制时临时传递，
+     * 画完就丢。于是「按名字给任意对象设标签」这件事没有落脚点 ——
+     *   - 派生对象（TANGENT 的 T2 / T2_tan、自动命名的 seg_2 …）在脚本里根本没有
+     *     独立定义行，`sourceBindings` 里查不到，既读不到也写不回去；
+     *   - 想在脚本里加标签也因为找不到「该写哪一行」而作罢。
+     * 这张表就是那个落脚点：绘制时按名字查，查到了就覆盖脚本里的 `label=`。
+     *
+     * 值是已解析的最终文本；空串表示「显式要求不显示标签」（而不是「没设置」），
+     * 所以用 `has()` 判断是否存在，不能拿 `get() === ''` 当没设置。
+     */
+    labelOverrides: Map<string, string>;
     labelHitRegions: LabelHitRegion[];
     textHitRegions: TextHitRegion[];
     renderedObjectNames: string[];
@@ -369,7 +400,12 @@ export class GeometryDSLInterpreter {
                 width: canvas ? canvas.width : 0,
                 height: canvas ? canvas.height : 0,
                 geoColor: 'black',
-                labelColor: 'white',
+                // 默认标签色必须是黑，不能是白。
+                // 画布默认底色是白的（见下面的 backgroundColor），白字画在白底上等于隐形 ——
+                // 用户写 `CREATE POINT ... draw=true label=P` 会发现「标签明明加了却看不见」。
+                // 文档（CLEAR 的 labelColor 说明）一直写的也是 black，这里是代码没跟上文档。
+                // 想在深色底上要白字，显式写 `labelColor=white` 或 `SET labelColor=white`。
+                labelColor: 'black',
 
                 centerX: 0,
                 centerY: 0,
@@ -411,6 +447,7 @@ export class GeometryDSLInterpreter {
             selectedObjectNames: new Set(),
             selectedLabelId: undefined,
             labelPositions: new Map(),
+            labelOverrides: new Map(),
             labelHitRegions: [],
             textHitRegions: [],
             renderedObjectNames: [],
@@ -549,6 +586,9 @@ export class GeometryDSLInterpreter {
         this.state.topLevelCommands = [];
         this.state.textElements.clear();
         this.state.pointSets.clear();
+        // 标签覆盖表由 SETLABEL 写入，而脚本里就写着 SETLABEL，重跑会重新填一遍。
+        // 不全清的话，用户把 SETLABEL 那行删掉后旧标签会阴魂不散地留在图上。
+        this.state.labelOverrides.clear();
         this.state.labelHitRegions = [];
         this.state.textHitRegions = [];
         this.state.renderedObjectNames = [];
@@ -935,10 +975,10 @@ export class GeometryDSLInterpreter {
         const binding = this.state.sourceBindings.get(name);
         if (!binding) return null;
 
-        if ((binding.command.params.get('draw') ?? '').toLowerCase() === 'true') {
-            return { lineNumber: binding.lineNumber, params: binding.command.params, onDrawLine: false };
-        }
-
+        // **DRAW 行优先**，顺序和 `updateDslObjectLabel` 必须一致 ——
+        // 那边按同样优先级决定把 `label=` 写在哪一行，两边不一致就会出现
+        // 「面板里显示 A、画布上是 B」。定义行只要有 `name=` 就能匹配，若让它抢先，
+        // 一条没写 `draw=true` 的定义行就会把真正的 DRAW 行遮住。
         for (const entry of this.state.topLevelCommands) {
             if (entry.command.toUpperCase() !== 'DRAW') continue;
             const target = entry.params.get('obj') ?? entry.params.get('o');
@@ -947,6 +987,11 @@ export class GeometryDSLInterpreter {
                 return { lineNumber: entry.lineNumber, params: entry.params, onDrawLine: true };
             }
         }
+
+        if ((binding.command.params.get('draw') ?? '').toLowerCase() === 'true') {
+            return { lineNumber: binding.lineNumber, params: binding.command.params, onDrawLine: false };
+        }
+
         return null;
     }
 
@@ -958,19 +1003,47 @@ export class GeometryDSLInterpreter {
      * 把原因写在 reason 里，面板据此把输入框置灰。
      */
     public getEditableLabel(name: string): EditableLabelProperty | undefined {
-        // TEXT 的文字内容就是它自己，没有「标签」这个概念；内部合成的点也没有源码行。
         if (!this.state.objects.has(name)) return undefined;
+
+        // `SETLABEL` 设过的对象：值以覆盖表为准，且**永远可编辑** ——
+        // 它不依赖脚本里有没有可改的 `label=`，这正是 SETLABEL 存在的意义。
+        if (this.state.labelOverrides.has(name)) {
+            return {
+                label: '标签',
+                value: this.state.labelOverrides.get(name) ?? '',
+                // 覆盖表没有对应源码行；给定义行（若有）只是为了面板能显示「第 N 行」。
+                lineNumber: this.state.sourceBindings.get(name)?.lineNumber ?? 0,
+                editable: true,
+                reason: '由 SETLABEL 指令设置。清空 = 不显示标签；想彻底去掉这行请删除脚本里的 SETLABEL。',
+            };
+        }
+
         const binding = this.state.sourceBindings.get(name);
-        if (!binding) return undefined;
+
+        // 没有源码行定义的对象：TANGENT 顺带建出的切点/切线（`T2`、`T2_tan`）、
+        // 自动命名的派生对象（`seg_2`）等。它们**在脚本里没有独立的定义行**，
+        // 所以既读不到也写不回 `label=` —— 但用户完全有理由想给它加标签。
+        // 这种情况引导他用 SETLABEL；仍然可编辑（写入覆盖表）。
+        if (!binding) {
+            return {
+                label: '标签',
+                value: '',
+                lineNumber: 0,
+                editable: true,
+                reason: '这个对象是自动派生的（没有单独的创建行），标签会用 SETLABEL 指令写入脚本。',
+            };
+        }
 
         const source = this.resolveLabelSource(name);
         if (!source) {
+            // 有定义行但没画出来。以前这里是 editable:false，逼着用户先去 `draw=true`；
+            // 现在有 SETLABEL 作为第二条路 —— 它按名字设标签，不要求对象在脚本里有落脚点。
             return {
                 label: '标签',
                 value: '',
                 lineNumber: binding.lineNumber,
-                editable: false,
-                reason: '这个对象还没有被画出来（定义行没有 draw=true，也没有 DRAW 指令），先让它出现在图上再设标签。',
+                editable: true,
+                reason: '这个对象还没有被画出来（定义行没有 draw=true，也没有 DRAW 指令）。标签会用 SETLABEL 指令写入脚本。',
             };
         }
 
@@ -986,6 +1059,46 @@ export class GeometryDSLInterpreter {
             lineNumber: source.lineNumber,
             editable: true,
             reason: '留空表示不显示标签。标签写在脚本的 label= 上，可以写中文或 $LaTeX$。',
+        };
+    }
+
+    /**
+     * 一段画布文字（TEXT）的可编辑信息。
+     *
+     * TEXT 的定位只有**行号**这一个可靠依据：它没有 `name=`，解释器内部合成
+     * `text_<行号>` 只是为了让选择和命中测试有个标识。所以这里从 `topLevelCommands`
+     * 里找那条 TEXT 指令的行号 —— 那份表是解释器解析脚本时留下的，比从
+     * `textElements` 反推更可靠（TEXT 会被延迟到末尾统一绘制，元素上的行号未必是定义行）。
+     *
+     * 找不到时返回 `editable: false` 并给出原因：文字可能来自 CODE 块 / 动画帧，
+     * 那些上下文里的指令没有稳定的顶层源码行，硬改会改错地方。
+     */
+    public getEditableText(name: string): EditableTextProperty | undefined {
+        if (!this.state.textElements.has(name)) return undefined;
+
+        // 同名的 TEXT 可能有多条（脚本里复制粘贴），以**最后一条**为生效定义 ——
+        // 和对几何对象「同名以后者为准」的约定保持一致。
+        let lineNumber: number | undefined;
+        for (const command of this.state.topLevelCommands) {
+            if (command.command.toUpperCase() !== 'TEXT') continue;
+            const commandName = command.params.get('name') || command.params.get('id') || `text_${command.lineNumber}`;
+            if (commandName === name) lineNumber = command.lineNumber;
+        }
+
+        if (lineNumber === undefined) {
+            return {
+                name,
+                lineNumber: 0,
+                editable: false,
+                reason: '这段文字来自 CODE 块或动画帧，没有稳定的顶层源码行，请直接在脚本里修改。',
+            };
+        }
+
+        return {
+            name,
+            lineNumber,
+            editable: true,
+            reason: '修改内容与样式后会写回脚本里这条 TEXT 指令所在的行。',
         };
     }
 
@@ -1363,6 +1476,9 @@ private parseParameters(paramString: string): Map<string, string> {
             case 'GETOBJ':
                 this.executeGetObject(params);
                 break;
+            case 'SETLABEL':
+                this.executeSetLabel(params, rawCommand);
+                break;
             case 'CALCULATE':
                 this.executeCalculate(params);
                 break;
@@ -1539,16 +1655,103 @@ private parseParameters(paramString: string): Map<string, string> {
         this.state.pendingCutResolutions.clear();
     }
 
-    // 设置属性
+    // 设置全局默认属性。
+    //
+    // 支持两种写法（可混用）：
+    //   SET labelColor=white                     —— 推荐的简写，一行一个属性名；
+    //   SET item=labelColor value=white          —— 老写法，一次只设一个（向后兼容）；
+    //   SET labelColor=white pointRadius=6       —— 一行设多个不同属性（简写形式可叠加）。
+    //
+    // 之所以要「简写 + 多属性」，是因为老写法每设一个属性就要敲一遍 `item=` 和
+    // `value=`，想同时改几个全局项就得写好几行 `SET`，可读性很差。
+    //
+    // 注意：这是唯一一条既收「属性名」又收 `item`/`value` 关键字的指令。
+    // `item` / `value` 只是关键字，不会和简写的属性名撞车 —— 遍历时会跳过这两个键。
+    //
+    // 混用时的优先级：**老写法先应用，且每个属性只应用一次**。这样
+    // `SET item=labelColor value=blue labelColor=red` 与
+    // `SET labelColor=red item=labelColor value=blue` 结果相同（都是 blue），
+    // 不会因为书写顺序不同而得到不同颜色。
     private executeSetOptions(params: Map<string, string>): void {
-        const item = params.get('item');
-        const value = params.get('value');
+        const legacyItem = params.get('item');
+        const legacyValue = params.get('value');
 
-        if (!item || value === undefined) {
-            throw new Error('SET command requires "item" and "value" parameters.');
+        // 老写法（item= + value=）优先当成一对处理，行为与过去完全一致。
+        // 只有当 `item=` 没写、但 `value=` 写了时才认为用户写漏了 name。
+        if (legacyItem !== undefined) {
+            if (legacyValue === undefined) {
+                throw new Error('SET command requires "item" and "value" parameters.');
+            }
+
+            this.applySettingItem(legacyItem, legacyValue, params);
         }
 
+        // 简写：剩下的 `属性名=值` 全部按属性处理。
+        // 一行可以写多个，各自独立生效（一个失败不影响其它）。
+        const applied = new Set<string>();
+        if (legacyItem !== undefined) applied.add(legacyItem.toLowerCase());
+
+        for (const [key, rawValue] of params) {
+            const lower = key.toLowerCase();
+            if (lower === 'item' || lower === 'value') continue;
+            if (!rawValue.trim()) continue; // `SET foo=` 这种空值直接忽略
+            // 同一个属性只应用一次，且老写法优先 —— 否则
+            // `SET labelColor=red item=labelColor value=blue` 会被简写分支再赋值回 red，
+            // 与「按出现顺序，后者生效」的直觉相反。
+            if (applied.has(lower)) continue;
+            applied.add(lower);
+            this.applySettingItem(key, rawValue, params);
+        }
+
+        if (legacyItem === undefined && !this.hasShorthandSetting(params)) {
+            throw new Error('SET command requires at least one "属性名=值" pair (或 "item=" 与 "value=").');
+        }
+    }
+
+    // 解析一个「必须是数字」的设置值，支持 `{slot}` 表达式。
+    // 非法值抛错（例如 `SET pointRadius=abc`），而不是让 `parseFloat` 给出 NaN
+    // 悄悄写进 defaultOptions —— 那样后面的绘制会莫名其妙地什么都不显示。
+    private parseSettingNumber(item: string, value: string, params: Map<string, string>): number {
+        const parsed = this.getNumberValue(params, 'value');
+        if (parsed === undefined || !Number.isFinite(parsed)) {
+            throw new Error(`set option ${item} fail, your value ${value} is invalid`);
+        }
+        return parsed;
+    }
+
+    // 判断参数里是否至少有一个简写形式的 `属性名=值`（排除 item/value 关键字）。
+    private hasShorthandSetting(params: Map<string, string>): boolean {
+        for (const [key, rawValue] of params) {
+            const lower = key.toLowerCase();
+            if (lower === 'item' || lower === 'value') continue;
+            if (rawValue.trim()) return true;
+        }
+        return false;
+    }
+
+    // 应用单个设置项。key 大小写不敏感，别名与原名字等价。
+    //
+    // `params` 是原样透传的「本次 SET 的全部参数」，只为了让 `parseColor` /
+    // `getNumberValue` 这类辅助方法能按 key 去取原始值（它们要拿原文来识别
+    // `{slot}` 表达式，光有已解析出的字符串不够）。
+    private applySettingItem(
+        item: string,
+        value: string,
+        params: Map<string, string>
+    ): void {
         let isUnKnownCmd = false;
+
+        // 把「属性名 -> 原始值」统一成一张表，这样下面可以直接用属性名查，
+        // 不必关心用户写的是 `labelColor=white` 还是 `item=labelColor value=white`。
+        //
+        // 这一点很关键：`parseColor(params, 'labelColor')` 在**老写法**下会取不到值 ——
+        // 老写法的 map 里只有 `item`/`value` 两个键，属性名根本不在其中，
+        // 于是颜色类设置会被静默忽略（`if (this.parseColor(...))` 为假就什么都不做）。
+        const scopedParams = new Map<string, string>(params);
+        scopedParams.set(item.toLowerCase(), value);
+        // 老写法下属性名不在 map 里，辅助方法按属性名取不到时还能退回 `value` 键。
+        scopedParams.set('item', item);
+        scopedParams.set('value', value);
 
         try {
             switch (item.toLowerCase()) {
@@ -1556,26 +1759,26 @@ private parseParameters(paramString: string): Map<string, string> {
                     this.state.defaultOptions.backgroundColor = value;
                     break;
                 case 'pencolor':
-                    if (this.parseColor(params, value)) {
-                        this.state.defaultOptions.penColor = this.parseColor(params, value)!;
+                    if (this.parseColor(scopedParams, 'pencolor')) {
+                        this.state.defaultOptions.penColor = this.parseColor(scopedParams, 'pencolor')!;
                     }
                     break;
                 case 'pensize':
-                    this.state.defaultOptions.penSize = parseFloat(value);
+                    this.state.defaultOptions.penSize = this.parseSettingNumber(item, value, scopedParams);
                     break;
                 case 'labelfont':
                     this.state.defaultOptions.labelFont = value;
                     break;
                 case 'labelcolor':
-                    if (this.parseColor(params, value)) {
-                        this.state.defaultOptions.labelColor = this.parseColor(params, value)!;
+                    if (this.parseColor(scopedParams, 'labelcolor')) {
+                        this.state.defaultOptions.labelColor = this.parseColor(scopedParams, 'labelcolor')!;
                     }
                     break;
                 case 'labelsize':
-                    this.state.defaultOptions.labelSize = parseFloat(value);
+                    this.state.defaultOptions.labelSize = this.parseSettingNumber(item, value, scopedParams);
                     break;
                 case 'pointradius':
-                    this.state.defaultOptions.pointRadius = parseFloat(value);
+                    this.state.defaultOptions.pointRadius = this.parseSettingNumber(item, value, scopedParams);
                     break;
                 case 'pointfill':
                     this.state.defaultOptions.pointFill = GeometryDSLInterpreter.parseBoolean(value);
@@ -1588,32 +1791,36 @@ private parseParameters(paramString: string): Map<string, string> {
                     break;
                 case 'linelength':
                 case 'linelen':
-                    this.state.defaultOptions.lineLength = this.parseLineLength(params, value);
+                    this.state.defaultOptions.lineLength = this.parseLineLength(scopedParams, value);
                     break;
                 case 'geocolor':
                 // help 里一直写着 `geoColor/defaultGeoColor` 两个名字，但只实现了前者，
                 // 于是 `SET item=defaultGeoColor ...` 会抛 Unknown setting item。补上别名。
                 case 'defaultgeocolor':
-                    this.state.defaultOptions.geoColor = value;
+                    if (this.parseColor(scopedParams, 'geocolor')) {
+                        this.state.defaultOptions.geoColor = this.parseColor(scopedParams, 'geocolor')!;
+                    } else {
+                        this.state.defaultOptions.geoColor = value;
+                    }
                     break;
                 // 这两个以前写的是 canvasX / canvasY —— 那是**由画布外层变换推导出来的**
                 // 可视矩形原点（见 setTransform / setRenderTransform），不是视图中心，
                 // 而且每次重算都会被覆盖。文档写的是「视图中心X/Y坐标」，`SET scale` 也确实
                 // 写的是 scale，所以这里应当和 VIEW centerX/centerY 落到同一个字段。
                 case 'centerx':
-                    this.state.defaultOptions.centerX = parseFloat(value);
+                    this.state.defaultOptions.centerX = this.parseSettingNumber(item, value, scopedParams);
                     break;
                 case 'centery':
-                    this.state.defaultOptions.centerY = parseFloat(value);
+                    this.state.defaultOptions.centerY = this.parseSettingNumber(item, value, scopedParams);
                     break;
                 case 'scale':
-                    this.state.defaultOptions.scale = parseFloat(value);
+                    this.state.defaultOptions.scale = this.parseSettingNumber(item, value, scopedParams);
                     break;
                 // 视图旋转（度），与 `VIEW rotation=` 落到同一个字段。
                 case 'rotation':
                 case 'rotate':
                 case 'angle':
-                    this.state.defaultOptions.rotation = parseFloat(value);
+                    this.state.defaultOptions.rotation = this.parseSettingNumber(item, value, scopedParams);
                     break;
 
                 default:
@@ -1647,6 +1854,9 @@ private parseParameters(paramString: string): Map<string, string> {
             return null;
         }
 
+        // `params` 已经是 applySettingItem 里归一化过的表，`'value'` 键必然指向
+        // 本次要设的原始文本（简写与老写法都成立），所以这里不用关心用户怎么写。
+        // `getNumberValue` 需要原始文本是为了识别 `{slot}` 表达式。
         const parsed = this.getNumberValue(params, 'value');
         if (parsed === undefined || !Number.isFinite(parsed) || parsed <= 0) {
             return null;
@@ -1793,8 +2003,18 @@ private parseParameters(paramString: string): Map<string, string> {
         const autoLabel = obj instanceof Point
             ? this.state.defaultOptions.drawLabelForPoints
             : this.state.defaultOptions.drawLabelForOthers;
-        const explicitLabel = label ?? params.get('label') ?? params.get('l');
-        if (autoLabel && explicitLabel != null && explicitLabel !== '') {
+        // `SETLABEL` 设过的对象以覆盖表为准，优先级高于脚本里的 `label=`。
+        // 用 `has()` 而不是判空串：覆盖值可能是**空串**，那表示「显式要求不显示标签」，
+        // 与「没设过、请回落到脚本」是两回事。
+        const override = this.state.labelOverrides.get(obj.name);
+        const explicitLabel = override !== undefined
+            ? override
+            : (label ?? params.get('label') ?? params.get('l'));
+        // 总开关只约束「脚本里顺手写的 label=」。用户用 SETLABEL 明确点名要标签时，
+        // 再拿 `drawLabelForOthers=false`（其余对象的默认值）把他挡住就没道理了 ——
+        // 那会表现为「指令执行成功、但图上什么都没出现」。
+        const labelAllowed = override !== undefined ? true : autoLabel;
+        if (labelAllowed && explicitLabel != null && explicitLabel !== '') {
             // 标签与几何对象一样，都需要完整的逻辑坐标到画布坐标换算。
             // Canvas 的 ctx 只预置了拖拽平移/缩放，不包含 centerX/centerY 的视图偏移；
             // SVG 上下文也没有预置变换，因此两种渲染路径都传入完整 transform。
@@ -2178,6 +2398,129 @@ private parseParameters(paramString: string): Map<string, string> {
         }
     }
 
+    /**
+     * `SETLABEL` —— 给任意对象改名（设置显示标签）。
+     *
+     * 用法：
+     *   SETLABEL name=P label=点P                 # 单个对象
+     *   SETLABEL obj=A,B label=端点 draw=true     # 多个对象用同一个标签
+     *   SETLABEL name=P label=                    # 空标签 = 不显示
+     *
+     * 与 `SET` 的区别：`SET` 改的是**全局默认值**（之后新画的对象才受影响），
+     * `SETLABEL` 改的是**某个已存在对象的标签**。
+     *
+     * 与 `CREATE ... label=` 的区别：那条挂在创建行上，只对几何对象有效，且派生对象
+     * （`CREATE TANGENT` 顺带建出的 `T2` / `T2_tan`、自动命名的 `seg_2` …）在脚本里
+     * 根本没有独立定义行，压根没地方写 `label=`。`SETLABEL` 按名字定位，对**任何**
+     * 已注册对象都成立 —— 这正是它存在的理由。
+     *
+     * 实现落在 `state.labelOverrides`（对象名 -> 标签），绘制时优先于脚本里的 `label=`。
+     * 不去改写脚本源码：解释器只负责解释，脚本改写是编辑层（`dslPropertySync`）的职责，
+     * 混在一起会让「重跑脚本」和「改脚本」互相打架。
+     */
+    private executeSetLabel(params: Map<string, string>, rawCommand: string): void {
+        // 对象名可以写成 name= / n= / obj= / o=，与 GETOBJ / DRAW 保持一致的习惯。
+        const rawTargets = params.get('name') ?? params.get('n')
+            ?? params.get('obj') ?? params.get('o');
+
+        if (rawTargets === undefined) {
+            throw new Error('SETLABEL command requires name parameter (例如 SETLABEL name=P label=点P)');
+        }
+
+        // `label` 允许为空串（= 不显示），所以不能用 `??` 的短路逻辑去判「有没有写」——
+        // 必须区分「没写 label=`」和「写了 label= 但值是空的」。params 里有键就说明写了。
+        const labelKey = ['label', 'l', 'text', 't'].find(key => params.has(key));
+        if (labelKey === undefined) {
+            throw new Error('SETLABEL command requires label parameter');
+        }
+
+        // 转义要按**原始命令行**判断，不能看 params 里的值 ——
+        // `parseParameters` 早把引号剥掉了，`label="a\nb"` 与 `label=a\nb` 解析出来
+        // 一模一样，光看值无法区分「该还原换行」还是「该保留反斜杠」。
+        const label = this.readRawLabelValue(rawCommand, labelKey)
+            ?? (params.get(labelKey) ?? '');
+
+        const names = rawTargets.split(',').map(item => item.trim()).filter(Boolean);
+        if (names.length === 0) {
+            throw new Error('SETLABEL command requires at least one object name');
+        }
+
+        const missing: string[] = [];
+        for (const name of names) {
+            const obj = this.getObject(name);
+            if (!obj) {
+                missing.push(name);
+                continue;
+            }
+            this.state.labelOverrides.set(obj.name, label);
+        }
+
+        // 一个都没找到才报错；部分命中就按命中的来，并把缺失的名字提示出来 ——
+        // 派生对象的名字（`T2`、`seg_2`）用户不一定记得准，报错信息里带上才有用。
+        if (missing.length === names.length) {
+            throw new Error(`SETLABEL: 对象不存在: ${missing.join(', ')}`);
+        }
+
+        if (missing.length > 0) {
+            this.state.onMessage?.(
+                'warn',
+                this.state.currentCommandLine,
+                `SETLABEL: 以下对象不存在，已跳过: ${missing.join(', ')}`,
+            );
+        }
+
+        const display = label === '' ? '(空 = 不显示)' : label.replace(/\n/g, '\\n');
+        this.state.onMessage?.(
+            'info',
+            0,
+            `Set label of ${names.filter(n => !missing.includes(n)).join(', ')} to ${display}`,
+        );
+    }
+
+    /**
+     * 从**原始命令行**里取 `<key>=` 后面的标签文本，并按引号情况决定是否反转义。
+     *
+     * 为什么绕开 `params`：`parseParameters` 会把引号剥掉再存值，所以
+     * `label="a\nb"` 和 `label=a\nb` 解析出来完全相同。而这两者的语义必须不同 ——
+     * 前者是用户明确要一个换行，后者可能就是想打反斜杠。原始命令行里还留着引号，
+     * 是唯一能区分二者的地方。
+     *
+     * 转义必须**单趟**替换：分多次 replace 会踩「`\\` 先变 `\`、再碰上 n 就成了换行」的坑。
+     */
+    private readRawLabelValue(rawCommand: string, key: string): string | undefined {
+        if (!rawCommand) return undefined;
+
+        // 匹配 `key=` 后紧跟的「带引号串」或「裸串」，值的结束位置与 parseParameters 同规则：
+        // 裸串一直吃到「空白 + 下一个 key=」或行尾。
+        const pattern = new RegExp(`(?:^|\\s)${key}\\s*=\\s*`, 'i');
+        const match = pattern.exec(rawCommand);
+        if (!match) return undefined;
+
+        let cursor = match.index + match[0].length;
+        const quote = rawCommand[cursor];
+
+        if (quote === '"' || quote === "'") {
+            cursor++;
+            let end = cursor;
+            while (end < rawCommand.length && rawCommand[end] !== quote) {
+                if (rawCommand[end] === '\\' && end + 1 < rawCommand.length) end++; // 跳过被转义的字符
+                end++;
+            }
+            const inner = rawCommand.slice(cursor, end);
+            return inner.replace(/\\(.)/g, (_, char) => {
+                if (char === 'n') return '\n';
+                if (char === 't') return '\t';
+                if (char === 'r') return '\r';
+                return char;
+            });
+        }
+
+        // 裸值：读到下一个 ` key=` 之前
+        const rest = rawCommand.slice(cursor);
+        const nextKey = /\s+\w+\s*=/.exec(rest);
+        return (nextKey ? rest.slice(0, nextKey.index) : rest).trim();
+    }
+
     // 执行计算指令
     private executeCalculate(params: Map<string, string>): void {
         const expression = params.get('expression') || params.get('e');
@@ -2260,12 +2603,44 @@ private parseParameters(paramString: string): Map<string, string> {
         }
 
         let text = textMatch[1].trim();
-        if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
-            text = text.slice(1, -1);
+        // 只有**带引号**的内容才反转义。
+        // 画布右键「文字」对话框写出的就是 `text="..."`，内容里的换行/引号/反斜杠都经过转义
+        // （`\n` / `\"` / `\\`），不还原的话用户会看到一堆反斜杠；
+        // 而老脚本里裸写的 `text=AB` 或含 `\n` 字面量的写法要保持原样，所以不碰未加引号的情况。
+        const quoted = (text.startsWith('"') && text.endsWith('"'))
+            || (text.startsWith("'") && text.endsWith("'"));
+        if (quoted) {
+            // 单趟替换：一次扫过，`\\n` 这种「转义的反斜杠 + n」不会被误当成换行。
+            // 分多次 replace 会踩这个坑 —— `\\` 先变 `\`，再碰上 n 就成了换行。
+            //
+            // 只还原**写出方真正会转义**的那几种序列（\\ \n \t \r \" \'）：
+            // 其余反斜杠必须原样保留，否则 LaTeX 会被吃掉 —— `\frac` / `\left` / `\sqrt`
+            // 里的反斜杠不是转义前缀，按「`\x` → `x`」处理会变成 `frac` / `left` / `sqrt`，
+            // 公式直接崩成乱码（曾造成「非选中时公式末尾缺一段」）。
+            text = text.slice(1, -1).replace(/\\(.)/g, (match: string, char: string) => {
+                if (char === 'n') return '\n';
+                if (char === 't') return '\t';
+                if (char === 'r') return '\r';
+                if (char === '"' || char === "'" || char === '\\') return char;
+                return match; // 未知转义（含 LaTeX 命令）原样保留
+            });
         }
+        // 槽位替换 `{表达式}` → 求值结果。
+        //
+        // 两个防御点（都曾造成「整条 TEXT 一个字都不显示」）：
+        //   1. `{}` 是空表达式，`calculate('')` 会抛错。用户在 LaTeX 后面随手写个 `{}`
+        //      （或公式末尾本来就有花括号）就会把整条指令带崩 —— 空串直接跳过。
+        //   2. 单个槽位求值失败（变量未定义 / 语法错）不应该连累整段文字：
+        //      保留原样的 `{...}` 文本比什么都不画更有利于用户定位问题。
         for (const expression of this.extractExpressions(text)) {
-            const slotName = expression.slice(1, -1);
-            const slotValue = this.executeSlotExpression(slotName);
+            const slotName = expression.slice(1, -1).trim();
+            if (!slotName) continue;
+            let slotValue: number | undefined;
+            try {
+                slotValue = this.executeSlotExpression(slotName);
+            } catch {
+                continue; // 求值失败就保留原文，不让整条 TEXT 挂掉
+            }
             if (slotValue !== undefined) text = text.replace(expression, slotValue.toString());
         }
 
@@ -2294,8 +2669,10 @@ private parseParameters(paramString: string): Map<string, string> {
         ctx.save();
         ctx.font = `${fontStyle} ${fontWeight} ${fontSize}px ${fontFamily}`;
 
-        // 先把 text 切成普通文本 / LaTeX 片段，分别测宽，累出整体宽度与垂直范围。
-        const parts = splitLatexParts(text);
+        // 先把 text 按换行切成若干行；每一行内部再切成普通文本 / LaTeX 片段并测宽。
+        // 单行是绝大多数情况，多行来自画布右键「文字」对话框里按了回车。
+        const lines = text.split('\n');
+
         interface Layout {
             kind: 'text' | 'latex';
             value: string;
@@ -2306,49 +2683,75 @@ private parseParameters(paramString: string): Map<string, string> {
             descent: number;
             x: number;
         }
-        const layouts: Layout[] = [];
-        let cursorX = screenPoint.x;
-        let maxAscent = 0;
-        let maxDescent = 0;
-        for (const part of parts) {
-            if (part.kind === 'text') {
-                const value = part.value;
-                const m = ctx.measureText(value);
-                const width = m.width;
-                const ascent = (m as any).fontBoundingBoxAscent ?? fontSize * 0.8;
-                const descent = (m as any).fontBoundingBoxDescent ?? fontSize * 0.2;
-                layouts.push({ kind: 'text', value, width, height: ascent + descent, ascent, descent, x: cursorX });
-                cursorX += width;
-                maxAscent = Math.max(maxAscent, ascent);
-                maxDescent = Math.max(maxDescent, descent);
-            } else {
-                const measured = this.measureKatexForLayout(part.value, fontSize, color, part.displayMode === true);
-                const ascent = measured.height * 0.75;
-                const descent = measured.height * 0.25;
-                layouts.push({
-                    kind: 'latex',
-                    value: part.value,
-                    displayMode: part.displayMode,
-                    width: measured.width,
-                    height: measured.height,
-                    ascent,
-                    descent,
-                    x: cursorX,
-                });
-                cursorX += measured.width + 2;
-                maxAscent = Math.max(maxAscent, ascent);
-                maxDescent = Math.max(maxDescent, descent);
-            }
+        // 每行的布局，外加该行的整体尺寸 —— 多行时要按行的最大宽度对齐背景框、
+        // 按每行自己的 ascent 决定基线，不能拿一个全局值糊弄。
+        interface LineLayout {
+            layouts: Layout[];
+            width: number;
+            ascent: number;
+            descent: number;
         }
-        const totalWidth = cursorX - screenPoint.x;
+
+        const lineLayouts: LineLayout[] = [];
+        for (const lineText of lines) {
+            const parts = splitLatexParts(lineText);
+            const layouts: Layout[] = [];
+            let cursorX = screenPoint.x;
+            let lineAscent = 0;
+            let lineDescent = 0;
+            for (const part of parts) {
+                if (part.kind === 'text') {
+                    const value = part.value;
+                    const m = ctx.measureText(value);
+                    const width = m.width;
+                    const ascent = (m as any).fontBoundingBoxAscent ?? fontSize * 0.8;
+                    const descent = (m as any).fontBoundingBoxDescent ?? fontSize * 0.2;
+                    layouts.push({ kind: 'text', value, width, height: ascent + descent, ascent, descent, x: cursorX });
+                    cursorX += width;
+                    lineAscent = Math.max(lineAscent, ascent);
+                    lineDescent = Math.max(lineDescent, descent);
+                } else {
+                    const measured = this.measureKatexForLayout(part.value, fontSize, color, part.displayMode === true);
+                    const ascent = measured.height * 0.75;
+                    const descent = measured.height * 0.25;
+                    layouts.push({
+                        kind: 'latex',
+                        value: part.value,
+                        displayMode: part.displayMode,
+                        width: measured.width,
+                        height: measured.height,
+                        ascent,
+                        descent,
+                        x: cursorX,
+                    });
+                    cursorX += measured.width + 2;
+                    lineAscent = Math.max(lineAscent, ascent);
+                    lineDescent = Math.max(lineDescent, descent);
+                }
+            }
+            // 空行也要占一行高度，否则连按两次回车会被压缩掉，用户看到的行距和输入不一致。
+            if (layouts.length === 0) {
+                lineAscent = fontSize * 0.8;
+                lineDescent = fontSize * 0.2;
+            }
+            lineLayouts.push({ layouts, width: cursorX - screenPoint.x, ascent: lineAscent, descent: lineDescent });
+        }
+
+        // 行高取字号的一点二倍：太挤会和上行下伸部分打架，太松又不像一段文字。
+        const lineHeight = fontSize * 1.2;
+        const totalWidth = Math.max(...lineLayouts.map(line => line.width), 0);
+        const firstAscent = lineLayouts[0]?.ascent ?? fontSize * 0.8;
+        // 整个文本块的总高：第一行的上伸 + 中间行距 + 最后一行的下伸。
+        const totalHeight = (lineLayouts.length - 1) * lineHeight + firstAscent + (lineLayouts[lineLayouts.length - 1]?.descent ?? 0);
+
         this.state.textElements.set(textObjectName, {
             name: textObjectName,
             text,
             x,
             y,
             width: totalWidth,
-            ascent: maxAscent,
-            descent: maxDescent,
+            ascent: firstAscent,
+            descent: totalHeight - firstAscent,
             lineNumber,
         });
         this.state.textHitRegions.push({
@@ -2356,58 +2759,86 @@ private parseParameters(paramString: string): Map<string, string> {
             x,
             y,
             width: totalWidth,
-            ascent: maxAscent,
-            descent: maxDescent,
+            ascent: firstAscent,
+            descent: totalHeight - firstAscent,
         });
 
-        // 背景框（可选）
+        // 背景框（可选）。多行时框住整个文本块，不能只框第一行。
         const backgroundColor = this.parseColor(params, 'backgroundColor')
             || this.parseColor(params, 'bgc');
         if (backgroundColor && backgroundColor !== 'transparent' && backgroundColor !== 'none') {
             ctx.fillStyle = backgroundColor;
             ctx.fillRect(
                 screenPoint.x - padding,
-                screenPoint.y - maxAscent - padding,
+                screenPoint.y - firstAscent - padding,
                 totalWidth + padding * 2,
-                (maxAscent + maxDescent) + padding * 2,
+                totalHeight + padding * 2,
             );
             ctx.fillStyle = color;
         }
 
         ctx.fillStyle = color;
-        for (const layout of layouts) {
-            if (layout.kind === 'text') {
-                ctx.fillText(layout.value, layout.x, screenPoint.y);
-                continue;
-            }
-            // LaTeX 段：基线在 screenPoint.y，片段顶端放
-            // 在 screenPoint.y - ascent 处，与普通文字顶部齐平。
-            const top = screenPoint.y - layout.ascent;
-            if (isSvg) {
-                const svgCtx = ctx as unknown as { drawKatex: (fragment: string, x: number, y: number) => void };
-                if (typeof svgCtx.drawKatex === 'function') {
-                    const { fragment } = renderKatexToSvgFragment(layout.value, fontSize, color, {
-                        includeCss: false,
-                        displayMode: layout.displayMode === true,
-                    });
-                    svgCtx.drawKatex(fragment, layout.x, top);
+        for (let lineIndex = 0; lineIndex < lineLayouts.length; lineIndex++) {
+            const line = lineLayouts[lineIndex];
+            // 每一行的基线 = 第一行的基线往下挪若干行。用「第一行 ascent + 行距×n」
+            // 而不是拿本行 ascent 累加，行距才均匀（不然 LaTeX 行会把下面顶开）。
+            const lineBaseline = screenPoint.y + lineIndex * lineHeight;
+            for (const layout of line.layouts) {
+                if (layout.kind === 'text') {
+                    ctx.fillText(layout.value, layout.x, lineBaseline);
                     continue;
                 }
-                // 兜底：纯文本 fallback
-                ctx.fillText(`$${layout.value}$`, layout.x, screenPoint.y);
-                continue;
-            }
-            // Canvas 路径：先看缓存有没有渲染好的离屏 canvas
-            let cached = getCachedKatexCanvas(layout.value, fontSize, color, layout.displayMode === true);
-            if (!cached) {
-                prefetchKatexToCanvas(layout.value, fontSize, color, layout.displayMode === true);
-                // 还没渲好：用原文当占位，避免整段布局塌掉
-                const previousFont = ctx.font;
-                ctx.font = `italic ${fontWeight} ${fontSize}px ${fontFamily}`;
-                ctx.fillText(`$${layout.value}$`, layout.x, screenPoint.y);
-                ctx.font = previousFont;
-            } else {
-                ctx.drawImage(cached, layout.x, top);
+                // LaTeX 段：基线在 lineBaseline，片段顶端放在 lineBaseline - ascent 处，
+                // 与同行的普通文字顶部齐平。
+                const top = lineBaseline - layout.ascent;
+                if (isSvg) {
+                    const svgCtx = ctx as unknown as { drawKatex: (fragment: string, x: number, y: number) => void };
+                    if (typeof svgCtx.drawKatex === 'function') {
+                        const { fragment } = renderKatexToSvgFragment(layout.value, fontSize, color, {
+                            includeCss: false,
+                            displayMode: layout.displayMode === true,
+                        });
+                        svgCtx.drawKatex(fragment, layout.x, top);
+                        continue;
+                    }
+                    // 兜底：纯文本 fallback
+                    ctx.fillText(`$${layout.value}$`, layout.x, lineBaseline);
+                    continue;
+                }
+                // Canvas 路径：先看缓存有没有渲染好的离屏 canvas
+                const cached = getCachedKatexCanvas(layout.value, fontSize, color, layout.displayMode === true);
+                if (!cached) {
+                    prefetchKatexToCanvas(layout.value, fontSize, color, layout.displayMode === true);
+                    // 还没渲好：用原文当占位，避免整段布局塌掉。
+                    //
+                    // 占位文本必须**画在 layout.width 之内**：`\frac{a}{b}` 这类源码
+                    // 原样铺开比渲染后的公式宽得多（实测约 2.2 倍），直接 fillText 会
+                    // 冲出预留盒、压到后面的内容上，看起来就像「最后一段被截断了」。
+                    // 这里按预留宽度水平缩放一下，让占位恰好占满这段的位置；
+                    // 缓存就绪后会被真正的公式位图替换。
+                    const previousFont = ctx.font;
+                    ctx.font = `italic ${fontWeight} ${fontSize}px ${fontFamily}`;
+                    const placeholderText = `$${layout.value}$`;
+                    const placeholderWidth = ctx.measureText(placeholderText).width;
+                    if (placeholderWidth > 0 && layout.width > 0) {
+                        ctx.save();
+                        ctx.translate(layout.x, lineBaseline);
+                        ctx.scale(layout.width / placeholderWidth, 1);
+                        ctx.fillText(placeholderText, 0, 0);
+                        ctx.restore();
+                    } else {
+                        ctx.fillText(placeholderText, layout.x, lineBaseline);
+                    }
+                    ctx.font = previousFont;
+                } else {
+                    // 按位图的**原始像素尺寸**绘制（3 参形式）。
+                    //
+                    // 不要传 layout.width / layout.height：位图是 `Math.ceil(measureKatex(...))`，
+                    // 比测量值大 0~1px，而位图里的字形（尤其斜体末字母的伸出部分）是顶满像素盒的。
+                    // 按略小的测量值去画等于把内容缩一点，右边缘最后那点会被裁掉 ——
+                    // 表现出来正好是「公式末尾缺一点」。
+                    ctx.drawImage(cached, layout.x, top);
+                }
             }
         }
         ctx.restore();
@@ -3566,8 +3997,20 @@ private parseParameters(paramString: string): Map<string, string> {
         }
     }
 
+    /**
+     * 过一点作圆的切线。
+     *
+     * 名字约定（与 HELP / SystemPrompt 一致）：
+     * - `name` 是**切点的名字**，逗号分隔。
+     * - 圆外一点 → 两条切线、两个切点，`name=T1,T2`；切线名自动派生为 `T1_tan` / `T2_tan`。
+     *   只给一个名字时第二个切点退化成 `<名字>_2`（和 INTERSECT 的合成命名习惯一致）。
+     * - 圆上一点 → 只有一条切线、切点就是给定的那一点；切线名派生为 `<名字>_tan`。
+     *
+     * 以前这里有两处实打实的 bug：圆外分支里两条线段**都**连到 tangentPoint1（第二条
+     * 切线其实是第一条的重复），而且 `splitName[1]` 被同时当成点名和线名用 —— 于是
+     * 第二条线覆盖掉了第二个切点。现在切点和切线各自独立命名，两条切线各连各自的切点。
+     */
     private createTangent(params: Map<string, string>): void {
-        // 实现切线创建
         const name = params.get('name');
         const circleName = params.get('circle') || params.get('c');
         const pointName = params.get('point') || params.get('p');
@@ -3575,7 +4018,6 @@ private parseParameters(paramString: string): Map<string, string> {
         if (!name || !circleName || !pointName) {
             throw new Error('TANGENT command requires name, circle, and point parameters');
         }
-
 
         const circleRaw = this.getObject(circleName);
         const pointRaw = this.getObject(pointName);
@@ -3586,62 +4028,116 @@ private parseParameters(paramString: string): Map<string, string> {
         if (!(circleRaw instanceof Circle)) {
             throw new Error(`Object ${circleName} is not a valid circle object`);
         }
+        if (!(pointRaw instanceof Point)) {
+            throw new Error(`Object ${pointName} is not a valid point object`);
+        }
 
         const circle = circleRaw as Circle;
         const point = pointRaw as Point;
 
-        const splitName = name.split(',');
+        const names = name.split(',').map(item => item.trim()).filter(item => item.length > 0);
+        if (names.length === 0) {
+            throw new Error('TANGENT command requires at least one name');
+        }
 
-        // 检查点是否在圆上
+        const draw = params.get('draw');
+        const shouldDraw = draw != null && draw == 'true' && this.state.ctx;
+        // 切线始终跟着 draw 走；切点额外受 `showPoints` 控制（默认显示）。
+        // 分开是因为「只画切线、不标切点」是常见诉求，而 `draw=false` 会把两者一起关掉。
+        const shouldDrawPoints = shouldDraw && this.getBooleanParam(params, true, 'showPoints', 'sp');
+
+        // 切点落在这个位置的话，用已有的点、不再新建一个（避免图上出现两个重合的点）。
+        // 与 INTERSECT 系列同一套容差口径。
+        const approxPoint = (a: Point, b: Point) =>
+            a.distanceTo2(b.x, b.y) <= this.zeroThresholdValue;
+        const reuseOrCreatePoint = (preferredName: string, x: number, y: number): Point => {
+            const existing = this.findPoint(x, y);
+            if (existing) return existing;
+            const created = new Point(preferredName, x, y);
+            this.state.objects.set(created.name, created);
+            return created;
+        };
+
         const distance = circle.center.distanceTo(point);
-        if (Math.abs(distance - circle.radius) <= this.zeroThresholdValue) {
-            // 点在圆上
-            // 创建切线, 只需要过P点作OP垂线即可
-            const segmentRadius = new Segment(splitName[0] + '_<circle_radius>', point, circle.center);
-            this.state.objects.set(segmentRadius.name, segmentRadius);
 
-            const perpPointPos = segmentRadius.perpendicularLineThroughPoint(point);
-            const perpPoint = new Point(splitName[0] + '_<circle_Point>', perpPointPos.x, perpPointPos.y);
+        // ---- 点在圆上：只有一条切线，过该点作 OP 的垂线即可。
+        if (Math.abs(distance - circle.radius) <= this.zeroThresholdValue) {
+            const contactName = names[0];
+            // 切点就是给定的那个点。
+            // 名字约定下 `point=P` + `name=T` 表示「切点叫 T」：若 T 还没被占用，
+            // 就建一个与 P 重合的新点 T；若 T 已经是点（含 T===P 这种同一名字），
+            // 就直接用——但要把它的坐标对齐到 P，避免脚本里给了错坐标时切点跑到别处。
+            const existingContact = this.state.objects.get(contactName);
+            let contact: Point;
+            if (existingContact instanceof Point) {
+                contact = existingContact;
+                if (!(approxPoint(existingContact, point))) {
+                    this.state.objects.delete(contactName);
+                    contact = new Point(contactName, point.x, point.y);
+                    this.state.objects.set(contactName, contact);
+                }
+            } else {
+                contact = new Point(contactName, point.x, point.y);
+                this.state.objects.set(contactName, contact);
+            }
+
+            // 过切点作半径的垂线：借 Segment 的垂线工具算一个方向点（不画这条辅助半径）。
+            const radiusHelper = new Segment(`${names[0]}_<circle_radius>`, point, circle.center);
+            const perpPos = radiusHelper.perpendicularLineThroughPoint(point);
+            const perpPoint = new Point(`${names[0]}_<circle_Point>`, perpPos.x, perpPos.y);
             this.state.objects.set(perpPoint.name, perpPoint);
 
-            const segment = new Segment(splitName[0], point, perpPoint);
-            this.state.objects.set(name, segment);
+            const tangentLine = new Segment(`${names[0]}_tan`, contact, perpPoint);
+            this.state.objects.set(tangentLine.name, tangentLine);
 
-            const draw = params.get('draw');
-            if (draw != null && draw == 'true' && this.state.ctx) {
-                this.collectDraw(params, segment);
+            if (shouldDraw) {
+                if (shouldDrawPoints) this.collectDraw(params, contact);
+                this.collectDraw(params, tangentLine);
             }
+            return;
+        }
 
-        } else {
-            if (distance < circle.radius) {
-                // 点在圆内部，无法作切线
-                throw new Error(`Point ${pointName} is inside the circle ${circleName}, cannot create tangent`);
-            }
-            // 点在圆外
-            // 计算切线长度
-            const tangentLength = Math.sqrt(distance * distance - circle.radius * circle.radius);
+        if (distance < circle.radius - this.zeroThresholdValue) {
+            throw new Error(`Point ${pointName} is inside the circle ${circleName}, cannot create tangent`);
+        }
 
-            // 获取P点到圆上距离等于tangentLength的点
-            const tangentPointPos = circle.getPointAtDistanceFromTarget(point, tangentLength);
-            if (tangentPointPos.length !== 2) {
-                throw new Error(`Failed to calculate tangent point for ${pointName} on circle ${circleName}`);
-            }
+        // ---- 点在圆外：两条切线、两个切点。
+        // 切点 = 以「该点到圆心」为半径的辅助圆与已知圆的交点，所以用勾股定理先求切线长。
+        const tangentLength = Math.sqrt(distance * distance - circle.radius * circle.radius);
+        const tangentPointPositions = circle.getPointAtDistanceFromTarget(point, tangentLength);
+        if (tangentPointPositions.length !== 2) {
+            throw new Error(`Failed to calculate tangent points for ${pointName} on circle ${circleName}`);
+        }
 
-            const tangentPoint1 = new Point(splitName[0], tangentPointPos[0].x, tangentPointPos[0].y);
-            const tangentPoint2 = new Point(splitName[1] || splitName[0] + '_<next_tangent_point>', tangentPointPos[1].x, tangentPointPos[1].y);
+        // 第二个切点的名字：用户没给就用 `<名字>_2`，跟其它合成点一致。
+        const secondContactName = names[1] && names[1].length > 0 ? names[1] : `${names[0]}_2`;
 
-            this.state.objects.set(tangentPoint1.name, tangentPoint1);
-            this.state.objects.set(tangentPoint2.name, tangentPoint2);
+        // `getPointAtDistanceFromTarget` 内部走的是两圆求交，返回顺序取决于辅助圆的
+        // 内部构造，和用户直觉的「上/下」无关。这里按相对圆心的角度排一下序：
+        // 角度小的在前（即 y 小的在前，因为数学坐标 y 向上、atan2 在 y 越小时越小），
+        // 这样 names[0] 稳定地对应「偏下」那个切点、names[1] 对应「偏上」那个，
+        // 同一个脚本每次执行、以及和用户在图上看到的顺序都对得上。
+        const sortedPositions = tangentPointPositions.slice().sort((a, b) => {
+            const angleA = Math.atan2(a.y - circle.center.y, a.x - circle.center.x);
+            const angleB = Math.atan2(b.y - circle.center.y, b.x - circle.center.x);
+            return angleA - angleB;
+        });
 
-            const segment1 = new Segment(splitName[0], point, tangentPoint1);
-            this.state.objects.set(segment1.name, segment1);
-            const segment2 = new Segment(splitName[1], point, tangentPoint1);
-            this.state.objects.set(segment2.name, segment2);
+        const contacts = [
+            { name: names[0], position: sortedPositions[0] },
+            { name: secondContactName, position: sortedPositions[1] },
+        ];
 
-            const draw = params.get('draw');
-            if (draw != null && draw == 'true' && this.state.ctx) {
-                this.collectDraw(params, segment1);
-                this.collectDraw(params, segment2);
+        for (const { name: contactName, position } of contacts) {
+            const contact = reuseOrCreatePoint(contactName, position.x, position.y);
+            // 每条切线连**自己的**切点；名字用 `<切点名>_tan` 派生，不和切点撞名。
+            const tangentLineAlias = `${contact.name}_tan`;
+            const tangentLine = new Segment(tangentLineAlias, point, contact);
+            this.state.objects.set(tangentLine.name, tangentLine);
+
+            if (shouldDraw) {
+                if (shouldDrawPoints) this.collectDraw(params, contact);
+                this.collectDraw(params, tangentLine);
             }
         }
     }
@@ -5979,6 +6475,15 @@ private parseParameters(paramString: string): Map<string, string> {
         const existNameObject = this.state.objects.get(name);
         if (existNameObject) {
             return existNameObject;
+        }
+
+        // TEXT 不在 `state.objects` 里（它不是几何对象，没有几何语义），但画布上的
+        // 选择、命中、右键菜单都把它当普通可选中元素对待，一律走 `getObject(name).type`
+        // 判类型。这里补一条兜底，返回一个最小的 text 记录 —— 缺了它，文字会被
+        // 「查不到类型 → 过滤掉」，右键菜单里永远见不到它。
+        const textElement = this.state.textElements.get(name);
+        if (textElement) {
+            return { name, type: 'text' } as unknown as GeometricObject;
         }
 
         const existSlotValue = this.state.slots.get(name);

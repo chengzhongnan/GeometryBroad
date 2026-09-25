@@ -98,7 +98,7 @@ const LabelEditDialog: React.FC<LabelEditDialogProps> = ({
 
                 <Hint>
                     {editable
-                        ? '标签会写进脚本的 label=，并立刻重画。留空表示不显示标签。'
+                        ? (reason ?? '标签会写进脚本的 label=，并立刻重画。留空表示不显示标签。')
                         : reason}
                 </Hint>
 
@@ -117,13 +117,15 @@ const LabelEditDialog: React.FC<LabelEditDialogProps> = ({
                 </Field>
 
                 <MetaRow>
-                    <span>{objectType} · 第 {lineNumber} 行</span>
+                    {/* 行号为 0 是「自动派生对象」的约定值：它在脚本里没有独立定义行。 */}
+                    <span>{objectType} · {lineNumber ? `第 ${lineNumber} 行` : '自动派生对象'}</span>
                     <span>支持中文与 $LaTeX$</span>
                 </MetaRow>
 
-                <PreviewLabel>这一行将变成</PreviewLabel>
+                <PreviewLabel>{preview ? '这一行将变成' : '将在脚本末尾新增'}</PreviewLabel>
                 <CodePreview>
-                    {preview ?? '（这一行不参与标签，改动不会生效）'}
+                    {preview
+                        ?? `SETLABEL name=${objectName} label=${value.trim() || '（清除 = 删除该指令）'}`}
                 </CodePreview>
 
                 <Footer>

@@ -256,12 +256,17 @@ function formatLabelValue(value: string): string {
  *   - 参数已存在：原地替换（保留用户原本写的是 `label` 还是 `l`）；
  *   - 参数不存在：补在行尾（行尾注释之前），否则会被当成注释内容而失效。
  *
- * 写哪一行由解释器给的行号决定：定义行写了 `draw=true` 就写定义行，否则写真正把
- * 对象画出来的 `DRAW obj=X` —— 写在没被读的那一行上等于没写。
+ * 写哪一行：优先真正把对象画出来的 `DRAW obj=X`，其次才是自己带 `draw=true` 的定义行。
+ * 顺序很重要 —— 定义行只要写了 `name=` 就会被匹配到，如果让它抢先，一个没写
+ * `draw=true` 的定义行就会把标签吃掉，而那一行根本不参与渲染。
  *
  * `l` 这个别名只在 `DRAW` 行上收：文档里 `DRAW` 的 `l` 明确是「标签文本」，但在
  * `CREATE PERPENDICULAR_FOOT` / `CREATE REGION` 的定义行上 `l` 是「线」的意思。
  * 所以定义行只认 `label`，否则改标签会把 `l=AB`（一条线）当成标签覆盖掉。
+ *
+ * **兜底**：脚本里找不到任何能承载标签的行时（自动派生的对象，如 `CREATE TANGENT`
+ * 顺带建出的 `T2` / `T2_tan`），改为写入 / 更新一条 `SETLABEL` 指令 ——
+ * 见 `upsertSetLabelLine`。以前这种情况只能返回 null，也就是「改不了」。
  *
  * 返回 null 表示脚本不需要变，调用方不要因此清空日志或重跑脚本。
  */
@@ -277,30 +282,124 @@ export function updateDslObjectLabel(
     const { candidates } = collectCandidateLines(lines, name, options);
     const normalized = value.trim();
 
-    for (const index of candidates) {
-        const target = lines[index];
-        if (isCommentLine(target)) continue;
-        // 能挂标签的只有两种行：对象自己的定义行，或把它画出来的 DRAW 行。
-        // 其它带 obj= 的指令（FILL / MEASURE）不渲染标签，写上去不会生效。
-        const onDrawLine = isDrawLineForObject(target, name);
-        if (!onDrawLine && !isObjectDefinitionLine(target, name)) continue;
-        const aliases = onDrawLine ? LABEL_ALIASES : ['label'];
+    // 能挂标签的只有两种行：把它画出来的 `DRAW obj=X`，或自己就带 `draw=true` 的定义行。
+    // **顺序不能颠倒**：定义行只要有 `name=` 就会被匹配上，如果它排在前面且抢先写，
+    // 而这条定义行又没有 `draw=true`，标签就落到了一条根本不被渲染的行上 ——
+    // 表现为「面板里显示改成功了，画布上却什么都没出现」。
+    // 所以先扫一遍 DRAW 行，没有再退回定义行。
+    const drawLine = candidates.find(
+        index => !isCommentLine(lines[index]) && isDrawLineForObject(lines[index], name),
+    );
+    const definitionLine = candidates.find(
+        index => !isCommentLine(lines[index])
+            && isObjectDefinitionLine(lines[index], name)
+            // 定义行只有在它自己负责绘制时才收标签（`draw=true`）。
+            // `draw` 大小写不敏感（示例脚本里写的就是小写 `draw obj=...`）。
+            && /(?:^|\s)draw\s*=\s*(?:"?true"?|'?true'?)(?=\s|$)/i.test(lines[index]),
+    );
+
+    const targetIndex = drawLine ?? definitionLine;
+
+    if (targetIndex !== undefined) {
+        const target = lines[targetIndex];
+        const aliases = drawLine !== undefined ? LABEL_ALIASES : ['label'];
 
         if (!normalized) {
             const stripped = removeParameter(target, aliases);
             if (stripped === null || stripped === target) return null;
-            lines[index] = stripped;
-            return { script: lines.join('\n'), lineNumber: index + 1 };
+            lines[targetIndex] = stripped;
+            return { script: lines.join('\n'), lineNumber: targetIndex + 1 };
         }
 
         const formatted = formatLabelValue(normalized);
         const next = replaceParameter(target, aliases, formatted)
             ?? appendParameter(target, 'label', formatted);
         if (next === target) return null;
+        lines[targetIndex] = next;
+        return { script: lines.join('\n'), lineNumber: targetIndex + 1 };
+    }
+
+    // 走到这里说明脚本里**没有**任何可以承载这个标签的行 —— 典型是自动派生的对象
+    // （`CREATE TANGENT` 顺带建出的 `T2` / `T2_tan`、自动命名的 `seg_2`），它们在脚本里
+    // 没有独立定义行，也没有把名字写进任何 DRAW。以前这里只能返回 null（= 改不了），
+    // 现在回落到一条 `SETLABEL` 指令。
+    return upsertSetLabelLine(lines, name, value);
+}
+
+// `SETLABEL` 指令名的匹配（大小写不敏感，允许前面有缩进）。
+const SETLABEL_PATTERN = /^\s*SETLABEL\b/i;
+
+/**
+ * 取出 `SETLABEL ... name=<name> ...` 行里已经写着的对象名列表。
+ *
+ * `SETLABEL` 允许一次点名多个对象（`name=A,B`），所以匹配要拆开逐个比，
+ * 不能拿整串相等去判 —— 否则 `name=A,B` 会被当成「没有 A」，于是又追加一条，越改越多。
+ */
+function readSetLabelTargets(line: string): string[] | null {
+    const match = /(?:^|\s)(?:name|n|obj|o)\s*=\s*("[^"]*"|'[^']*'|[^\s]+)/i.exec(line);
+    if (!match) return null;
+    return match[1].replace(/^["']|["']$/g, '').split(',').map(item => item.trim()).filter(Boolean);
+}
+
+/**
+ * 写入 / 更新 / 删除一条 `SETLABEL` 指令。
+ *
+ * 三种情况：
+ *   1. 已有点名了该对象的 `SETLABEL` → 原地改它的 `label=`（对象名保持不动）；
+ *   2. 没有 → 追加一条新的 `SETLABEL name=<name> label=<value>` 到脚本末尾；
+ *   3. 值为空 → 把已有的 `SETLABEL` 里这个名字摘掉（整行只剩这一个名字时删掉整行）。
+ *
+ * 追加在**脚本末尾**而不是定义行附近：`SETLABEL` 是按名定位、运行到最后才生效的，
+ * 放在任何位置结果都一样；放末尾可以保证「不打断用户原有的脚本结构」，
+ * 也让这些自动生成的指令集中在一处便于统一管理。
+ */
+function upsertSetLabelLine(
+    lines: string[],
+    name: string,
+    value: string,
+): DslPropertyUpdate | null {
+    const normalized = value.trim();
+
+    // 从后往前找：如果手写脚本里出现了多条同对象的 SETLABEL，
+    // 后写的那条才是实际生效值，改最后一条才符合直觉。
+    for (let index = lines.length - 1; index >= 0; index--) {
+        const line = lines[index];
+        if (!SETLABEL_PATTERN.test(line) || isCommentLine(line)) continue;
+        const targets = readSetLabelTargets(line);
+        if (!targets || !targets.includes(name)) continue;
+
+        if (normalized === '') {
+            // 只摘掉这一个名字；还有别的名字就保留这行，否则整行删掉。
+            const remaining = targets.filter(target => target !== name);
+            if (remaining.length === 0) {
+                lines.splice(index, 1);
+                return { script: lines.join('\n'), lineNumber: index + 1 };
+            }
+            const rewritten = line.replace(
+                /((?:^|\s)(?:name|n|obj|o)\s*=\s*)("[^"]*"|'[^']*'|[^\s]+)/i,
+                (_all, prefix: string) => `${prefix}${remaining.join(',')}`,
+            );
+            lines[index] = removeParameter(rewritten, LABEL_ALIASES)
+                ?? removeParameter(rewritten, ['label', 'l', 'text', 't'])
+                ?? rewritten;
+            return { script: lines.join('\n'), lineNumber: index + 1 };
+        }
+
+        const formatted = formatLabelValue(normalized);
+        const next = replaceParameter(line, ['label'], formatted)
+            ?? appendParameter(line, 'label', formatted);
+        if (next === line) return null;
         lines[index] = next;
         return { script: lines.join('\n'), lineNumber: index + 1 };
     }
-    return null;
+
+    // 没有任何已有的 SETLABEL 提到这个对象。
+    // 空值 + 没写过 = 本来就没标签，不需要动脚本。
+    if (normalized === '') return null;
+
+    const formatted = formatLabelValue(normalized);
+    lines.push(`SETLABEL name=${name} label=${formatted}`);
+    return { script: lines.join('\n'), lineNumber: lines.length };
 }
 
 // frozen 只存在于 POINT 指令上。限定指令类型有两个作用：

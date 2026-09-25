@@ -88,6 +88,58 @@ let inlinedKatexCss: string | null = null;
 let inlinedKatexCssReady = false;
 let inlinedKatexCssPromise: Promise<void> = Promise.resolve();
 
+/**
+ * KaTeX 字体是否已经在当前文档里「生效」。
+ *
+ * 为什么单独记一个标志：`measureKatex` 是同步的，首次绘制时字体往往还没加载，
+ * 量出来的是**系统回退字体**的宽度（实测同一条公式 113.88 vs 126.89，差 13px）。
+ * 而离屏位图 `doRender` 会 `await inlinedKatexCssPromise`，用的是**真正的 KaTeX 字体**。
+ * 于是「布局预留 113.88、位图画 127」—— 位图比预留盒宽出十几像素，
+ * 右边被后面的内容盖住 / 被裁掉，看起来就是「公式末尾缺一点」。
+ *
+ * 字体就绪后必须让画布**重新测量并重绘**，两边的宽度才对齐。
+ */
+let katexFontsReady = false;
+
+/**
+ * 等 KaTeX 字体真正可用（不只是 CSS 文本内联完成，而是字体文件已被浏览器解析）。
+ *
+ * 用 `document.fonts.load` 显式触发加载并 `await`，比只等 CSS 字符串可靠 ——
+ * 后者只保证 <style> 内容就绪，字体本身仍是懒加载的。
+ */
+export const katexFontsReadyPromise: Promise<void> = (typeof window !== 'undefined' && typeof document !== 'undefined')
+    ? (async () => {
+        try {
+            // 等 CSS（含 base64 字体）内联完成，保证 @font-face 规则已经存在于文档里。
+            await inlinedKatexCssPromise;
+            const fontSet = (document as Document & { fonts?: FontFaceSet }).fonts;
+            if (fontSet && typeof fontSet.load === 'function') {
+                // 注意：这里必须用 **@font-face 注册的 family 名**（KaTeX_Main / KaTeX_Math …），
+                // 而不是字体文件名（KaTeX_Main-Regular / KaTeX_Main-Italic）。
+                // 用文件名去 load 会返回 0 个字体、且永远不 resolve，等于没加载（实测坑）。
+                // 只 load 主字体即可：公式宽高基本由它决定，20 个全 load 既慢又没必要。
+                await Promise.all([
+                    fontSet.load('16px KaTeX_Main'),
+                    fontSet.load('16px KaTeX_Math'),
+                    fontSet.load('16px KaTeX_Size1'),
+                    fontSet.load('16px KaTeX_Size2'),
+                ]);
+            }
+        } catch {
+            // 拿不到字体对象也不阻塞：退化成「首次绘制用回退字体」，用户改一下脚本就会重测。
+        } finally {
+            katexFontsReady = true;
+            // 字体就绪 = 测量基准变了，通知画布重绘一次，让布局预留宽度与位图对齐。
+            for (const fn of listeners) fn();
+        }
+    })()
+    : Promise.resolve();
+
+/** 供画布判断「要不要因为字体就绪而重绘」。 */
+export function isKatexFontsReady(): boolean {
+    return katexFontsReady;
+}
+
 if (typeof window !== 'undefined' && typeof fetch !== 'undefined') {
     inlinedKatexCssPromise = (async () => {
         try {
@@ -206,11 +258,22 @@ export function renderKatexToSvgFragment(
         displayMode,
     });
     const styleBlock = includeCss ? `<style>${getEffectiveKatexCss()}</style>` : '';
+    // `white-space:nowrap` 是必需的，不是可选优化。
+    //
+    // 没有它时，`foreignObject` 里的 KaTeX HTML 会**按空格换行**：KaTeX 在 `=`、`+`
+    // 这类二元运算符两侧留的是可断行的空白，于是 `a = b + c` 会在 `+` 之后折到第二行。
+    // 而 `foreignObject` 的高度只有一行（`Math.ceil(measureKatex().height)`），
+    // 第二行直接被裁掉 —— 表现出来就是「公式末尾缺一截」。
+    //
+    // 实测：`\frac{2}{PC} = \frac{1}{PA} + \frac{1}{PB}` 声明宽 113.9px，
+    // 不加 nowrap 时墨迹只到 95px（丢了 18.9px，正好是末尾那个 `\frac{1}{PB}`），
+    // 加上之后墨迹到 113px（只剩 0.9px 字形侧边距）。
+    // 测量用的隐藏 div 本来就带 `white-space:nowrap`，所以这里是两处保持一致。
     const fragment =
         `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
         `${styleBlock}` +
         `<foreignObject x="0" y="0" width="${width}" height="${height}">` +
-        `<div xmlns="http://www.w3.org/1999/xhtml" style="font-size:${fontSize}px;color:${color};display:inline-block;line-height:1">` +
+        `<div xmlns="http://www.w3.org/1999/xhtml" style="font-size:${fontSize}px;color:${color};display:inline-block;white-space:nowrap;line-height:1">` +
         `${html}` +
         `</div>` +
         `</foreignObject>` +

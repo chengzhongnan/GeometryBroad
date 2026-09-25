@@ -40,7 +40,7 @@ export function isGeometricCommandName(name: string): boolean {
  * （`PRINT` 的别名），却不在名单里。
  */
 export const META_COMMANDS = [
-    'CLEAR', 'SET', 'HELP', 'VIEW', 'DRAW', 'TEXT', 'FILL', 'MEASURE',
+    'CLEAR', 'SET', 'SETLABEL', 'HELP', 'VIEW', 'DRAW', 'TEXT', 'FILL', 'MEASURE',
     'RUN', 'CODE', 'WITH', 'CALCULATE', 'GETOBJ', 'PRINT', 'CREATE',
 ] as const;
 

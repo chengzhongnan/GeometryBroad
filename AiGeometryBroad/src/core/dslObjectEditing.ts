@@ -291,6 +291,13 @@ export interface LinearTrimRewrite {
      * 必须存在，即使本次数组为空也表示新算法路径。
      */
     cutPointNames?: readonly string[];
+    /**
+     * 需要先追加到脚本末尾的指令。
+     *
+     * 鼠标停在无界尾部时会在这里生成一个边界点（`MEASURE` + `POINT_ON_LINE`），
+     * 这些指令必须比「改写原定义行」先落地，否则截取写回时引用的点名还不存在。
+     */
+    preludeCommands?: readonly string[];
 }
 
 /** 把参数值换成新值（跳过引号内的同名片段）。 */
@@ -414,5 +421,14 @@ export function rewriteLinearDefinition(
 
     const rewritten = [...lines];
     rewritten[definitionIndex] = line;
+
+    // 「在鼠标处生成截点」的情形：先把这个新点的指令追加到脚本末尾。
+    // 追加而不是插在原定义行之前，是为了不改动任何已有行号 —— 调用方（和其他
+    // cutPoints 写回路径）都按行号定位，插行会让它们全部错位。
+    // 新点在定义行之后才创建，但脚本是整体重跑、解释器一次执行完，引用不会落空。
+    if (rewrite.preludeCommands && rewrite.preludeCommands.length > 0) {
+        rewritten.push(...rewrite.preludeCommands);
+    }
+
     return rewritten.join('\n');
 }

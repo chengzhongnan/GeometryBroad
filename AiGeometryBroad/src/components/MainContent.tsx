@@ -1,5 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import styled from 'styled-components';
+import { v4 as uuidv4 } from 'uuid';
 
 import TabsPanel from './TabsPanel';
 import AIChatPanel from './AIChatPanel';
@@ -15,6 +16,8 @@ import { INITIAL_USER_INPUT } from './InitScript';
 import type { ObjectPropertyKey, TopLevelCommandInfo, VariableInfo } from '../core/DSLInterpreter';
 import { updateDslObjectCutPoints, updateDslObjectFrozen, updateDslObjectLabel, updateDslObjectProperty, type PropertySyncOptions } from '../core/dslPropertySync';
 import { removeObjectsFromScript, rewriteLinearDefinition, type LinearTrimRewrite } from '../core/dslObjectEditing';
+import { removeTextLineFromScript, rewriteTextCommandLine } from '../core/textObjectEditing';
+import type { CreateTextSpec } from '../core/geometryCommandBuilder';
 import {
     createHistory,
     recordHistory,
@@ -24,10 +27,20 @@ import {
     type ScriptHistoryState,
     type ScriptSnapshot,
 } from '../core/scriptHistory';
+import {
+    findParentFolderId,
+    insertNodeIntoTree,
+    nextSequentialFileName,
+} from '../core/scriptFiles';
 import type { IPoint } from '../core/geometry/base';
 
 const SCRIPT_STORAGE_KEY = 'geo-script-last-code';
 const FILES_STORAGE_KEY = 'geo-script-files';
+
+// 「保存脚本」新建文件时用的前缀与扩展名：保存一次生成一个 `geo_1.geo`、`geo_2.geo`……
+// 编号取当前文件树里尚未使用的下一个整数，保证不会重名。
+const SAVED_FILE_PREFIX = 'geo';
+const SAVED_FILE_EXTENSION = '.geo';
 
 const DEFAULT_FILES: FileNodeData[] = [
     {
@@ -38,31 +51,10 @@ const DEFAULT_FILES: FileNodeData[] = [
             { id: '2', name: 'create_geometry.geo', type: 'file', content: INITIAL_USER_INPUT },
         ],
     },
-    { id: '4', name: 'README.md', type: 'file', content: '# GeometryBroad scripts\\n' },
+    // 注意：这里是**真实的换行符**，不是字符串 "\n"。早先写成 '# GeometryBroad scripts\\n'
+    // 会在编辑器里原样显示成一个反斜杠加 n，看着像乱码。
+    { id: '4', name: 'README.md', type: 'file', content: '# GeometryBroad scripts\n' },
 ];
-
-function updateFileContent(nodes: FileNodeData[], fileId: string, content: string): FileNodeData[] {
-    return nodes.map(node => {
-        if (node.id === fileId && node.type === 'file') {
-            return { ...node, content };
-        }
-        if (node.children) {
-            return { ...node, children: updateFileContent(node.children, fileId, content) };
-        }
-        return node;
-    });
-}
-
-function findFile(nodes: FileNodeData[], fileId: string): FileNodeData | null {
-    for (const node of nodes) {
-        if (node.id === fileId && node.type === 'file') return node;
-        if (node.children) {
-            const match = findFile(node.children, fileId);
-            if (match) return match;
-        }
-    }
-    return null;
-}
 
 function MainContent() {
 
@@ -202,17 +194,34 @@ function MainContent() {
         setHistory(createHistory());
     }, []);
 
+    // 「保存脚本」= 另存为一份**新文件**：在文件树里按 `geo_<数字>` 命名建一个 .geo，
+    // 内容就是当前脚本，并把它设为活动文件。
+    //
+    // 为什么不是「覆盖当前文件」：当前脚本往往是 AI 生成 / 临时试验的内容，
+    // 直接盖掉已有文件容易误伤。另存一份新文件更安全，也符合截图里
+    // 「Save Script → 左侧文件树多出一个脚本」的预期。
+    // 新文件放进**当前活动文件所在的文件夹**（没有就放根层），并自动选中它。
     const handleSaveScript = useCallback(() => {
         localStorage.setItem(SCRIPT_STORAGE_KEY, script);
-        if (activeFileId) {
-            const nextFiles = updateFileContent(files, activeFileId, script);
-            setFiles(nextFiles);
-            localStorage.setItem(FILES_STORAGE_KEY, JSON.stringify(nextFiles));
-            const activeFile = findFile(nextFiles, activeFileId);
-            setSaveStatus(activeFile ? `Saved ${activeFile.name}` : 'Saved script');
-        } else {
-            setSaveStatus('Saved last script');
-        }
+
+        const newFileName = nextSequentialFileName(files, SAVED_FILE_PREFIX, SAVED_FILE_EXTENSION);
+        const parentFolderId = activeFileId ? findParentFolderId(files, activeFileId) : null;
+        const newNode: FileNodeData = {
+            id: uuidv4(),
+            name: newFileName,
+            type: 'file',
+            content: script,
+        };
+
+        const nextFiles = insertNodeIntoTree(files, parentFolderId, newNode);
+        setFiles(nextFiles);
+        localStorage.setItem(FILES_STORAGE_KEY, JSON.stringify(nextFiles));
+
+        // 保存后切到新文件：用户刚存完就能继续在它上面编辑，也便于确认存到哪了。
+        setActiveFileId(newNode.id);
+        setSaveStatus(`Saved ${newFileName}`);
+        // 换了一份文档，历史清空 —— 否则在新文件里 Ctrl+Z 会倒灌上一个文件的内容。
+        setHistory(createHistory());
     }, [activeFileId, files, script]);
 
     const handleFilesChange = useCallback((nextFiles: FileNodeData[]) => {
@@ -344,6 +353,28 @@ function MainContent() {
         commitScriptUpdate(base => removeObjectsFromScript(base, commands, names)?.script ?? null);
     }, [commitScriptUpdate]);
 
+    // 编辑/删除一段画布文字（TEXT）。
+    //
+    // TEXT 没有 `name=`，通用删除路径按名字找不到它，所以单独按**行号**定位。
+    // 行号由画布在右键那一刻从解释器取好传上来（解释器里有唯一的真值），
+    // 这里只负责落地改写，不再自己解析一遍脚本。
+    const handleTextLineChange = useCallback((lineNumber: number, spec: CreateTextSpec) => {
+        commitScriptUpdate(base => {
+            const lines = base.split('\n');
+            const index = lineNumber - 1;
+            if (index < 0 || index >= lines.length) return null;
+            const rewritten = rewriteTextCommandLine(lines[index], spec);
+            if (rewritten === null) return null;
+            const next = [...lines];
+            next[index] = rewritten;
+            return next.join('\n');
+        });
+    }, [commitScriptUpdate]);
+
+    const handleDeleteText = useCallback((lineNumber: number) => {
+        commitScriptUpdate(base => removeTextLineFromScript(base, lineNumber));
+    }, [commitScriptUpdate]);
+
     // 截止点属性：整串值写回 `cutPoints=`。空串表示清空（把参数整个删掉，恢复完整直线/射线）。
     // 它是一串点名而不是数值，所以不走 handleObjectPropertyChange。
     const handleCutPointsChange = useCallback((name: string, value: string, lineNumber?: number) => {
@@ -384,6 +415,10 @@ function MainContent() {
 
     // 把直线/射线/线段裁掉某一侧。新的实现会把「截止点数组」写回原对象定义，
     // 由原对象绘制时跳过对应区间，不再覆盖原线，也不再创建背景色遮罩。
+    //
+    // 鼠标停在无界尾部时，planner 会额外给一条 preludeCommands（`MEASURE` + `POINT_ON_LINE`），
+    // 但那是**上一个 revision** 的脚本里还不存在的点。它和截止点写回必须落在
+    // 同一个 string 里一次性提交：先追加指令、再改定义行，这样脚本一重跑全都成立。
     const handleLinearTrim = useCallback((
         rewrite: LinearTrimRewrite,
         commands: ReadonlyArray<TopLevelCommandInfo>,
@@ -479,6 +514,8 @@ function MainContent() {
                             onLabelChange={handleLabelChange}
                             onGeometryCommands={handleGeometryCommands}
                             onDeleteObjects={handleDeleteObjects}
+                            onTextLineChange={handleTextLineChange}
+                            onDeleteText={handleDeleteText}
                             onLinearTrim={handleLinearTrim}
                             cutPointPick={cutPointPick}
                             onCutPointPicked={handleCutPointPicked}

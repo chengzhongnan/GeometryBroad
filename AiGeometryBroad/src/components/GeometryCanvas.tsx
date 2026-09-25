@@ -19,6 +19,7 @@ import {
 } from '../core/viewTransform';
 import GeometryPickDialog from './GeometryPickDialog';
 import LabelEditDialog from './LabelEditDialog';
+import TextCreateDialog from './TextCreateDialog';
 import {
     buildCreateShapeCommands,
     buildPickOperationCommands,
@@ -37,6 +38,7 @@ import {
     type CommandBuildContext,
     type CreateShapeCatalogEntry,
     type CreateShapeKind,
+    type CreateTextSpec,
     type LinearPiece,
     type ObjectRef,
     type PickOperation,
@@ -45,6 +47,7 @@ import {
     type SelectionOperation,
     type CircleOperation,
 } from '../core/geometryCommandBuilder';
+import { parseTextCommandLine, rewriteTextCommandLine } from '../core/textObjectEditing';
 
 // 命中测试的像素容差。hover 光标提示、左键拖动、滚轮缩放守卫全部共用这一个值，
 // 避免同一个「算不算命中」的判断散落成几个字面量后逐渐走偏。
@@ -75,6 +78,13 @@ interface ContextMenuItem {
     trimMode?: boolean;
     /** 打开「修改标签」对话框。 */
     editLabel?: boolean;
+    /**
+     * 打开「编辑文字」对话框（TEXT 专用）。
+     * 带行号是因为 TEXT 没有 `name=`，通用删除/改写路径按名字找不到它。
+     */
+    editText?: { lineNumber: number };
+    /** 删掉这一条 TEXT 指令（按行号）。 */
+    deleteTextLine?: number;
     /**
      * 空选右键时「在此处创建」的图形。点下去才用右键那一刻的逻辑坐标去生成指令 ——
      * 菜单项本身不预生成指令：十个图形各生成一遍，绝大多数是白算的。
@@ -156,6 +166,18 @@ interface TrimSession {
     p2: Point2D;
 }
 
+/**
+ * 鼠标压在线上时解析出来的结果。
+ *
+ * `index` 只用来画高亮；`t` / `point` 是同一份投影结果，交给删除逻辑按
+ * 「离鼠标最近的已知点」重算真正要删的那一段（无界尾部会用到 `point` 生成边界点）。
+ */
+interface TrimHover {
+    index: number;
+    t: number;
+    point: Point2D;
+}
+
 interface GeometryCanvasProps {
     width: number;
     height: number;
@@ -181,6 +203,13 @@ interface GeometryCanvasProps {
      * 只有它知道哪一行定义了谁、哪一行引用了谁，而上层拿不到解释器实例。
      */
     onDeleteObjects: (names: string[], commands: ReadonlyArray<TopLevelCommandInfo>) => void;
+    /**
+     * 改写一条 TEXT 指令行（编辑文字）。TEXT 没有 `name=`，只能按行号定位，
+     * 所以行号由画布在右键那一刻从解释器取好一起传上去。
+     */
+    onTextLineChange: (lineNumber: number, spec: CreateTextSpec) => void;
+    /** 删除一条 TEXT 指令行。同上，按行号定位。 */
+    onDeleteText: (lineNumber: number) => void;
     /** 把线性对象的某一段加入 `cutPoints`，由原对象自行停止/跳过绘制。 */
     onLinearTrim: (rewrite: LinearTrimRewrite, commands: ReadonlyArray<TopLevelCommandInfo>) => void;
     /**
@@ -199,7 +228,7 @@ export interface CutPointPickRequest {
     sign: '+' | '-';
 }
 
-const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, revision, onGeometryMessage, onClearMessage, frozenRandomVariables, frozenRandomObjects, selectedObjectNames, selectedLabelId, labelPositions, onSelectObject, onSelectLabel, onLabelPositionChange, onObjectPropertyChange, onLabelChange, onGeometryCommands, onDeleteObjects, onLinearTrim, cutPointPick, onCutPointPicked, onCancelCutPointPick, onVariablesChange }) => {
+const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, revision, onGeometryMessage, onClearMessage, frozenRandomVariables, frozenRandomObjects, selectedObjectNames, selectedLabelId, labelPositions, onSelectObject, onSelectLabel, onLabelPositionChange, onObjectPropertyChange, onLabelChange, onGeometryCommands, onDeleteObjects, onTextLineChange, onDeleteText, onLinearTrim, cutPointPick, onCutPointPicked, onCancelCutPointPick, onVariablesChange }) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const interpreterRef = useRef<GeometryDSLInterpreter | null>(null);
 
@@ -237,7 +266,7 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
     const trimSessionRef = useRef<TrimSession | null>(null);
     const trimHoverRef = useRef<number | null>(null);
     const exitTrimModeRef = useRef<() => void>(() => {});
-    const commitTrimPieceRef = useRef<(pieceIndex: number) => void>(() => {});
+    const commitTrimPieceRef = useRef<(tMouse: number, mousePoint: Point2D) => void>(() => {});
     // 「挑截止点」的会话。和截取模式同一套做法：ref 给事件处理函数读最新值，
     // state 只负责驱动提示条重渲染。
     const cutPointPickRef = useRef<CutPointPickRequest | null>(null);
@@ -277,6 +306,18 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
     // 「修改标签」对话框。内容和目标行号都在右键那一刻从解释器取好 ——
     // 对话框本身不持有解释器，也就不可能在脚本重跑后拿着过期的行号去写。
     const [labelDialog, setLabelDialog] = useState<LabelDialogState | null>(null);
+    // 「插入文字 / 编辑文字」对话框。右键处坐标在点菜单那一刻记下来 —— 对话框里的预览和
+    // 最终生成的 TEXT 指令都以此为准，不可能被期间画布的缩放/平移带跑偏。
+    //
+    // `editLine` 非空表示这是**编辑**已有文字：提交时改写那一行而不是追加新指令。
+    // 行号同样在右键那一刻定格，避免脚本在对话框打开期间被改后写错行。
+    const [textDialog, setTextDialog] = useState<{
+        anchor: Point2D;
+        value: CreateTextSpec;
+        editLine?: number;
+        /** 编辑模式下用于生成预览指令的「原行文本」（只读，提交时被新值覆盖）。 */
+        sourceLine?: string;
+    } | null>(null);
     // KaTeX 异步缓存命中后会通过订阅通知这里，每次通知都让 redraw 重新执行
     // 一次脚本，把缓存好的 LaTeX 离屏 canvas 贴回主画布。
     const [katexTick, setKatexTick] = useState(0);
@@ -532,7 +573,8 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
             // 截取模式：光标压在哪一段就高亮哪一段，不拖动也不做选择高亮。
             if (trimSessionRef.current) {
                 const point = getCanvasPoint(e);
-                const hoverIndex = resolveTrimHover(point.x, point.y);
+                const hover = resolveTrimHover(point.x, point.y);
+                const hoverIndex = hover?.index ?? null;
                 if (hoverIndex !== trimHoverRef.current) {
                     trimHoverRef.current = hoverIndex;
                     setTrimHover(hoverIndex);
@@ -656,8 +698,13 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
          *
          * 先要求光标离这条线足够近（借用同一个 12px 容差，换算成逻辑单位），
          * 否则鼠标在画布任何位置都会高亮某一段，看着像失灵。
+         *
+         * 除了段号，这里还把鼠标投影到线上的参数 `t` 和投影点一起返回 ——
+         * 高亮按 `t` 落在哪段来定，但真正删哪一段由 `planLinearPieceRemoval`
+         * 按「离鼠标最近的已知点」重算，两者必须是同一份投影结果，
+         * 否则会出现「高亮这段、删的是另一段」。
          */
-        const resolveTrimHover = (canvasX: number, canvasY: number): number | null => {
+        const resolveTrimHover = (canvasX: number, canvasY: number): TrimHover | null => {
             const session = trimSessionRef.current;
             const interpreter = interpreterRef.current;
             if (!session || !interpreter) return null;
@@ -681,11 +728,14 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
             const t = projectOntoLinear(logical, p1, p2, 'line');
             if (t === null) return null;
 
+            // 投影点（逻辑坐标）—— 生成边界点时要拿它反过来算参数，也用不到端点钳制。
+            const projected = { x: p1.x + t * dx, y: p1.y + t * dy };
+
             for (let i = 0; i < session.pieces.length; i++) {
                 const piece = session.pieces[i];
                 const lo = piece.startT ?? -Infinity;
                 const hi = piece.endT ?? Infinity;
-                if (t >= lo && t <= hi) return i;
+                if (t >= lo && t <= hi) return { index: i, t, point: projected };
             }
             return null;
         };
@@ -733,8 +783,8 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
             // 截取模式：左键点中哪一段就删掉哪一段，然后退出。
             if (trimSessionRef.current) {
                 const point = getCanvasPoint(e);
-                const hoverIndex = resolveTrimHover(point.x, point.y);
-                if (hoverIndex !== null) commitTrimPieceRef.current(hoverIndex);
+                const hover = resolveTrimHover(point.x, point.y);
+                if (hover) commitTrimPieceRef.current(hover.t, hover.point);
                 return;
             }
             if (isLockedRef.current || !interpreterRef.current) return;
@@ -873,8 +923,11 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
                 }
 
                 // 改标签：名字是给引用用的标识符（自动生成的还是 `perp1` 这种），
-                // 想让它出现在图上就显式设一个标签。没被画出来的对象没有可挂的指令，
-                // 这时置灰并把原因写在悬停提示里，而不是给个点了没反应的菜单项。
+                // 想让它出现在图上就显式设一个标签。
+                //
+                // 解释器现在对**所有**已注册对象都返回一条记录（editable 恒为 true）：
+                // 有可挂的 `label=` 就改那一行，没有的地方（`CREATE TANGENT` 顺带建出的
+                // `T2` / `T2_tan` 之类）就用 SETLABEL 指令兜底。所以这里不再需要置灰。
                 const labelProperty = interpreterRef.current?.getEditableLabel(anchor.name);
                 if (labelProperty) {
                     items.push({
@@ -886,6 +939,36 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
                         editLabel: true,
                         disabled: !labelProperty.editable,
                     });
+                }
+
+                // 选中一段文字：编辑内容与样式 / 删除。
+                //
+                // 单独开一条分支而不是走通用的「改标签 + 删除」，原因是 TEXT 在两个
+                // 通用路径里都不可见：它没有 `name=`，所以既挂不上 `label=`（改标签无从谈起），
+                // 也进不了 `definedNamesOf`（通用删除找不到要删的定义行）。
+                // 唯一可靠的定位是**行号**，由解释器给出。
+                if (anchor.type === 'text') {
+                    const textInfo = interpreterRef.current?.getEditableText(anchor.name);
+                    if (textInfo) {
+                        items.push({
+                            id: 'editText',
+                            label: '编辑文字…',
+                            title: textInfo.editable
+                                ? '修改内容与样式，保存后写回脚本里这条 TEXT 指令'
+                                : textInfo.reason,
+                            editText: { lineNumber: textInfo.lineNumber },
+                            disabled: !textInfo.editable,
+                        });
+                        // 删除放在这里而不是沿用页面底部的通用「删除」：通用那条对 TEXT
+                        // 必然置灰，留着会让用户以为「文字删不掉」。
+                        items.push({
+                            id: 'deleteText',
+                            label: '删除文字',
+                            title: '删除脚本里这条 TEXT 指令',
+                            deleteTextLine: textInfo.lineNumber,
+                            disabled: !textInfo.editable,
+                        });
+                    }
                 }
 
                 // 选中一个圆：圆周最近点 / 圆心 / 切线 / 法线。都即时生成，不需要对话框。
@@ -905,15 +988,55 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
                             disabled: Boolean(plan.blocked),
                         });
                     }
+                    // 上面那条切线的切点是「鼠标最近处」，这里再给一个显式挑点的入口：
+                    // 圆外一个已经画好的点 → 过它作切线。需要先弹对话框点选那个点。
+                    items.push({
+                        id: 'tangentToCircle',
+                        label: '过某个已有点作切线…',
+                        title: `点击一个已画出的点，过它作 ${anchor.name} 的切线并标出切点`,
+                        pickOperation: 'tangentToCircle',
+                    });
                 }
             } else if (objects.length === 2) {
                 const [first, second] = objects;
+                const circleRef = objects.find(item => item.type === 'circle');
+                const pointRef = objects.find(item => isPointType(item.type));
+                const lineRef = objects.find(item => isLinearType(item.type));
+
                 if (isPointType(first.type) && isPointType(second.type)) {
                     items.push(
                         { id: 'segment', label: '连接线段', selectionOperation: 'segment' },
                         { id: 'line', label: '连接直线', selectionOperation: 'line' },
                         { id: 'perpBisector', label: '作垂直平分线', selectionOperation: 'perpBisector' },
                     );
+                } else if (pointRef && circleRef) {
+                    // 一个点 + 一个圆：过该点作圆的切线（并标出切点）。
+                    // 点在圆内时做不出来，置灰并说明原因。
+                    const plan = planSelectionOperation('pointCircleTangent', objects, buildContext());
+                    const count = plan.newPointCount ?? 0;
+                    items.push({
+                        id: 'pointCircleTangent',
+                        label: count === 1
+                            ? '过该点作圆的切线（切点在该点上）'
+                            : '过该点作圆的切线（作两条，标出切点）',
+                        title: plan.blocked ?? '过这个点作圆的切线；点在圆外会作出两条切线并标出两个切点',
+                        selectionOperation: 'pointCircleTangent',
+                        disabled: Boolean(plan.blocked),
+                    });
+                } else if (lineRef && circleRef) {
+                    // 一条线 + 一个圆：求交点。最多两个；已有的交点不再重复建。
+                    const plan = planSelectionOperation('lineCircleIntersect', objects, buildContext());
+                    const count = plan.newPointCount ?? 0;
+                    const defaultHint = count === 1
+                        ? '线与圆有两个交点，但其中一个已经存在，只创建缺少的那个点'
+                        : '创建这条线与圆的全部交点';
+                    items.push({
+                        id: 'lineCircleIntersect',
+                        label: count === 1 ? '求线与圆的交点（补建 1 个点）' : '求线与圆的交点',
+                        title: plan.blocked ?? defaultHint,
+                        selectionOperation: 'lineCircleIntersect',
+                        disabled: Boolean(plan.blocked),
+                    });
                 } else if (
                     (isPointType(first.type) && isLinearType(second.type))
                     || (isLinearType(first.type) && isPointType(second.type))
@@ -975,19 +1098,27 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
                 }
             }
 
-            // 删除：任何对象都能删，所以放在最后。
+            // 删除：任何几何对象都能删，所以放在最后。
             // 依赖者会被连带删掉（删掉 A 之后 `p1=A` 的定义就全废了），
             // 数量直接写在菜单上，别让用户点下去才发现删多了。
-            if (objects.length > 0) {
-                const deletion = planObjectDeletion(commands, objectNames);
-                const dependents = deletion.names.length - objectNames.length;
+            //
+            // TEXT 除外：它没有 `name=`，`planObjectDeletion` 必然返回「找不到创建指令」，
+            // 列出来只会是一个永远置灰的「删除（不可用）」。文字的删除已经在上面的
+            // 单对象分支里给了专用入口。
+            if (objects.length > 0 && objects.some(item => item.type !== 'text')) {
+                const deletableNames = objectNames.filter(name => {
+                    const ref = objects.find(item => item.name === name);
+                    return ref?.type !== 'text';
+                });
+                const deletion = planObjectDeletion(commands, deletableNames);
+                const dependents = deletion.names.length - deletableNames.length;
                 const label = deletion.blocked
                     ? '删除（不可用）'
                     : dependents > 0
-                        ? `删除 ${objectNames.length} 个对象（含 ${dependents} 个依赖对象）`
+                        ? `删除 ${deletableNames.length} 个对象（含 ${dependents} 个依赖对象）`
                         : objects.length === 1
                             ? `删除 ${objects[0].name}`
-                            : `删除 ${objects.length} 个对象`;
+                            : `删除 ${deletableNames.length} 个对象`;
                 items.push({
                     id: 'delete',
                     label,
@@ -1127,9 +1258,86 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
     // 生成指令后走和别的作图完全相同的通道（追加到脚本末尾并重跑），不另开写回路径。
     const handleCreateShape = useCallback((kind: CreateShapeKind, anchor: Point2D | null, size?: number) => {
         if (!anchor) return;
+        // 文字不直接作图：内容、字号、颜色都得先问用户。这里只负责把对话框打开，
+        // 真正生成指令要等用户在对话框里按了「插入」（见 handleSubmitText）。
+        if (kind === 'text') {
+            setTextDialog({
+                anchor,
+                value: {
+                    content: '',
+                    fontSize: 16,
+                    color: '#1f2937',
+                    fontFamily: 'Arial',
+                    italic: false,
+                    bold: false,
+                    backgroundColor: '',
+                    padding: 4,
+                },
+            });
+            return;
+        }
         const commands = buildCreateShapeCommands({ kind, anchor, size: size ?? 1 }, buildContext());
         if (commands.length > 0) onGeometryCommands(commands);
     }, [buildContext, onGeometryCommands]);
+
+    // 文字对话框里「将插入的指令」预览与最终插入走的是**同一次计算**，
+    // 不会出现「预览显示 A、确定后插入 B」这种对不上的情况。
+    //
+    // 编辑模式下预览的是「这一行将变成什么」：拿原行文本套同一个改写函数，
+    // 和提交时落地的完全一致。不能用 `buildCreateShapeCommands` —— 那会按
+    // 当前画布变换重新算坐标，得到一条 x/y 都变了的「新指令」，预览就骗人了。
+    const textDialogCommand = useMemo(() => {
+        if (!textDialog) return '';
+        if (textDialog.editLine !== undefined && textDialog.sourceLine !== undefined) {
+            return rewriteTextCommandLine(textDialog.sourceLine, textDialog.value) ?? '';
+        }
+        const commands = buildCreateShapeCommands({
+            kind: 'text',
+            anchor: textDialog.anchor,
+            size: 1,
+            text: textDialog.value,
+        }, buildContext());
+        return commands[0] ?? '';
+    }, [textDialog, buildContext]);
+
+    const handleSubmitText = useCallback((value: CreateTextSpec) => {
+        if (!textDialog) return;
+        // 编辑：原地改写那一行，不追加新指令、也不动它的坐标。
+        if (textDialog.editLine !== undefined) {
+            const line = textDialog.editLine;
+            setTextDialog(null);
+            onTextLineChange(line, value);
+            return;
+        }
+        const commands = buildCreateShapeCommands({
+            kind: 'text',
+            anchor: textDialog.anchor,
+            size: 1,
+            text: value,
+        }, buildContext());
+        setTextDialog(null);
+        if (commands.length > 0) onGeometryCommands(commands);
+    }, [textDialog, buildContext, onGeometryCommands, onTextLineChange]);
+
+    // 打开「编辑文字」对话框：内容与样式从**脚本原行**解析回来，而不是从解释器里
+    // 那份已经求值过的 text（槽位 `{len}` 会被替换成数字，再存回去就把表达式弄丢了）。
+    const handleOpenTextDialog = useCallback((name: string) => {
+        const interpreter = interpreterRef.current;
+        if (!interpreter) return;
+        const info = interpreter.getEditableText(name);
+        if (!info) return;
+        // 先看当前生效脚本（可能是用户正在编辑的那份），再看生成脚本。
+        const lineText = script.split('\n')[info.lineNumber - 1];
+        const spec = lineText ? parseTextCommandLine(lineText) : null;
+        if (!spec) return;
+        const position = interpreter.getEditableElementPosition(name);
+        setTextDialog({
+            anchor: position ? { x: position.x, y: position.y } : { x: 0, y: 0 },
+            value: spec,
+            editLine: info.lineNumber,
+            sourceLine: lineText,
+        });
+    }, [script]);
 
     // 对话框里的命中测试直接借用解释器：副本与主画布的像素尺寸、视图变换完全一致，
     // 所以同一个画布像素坐标在两边指向同一个对象，不必再维护第二套几何。
@@ -1226,16 +1434,21 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
         redrawRef.current();
     }, []);
 
-    // 删掉选中的那一段。分段和计划都是纯函数，输入没变结果就一致，
-    // 不会出现「预览说删这段、点下去删的是另一段」。
-    const commitTrimPiece = useCallback((pieceIndex: number) => {
+    // 删掉鼠标所在的那一段。真正删哪一段由 planner 按「离鼠标最近的已知点」重算，
+    // 这里只把鼠标在线上投影的位置（参数 t + 投影点）交下去。
+    //
+    // 鼠标落在无界尾部时 planner 会返回 preludeCommands（现场造一个边界点）：
+    // 那些指令要先追加进脚本、并和 cutPoints 一起写回，所以走 onLinearTrim 的
+    // 一次性入口，由上层把两件事合到同一次脚本更新里。
+    const commitTrimPiece = useCallback((tMouse: number, mousePoint: Point2D) => {
         const session = trimSessionRef.current;
         const interpreter = interpreterRef.current;
         if (!session || !interpreter) return;
         const outcome = planLinearPieceRemoval({
             anchorName: session.anchorName,
             anchorType: session.anchorType,
-            pieceIndex,
+            tMouse,
+            mousePoint,
         }, buildContext());
         exitTrimMode();
         if (!outcome.plan) return;
@@ -1243,6 +1456,7 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
             name: session.anchorName,
             results: outcome.plan.results,
             cutPointNames: outcome.plan.cutPointNames,
+            preludeCommands: outcome.plan.preludeCommands,
         }, interpreter.getTopLevelCommands());
     }, [buildContext, exitTrimMode, onLinearTrim]);
 
@@ -1329,6 +1543,10 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
                         handleCircleOperation(item.circleOperation, menu.objects[0], menu.anchorPoint ?? null);
                     } else if (item.deleteObjects) {
                         handleDeleteObjects(item.deleteObjects);
+                    } else if (item.editText) {
+                        handleOpenTextDialog(menu.objects[0].name);
+                    } else if (item.deleteTextLine !== undefined) {
+                        onDeleteText(item.deleteTextLine);
                     } else if (item.trimMode) {
                         handleStartTrim(menu.objects[0]);
                     } else if (item.editLabel) {
@@ -1444,6 +1662,16 @@ const GeometryCanvas: React.FC<GeometryCanvasProps> = ({ width, height, script, 
                         setLabelDialog(null);
                         onLabelChange(target.name, value, target.lineNumber);
                     }}
+                />
+            )}
+            {textDialog && (
+                <TextCreateDialog
+                    anchor={textDialog.anchor}
+                    command={textDialogCommand}
+                    initialValue={textDialog.value}
+                    mode={textDialog.editLine !== undefined ? 'edit' : 'create'}
+                    onCancel={() => setTextDialog(null)}
+                    onSubmit={handleSubmitText}
                 />
             )}
         </CanvasContainer>

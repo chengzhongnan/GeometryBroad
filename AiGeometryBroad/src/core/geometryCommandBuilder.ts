@@ -23,6 +23,8 @@ export type SelectionOperation =
     | 'perpendicular'
     | 'intersect'
     | 'circleIntersect'
+    | 'lineCircleIntersect'
+    | 'pointCircleTangent'
     | 'triangle'
     | 'circumcircle'
     | 'incircle'
@@ -37,6 +39,12 @@ export const TWO_LINEAR_OPERATIONS: readonly SelectionOperation[] = ['angleBisec
 
 /** 需要两个圆的操作。 */
 export const TWO_CIRCLE_OPERATIONS: readonly SelectionOperation[] = ['circleIntersect'];
+
+/** 需要一个点 + 一个圆的操作（过点作切线）。 */
+export const POINT_CIRCLE_OPERATIONS: readonly SelectionOperation[] = ['pointCircleTangent'];
+
+/** 需要一条线 + 一个圆的操作（求交点）。 */
+export const LINE_CIRCLE_OPERATIONS: readonly SelectionOperation[] = ['lineCircleIntersect'];
 
 /**
  * 选中一个圆时，右键菜单能做的操作。
@@ -63,11 +71,12 @@ export const CIRCLE_OPERATIONS: readonly CircleOperation[] = ['pointOnCircle', '
  * 点操作（前四项）与线操作（后五项）共用同一套对话框。
  */
 export type PickOperation =
-    // —— 点：在对话框里再点一个点或一条直线
+    // —— 点：在对话框里再点一个点或一条直线或一个圆
     | 'connect'
     | 'parallel'
     | 'perpendicular'
     | 'reflectPoint'
+    | 'tangentToCircle'
     // —— 线：多数只需要填参数，不需要再点选
     | 'pointOnLine'
     | 'divide'
@@ -77,7 +86,7 @@ export type PickOperation =
     | 'cutSegment';
 
 /** 对话框里允许用户点选的目标类型；null 表示这个操作不需要点选。 */
-export type PickKind = 'point' | 'linear';
+export type PickKind = 'point' | 'linear' | 'circle';
 
 export interface Point2D {
     x: number;
@@ -290,6 +299,20 @@ function formatNumber(value: number): string {
     return String(Number(value.toFixed(6)));
 }
 
+/**
+ * 把用户输入的文字转义成能安全放进 `text="..."` 的形式。
+ *
+ * 换行必须是**字面量** `\n`（两个字符），不能真的把换行写进脚本 —— TEXT 是按行解析的，
+ * 一个真实换行会把这条指令拦腰截断，后半截变成一条谁也看不懂的指令。
+ * 反斜杠要先转义，否则内容里的 `\n` 会被二次解释；引号不转义的话也就没法表达。
+ */
+function escapeTextContent(content: string): string {
+    return content
+        .replace(/\\/g, '\\\\')
+        .replace(/"/g, '\\"')
+        .replace(/\r\n|\r|\n/g, '\\n');
+}
+
 function optionNumber(values: OptionValues, key: string, fallback: number): number {
     const raw = values[key];
     const num = typeof raw === 'number' ? raw : parseFloat(String(raw ?? ''));
@@ -314,6 +337,7 @@ export const PICK_OPERATION_LABELS: Record<PickOperation, string> = {
     parallel: '过该点作平行线…',
     perpendicular: '过该点作垂线…',
     reflectPoint: '关于直线作对称点…',
+    tangentToCircle: '过该点作圆的切线…',
     pointOnLine: '在线上取点…',
     divide: '取 N 等分点…',
     extend: '延长…',
@@ -325,13 +349,17 @@ export const PICK_OPERATION_LABELS: Record<PickOperation, string> = {
 // 不同主体类型能做什么。放在这里而不是散在菜单代码里，
 // 以后加操作只要改这张表 + 描述符。
 const PICK_OPERATIONS_BY_TYPE: Record<string, PickOperation[]> = {
-    point: ['connect', 'parallel', 'perpendicular', 'reflectPoint'],
+    // 「过该点作圆的切线」放最前：右键一个点时它是最常见的诉求之一，
+    // 也是唯一一个需要再点选「圆」这个第三类目标的操作。
+    point: ['tangentToCircle', 'connect', 'parallel', 'perpendicular', 'reflectPoint'],
     // 等分 / 延长 / 截取都要求对象有确定的「两个定义点」，线段和射线都满足。
     // 「在线上取点」排在最前：它是线上最基础的操作，其余都是在它的基础上派生的。
     segment: ['pointOnLine', 'divide', 'extend', 'cutSegment', 'perpBisector', 'intersect'],
     ray: ['pointOnLine', 'divide', 'extend', 'cutSegment', 'perpBisector', 'intersect'],
     // 直线是无限长的，「等分」「延长」「截取」都没有意义，只留取点、中垂线与求交点。
     line: ['pointOnLine', 'perpBisector', 'intersect'],
+    // 圆：过某点作圆的切线（切点 + 切线）。点和圆一起选中时也有同样的菜单。
+    circle: ['tangentToCircle'],
 };
 
 /** 某个类型的主体支持哪些需要对话框的操作。 */
@@ -429,6 +457,20 @@ export function describePickOperation(
                     },
                 ],
                 defaults: { includeFoot: true },
+            };
+        case 'tangentToCircle':
+            return {
+                title: '过该点作圆的切线',
+                hint: `点击一个圆，过 ${anchorName} 作它的切线（圆外会作出两条并标出两个切点）`,
+                pick: 'circle',
+                fields: [
+                    {
+                        kind: 'checkbox',
+                        key: 'showTangentPoints',
+                        label: '画出切点',
+                    },
+                ],
+                defaults: { showTangentPoints: true },
             };
         case 'pointOnLine':
             return {
@@ -694,6 +736,14 @@ export interface LinearPieceTrimPlan {
     results: LinearTrimResult[];
     /** 写入原定义行的截止点数组，带方向前缀：`+A` 砍正方向一侧，`-A` 砍负方向一侧。 */
     cutPointNames?: string[];
+    /**
+     * 需要在删除**之前**追加到脚本的指令。
+     *
+     * 鼠标停在无界尾部（`−∞ → A` / `A → +∞`）时，这一段的边界点根本不存在，
+     * 只能按鼠标投影位置现场造一个点当边界 —— 这一条就是那条 `MEASURE` + `POINT_ON_LINE`。
+     * 生成的点沿用「在线上取点」的槽位表达式写法，所以拖动原线端点后它依旧贴在线上同一相对位置。
+     */
+    preludeCommands?: string[];
 }
 
 export interface LinearPieceTrimOutcome {
@@ -715,37 +765,135 @@ export interface LinearPieceTrimOutcome {
  * 也不需要交换定义点（派生线的定义点本来就交换不了）。
  *
  * 脚本因此只需修改原定义行，不创建替代对象、遮罩对象或额外 DRAW。
+ *
+ * ---
+ *
+ * `pieceIndex` 是给「点菜单里第 n 段」这种确定位置用的。鼠标交互走的是
+ * `tMouse`：只交出鼠标在线上投影的参数位置，由这里**按绝对值最近**找界的那个已知点，
+ * 再删掉鼠标所在的相邻两点之间那一段。
+ *
+ * 为什么必须按鼠标重新算而不是用界面高亮的 index：
+ * 界面上的分段按「定义点」划分，鼠标常离某个界点很近却落在相邻段里，
+ * 直接按 index 删会多砍一截。按 `tMouse` 就近吸附才符合「删除不要过长」的直觉。
+ *
+ * 鼠标落在无界尾部时（`−∞ → A` 或 `A → +∞`），这一段的远端界点不存在，
+ * 就在鼠标投影处现场造一个点当边界（`preludeCommands`），返回的名字由调用方一起写进 cutPoints。
  */
 export function planLinearPieceRemoval(
-    spec: { anchorName: string; anchorType: string; pieceIndex: number },
+    spec: { anchorName: string; anchorType: string; pieceIndex?: number; tMouse?: number; mousePoint?: Point2D },
     context: CommandBuildContext,
 ): LinearPieceTrimOutcome {
-    const { anchorName, anchorType, pieceIndex } = spec;
+    const { anchorName, anchorType } = spec;
     const set = listLinearPieces({ anchorName, anchorType }, context);
     if (set.blocked) return { plan: null, blocked: set.blocked };
-
-    const target = set.pieces[pieceIndex];
-    if (!target) return { plan: null, blocked: '这一段不存在' };
-    if (!target.startName && !target.endName) {
-        // 整条直线没有任何界点 —— 正常不会走到这里（listLinearPieces 会先挡住）。
-        return { plan: null, blocked: '这一段的两端都是无穷远，无法用截止点表达' };
-    }
 
     const endpoints = context.getLinearEndpoints?.(anchorName);
     if (!endpoints) return { plan: null, blocked: `拿不到 ${anchorName} 的定义点，无法截取` };
     const { p1, p2 } = endpoints;
 
-    const cutPointNames = [
+    const domainLo = anchorType === 'line' ? null : 0;
+    const domainHi = anchorType === 'segment' ? 1 : null;
+
+    let target: LinearPiece | undefined;
+
+    if (typeof spec.tMouse === 'number' && Number.isFinite(spec.tMouse)) {
+        target = resolvePieceByMouse(set, spec.tMouse, domainLo, domainHi);
+    } else if (typeof spec.pieceIndex === 'number') {
+        target = set.pieces[spec.pieceIndex];
+    }
+
+    if (!target) return { plan: null, blocked: '这一段不存在' };
+
+    const resultType = anchorType === 'segment' ? 'segment' : anchorType === 'ray' ? 'ray' : 'line';
+    const results: LinearTrimResult[] = [{ name: anchorName, resultType, keepP1: p1, keepP2: p2 }];
+
+    let cutPointNames = [
         target.startName ? `+${target.startName}` : null,
         target.endName ? `-${target.endName}` : null,
     ].filter((name): name is string => name !== null);
 
-    const resultType = anchorType === 'segment' ? 'segment' : anchorType === 'ray' ? 'ray' : 'line';
+    // 鼠标那一侧的界点不存在（无界尾部）：现场造一个点补上。
+    const needsStartPoint = target.startName === null;
+    const needsEndPoint = target.endName === null;
+
+    if (needsStartPoint || needsEndPoint) {
+        if (!spec.mousePoint) return { plan: null, blocked: '拿不到鼠标位置，无法在这一侧生成截点' };
+        const coords = context.getLinearEndpointCoords?.(anchorName);
+        if (!coords) return { plan: null, blocked: `拿不到 ${anchorName} 的坐标，无法生成截点` };
+
+        const t = projectOntoLinear(spec.mousePoint, coords.p1, coords.p2, 'line');
+        if (t === null) return { plan: null, blocked: '鼠标位置无法投影到线上' };
+
+        const allocated = allocateBoundaryPoint(anchorName, t, p1, p2, context);
+        if (!allocated) return { plan: null, blocked: '无法生成截取用的边界点' };
+
+        if (needsStartPoint) cutPointNames = [`+${allocated.name}`, ...cutPointNames];
+        if (needsEndPoint) cutPointNames = [...cutPointNames, `-${allocated.name}`];
+
+        return {
+            plan: {
+                results,
+                cutPointNames,
+                preludeCommands: allocated.commands,
+            },
+        };
+    }
+
+    return { plan: { results, cutPointNames } };
+}
+
+/**
+ * 按鼠标参数位置找出「鼠标所在的相邻两点之间」那一段。
+ *
+ * 先把鼠标的 `t` 夹进定义域（射线 t<0 吸到 0，线段 t 吸到 [0,1]），
+ * 再取**区间包含 `t` 的那一段** —— 段的两端就是夹住鼠标的那两个已知点，
+ * 无界尾部则用 `null` 表示（`−∞ → A`、`B → +∞`）。
+ *
+ * 这就是「删鼠标所在的相邻两点之间」的直译：鼠标落在哪两个界点中间，就删那两个界点之间。
+ * 等价说法是「先找离鼠标最近的界点，再删它朝鼠标那一侧的一段」—— 不必分两步，
+ * 直接查包含关系更快，也天然覆盖了鼠标超出最外侧界点的无界情形
+ * （此时最近界点就是末界点，它朝鼠标那一侧正是 `末界点 → +∞`）。
+ */
+function resolvePieceByMouse(
+    set: LinearPieceSet,
+    tMouse: number,
+    domainLo: number | null,
+    domainHi: number | null,
+): LinearPiece | undefined {
+    let t = tMouse;
+    if (domainLo !== null) t = Math.max(domainLo, t);
+    if (domainHi !== null) t = Math.min(domainHi, t);
+
+    return set.pieces.find(piece =>
+        t >= (piece.startT ?? -Infinity) - PIECE_EPSILON
+        && t <= (piece.endT ?? Infinity) + PIECE_EPSILON);
+}
+
+/**
+ * 在鼠标投影位置生成一个可写回脚本的边界点。
+ *
+ * 用「在线上取点」那一套槽位表达式（`MEASURE type=distance` + `POINT_ON_LINE`），
+ * 而不是写死坐标：这样拖动原线端点、重跑脚本后，截点会跟着回到线上同一个相对位置。
+ * 距离一律从 `p1` 量出，`t < 0` 时改用 `p2` 作参考点（表达式里不出现负数字面量）。
+ */
+function allocateBoundaryPoint(
+    anchorName: string,
+    t: number,
+    p1: string,
+    p2: string,
+    context: CommandBuildContext,
+): { name: string; commands: string[] } | null {
+    const allocate = createNameAllocator(context);
+    const reference = t >= 0 ? p1 : p2;
+    const ratio = t >= 0 ? t : 1 - t;
+    const slot = `${sanitizeIdentifier(anchorName)}_len`;
+    const name = allocate('cut');
     return {
-        plan: {
-            results: [{ name: anchorName, resultType, keepP1: p1, keepP2: p2 }],
-            cutPointNames,
-        },
+        name,
+        commands: [
+            `MEASURE type=distance slot=${slot} p1=${p1} p2=${p2}`,
+            `CREATE POINT_ON_LINE name=${name} line=${anchorName} point=${reference} distance={${slot} * ${formatNumber(ratio)}} draw=true`,
+        ],
     };
 }
 
@@ -768,7 +916,9 @@ export function validatePick(
             ok: false,
             message: pick === 'point'
                 ? '这里没有点，请点击一个已画出的点'
-                : '这里没有直线，请点击一条已画出的直线或线段',
+                : pick === 'circle'
+                    ? '这里没有圆，请点击一个已画出的圆'
+                    : '这里没有直线，请点击一条已画出的直线或线段',
         };
     }
     if (hit.name === anchorName) {
@@ -777,6 +927,12 @@ export function validatePick(
     if (pick === 'point') {
         if (!isPointType(hit.type)) {
             return { ok: false, message: `${hit.name} 不是点，请点击一个点` };
+        }
+        return { ok: true };
+    }
+    if (pick === 'circle') {
+        if (hit.type !== 'circle') {
+            return { ok: false, message: `${hit.name} 不是圆，请点击一个圆` };
         }
         return { ok: true };
     }
@@ -919,6 +1075,55 @@ function computeCircleIntersection(a: CircleGeometry, b: CircleGeometry): Point2
         { x: midX + offX, y: midY + offY },
         { x: midX - offX, y: midY - offY },
     ];
+}
+
+/**
+ * 直线 / 线段 / 射线与圆的交点（逻辑坐标）。0 / 1 / 2 个。
+ *
+ * 和解释器 `Circle.getIntersectionWithLine` 用同一套一元二次方程，区别是这里额外
+ * 按对象类型裁剪参数 t 的取值区间：这样菜单里的预判结果和解释器实际算出来的
+ * 完全一致 —— 比如一条线段落在圆外，解释器（当作无限直线解）会算出两个交点，
+ * 而这里会正确地报「没有交点」。
+ */
+function computeLineCircleIntersection(
+    p1: Point2D,
+    p2: Point2D,
+    circle: CircleGeometry,
+    lineType: string,
+): Point2D[] {
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    const A = dx * dx + dy * dy;
+    if (A <= 1e-18) return []; // 两个定义点重合，方向无法确定
+
+    const cx = p1.x - circle.center.x;
+    const cy = p1.y - circle.center.y;
+    const B = 2 * (dx * cx + dy * cy);
+    const C = cx * cx + cy * cy - circle.radius * circle.radius;
+    const delta = B * B - 4 * A * C;
+    if (delta < -1e-9) return [];
+
+    // t 是「从 p1 出发沿 p1->p2 方向的参数」，t=0 在 p1、t=1 在 p2。
+    const roots: number[] = [];
+    if (delta <= 1e-9) {
+        roots.push(-B / (2 * A));
+    } else {
+        const sqrtDelta = Math.sqrt(delta);
+        roots.push((-B - sqrtDelta) / (2 * A), (-B + sqrtDelta) / (2 * A));
+    }
+
+    const withinRange = (t: number): boolean => {
+        if (lineType === 'segment') return t >= -1e-9 && t <= 1 + 1e-9;
+        if (lineType === 'ray') return t >= -1e-9;
+        return true; // 直线无限延伸
+    };
+
+    const points = roots.filter(withinRange).map(t => ({ x: p1.x + t * dx, y: p1.y + t * dy }));
+    // 相切（重根）时按容差去重，避免返回两个几乎重合的点。
+    if (points.length === 2 && Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y) <= 1e-9) {
+        return [points[0]];
+    }
+    return points;
 }
 
 /** 「在选中的对象之间作图」的结果：指令，外加做不了时的原因。 */
@@ -1075,6 +1280,73 @@ export function planSelectionOperation(
         };
     }
 
+    // 直线（线段 / 射线）与圆求交点：最多两个交点，可能已经有点落在上面了。
+    // 和两圆求交点用同一套「先查已有点、只补缺的那些」逻辑，只是交点由直线与圆算出。
+    if (operation === 'lineCircleIntersect') {
+        if (objects.length !== 2) return { commands: [], blocked: '需要选中一个圆和一条线' };
+        const line = objects.find(item => isLinearType(item.type));
+        const circleRef = objects.find(item => item.type === 'circle');
+        if (!line || !circleRef) return { commands: [], blocked: '这个操作需要一条线和一圆' };
+
+        const info = context.getCircleInfo?.(circleRef.name);
+        if (!info) return { commands: [], blocked: '取不到圆的圆心和半径' };
+        const lineCoords = context.getLinearEndpointCoords?.(line.name);
+        if (!lineCoords) return { commands: [], blocked: '取不到直线的两个端点坐标' };
+
+        const intersection = computeLineCircleIntersection(
+            lineCoords.p1, lineCoords.p2, info, line.type,
+        );
+        if (intersection.length === 0) {
+            return { commands: [], blocked: '这条线与圆没有交点' };
+        }
+
+        const existingPoints = context.listPointCoords?.() ?? [];
+        const tolerance = 1e-6;
+        const alreadyExists = (p: Point2D) =>
+            existingPoints.some(item => Math.hypot(item.x - p.x, item.y - p.y) <= tolerance);
+        const missing = intersection.filter(p => !alreadyExists(p));
+
+        if (missing.length === 0) {
+            return { commands: [], blocked: '这些交点都已经存在了' };
+        }
+
+        const nameA = allocate('P');
+        const nameB = allocate('P');
+        return {
+            commands: [
+                `CREATE INTERSECT name=${nameA},${nameB} obj1=${line.name} obj2=${circleRef.name} draw=true`,
+            ],
+            newPointCount: missing.length,
+        };
+    }
+
+    // 过一圆外（或圆上）的点作圆的切线，并标出切点。
+    if (operation === 'pointCircleTangent') {
+        if (objects.length !== 2) return { commands: [], blocked: '需要选中一个点和一个圆' };
+        const point = objects.find(item => isPointType(item.type));
+        const circleRef = objects.find(item => item.type === 'circle');
+        if (!point || !circleRef) return { commands: [], blocked: '这个操作需要一个点和一个圆' };
+
+        const info = context.getCircleInfo?.(circleRef.name);
+        const coords = context.getPointCoords?.(point.name);
+        if (!info || !coords) return { commands: [], blocked: '取不到点或圆的坐标' };
+
+        const distance = Math.hypot(coords.x - info.center.x, coords.y - info.center.y);
+        if (distance < info.radius - 1e-6) {
+            return { commands: [], blocked: '这个点在圆内，过它作不出圆的切线' };
+        }
+        // 圆上一点 → 一条切线一个切点；圆外 → 两条切线两个切点。
+        const onCircle = Math.abs(distance - info.radius) <= 1e-6;
+
+        const t1 = allocate('T');
+        const t2 = allocate('T');
+        const nameParam = onCircle ? t1 : `${t1},${t2}`;
+        return {
+            commands: [`CREATE TANGENT name=${nameParam} circle=${circleRef.name} point=${point.name} draw=true`],
+            newPointCount: onCircle ? 1 : 2,
+        };
+    }
+
     // 过点作垂线：需要一个点和一条直线（线段、射线同样可以）。
     if (objects.length !== 2) return { commands: [] };
     const point = objects.find(item => isPointType(item.type));
@@ -1176,8 +1448,11 @@ export function buildPickOperationCommands(
     if (!anchorName) return [];
     const allocate = createNameAllocator(context);
 
-    // ---- 需要点选目标的四种点操作
-    if (kind === 'connect' || kind === 'parallel' || kind === 'perpendicular' || kind === 'reflectPoint') {
+    // ---- 需要点选目标的点操作
+    if (
+        kind === 'connect' || kind === 'parallel' || kind === 'perpendicular'
+        || kind === 'reflectPoint' || kind === 'tangentToCircle'
+    ) {
         if (!targetName) return [];
 
         if (kind === 'connect') {
@@ -1196,6 +1471,22 @@ export function buildPickOperationCommands(
         if (kind === 'perpendicular') {
             const name = allocate('perp');
             return [`CREATE PERPENDICULAR name=${name} line=${targetName} point=${anchorName} draw=true`];
+        }
+        if (kind === 'tangentToCircle') {
+            // 这两个入口都能发起「过点作切线」：
+            //   - 右键一个点 → 主体是点，点选的目标是圆；
+            //   - 右键一个圆 → 主体是圆，点选的目标是点。
+            // 所以先按类型认角色，而不是假定「主体一定是点」。
+            const circleName = anchorType === 'circle' ? anchorName : targetName;
+            const pointName = anchorType === 'circle' ? targetName : anchorName;
+            if (!circleName || !pointName) return [];
+            // 切点名字给两个（圆外时正好用完；圆上时解释器只用第一个）。
+            // 切点是否画出来由 `showPoints` 控制（默认画），切线始终画（它就是本操作的产物）。
+            const t1 = allocate('T');
+            const t2 = allocate('T');
+            const showPoints = optionBoolean(options, 'showTangentPoints', true);
+            const showPointsParam = showPoints ? '' : ' showPoints=false';
+            return [`CREATE TANGENT name=${t1},${t2} circle=${circleName} point=${pointName} draw=true${showPointsParam}`];
         }
         // 轴对称点。可选地把垂足和「点 — 对称点」的虚线也画出来，
         // 否则图上只有一个孤零零的对称点，看不出对称关系。
@@ -1316,7 +1607,7 @@ export function buildPickOperationCommands(
 export type CreateShapeKind =
     | 'point' | 'segment' | 'line' | 'ray'
     | 'circle' | 'triangle' | 'rectangle' | 'square'
-    | 'axis' | 'grid';
+    | 'text' | 'axis' | 'grid';
 
 /** 菜单目录节点：带 `children` 的是分类（渲染成二级菜单），带 `kind` 的是叶子。 */
 export interface CreateShapeCatalogEntry {
@@ -1348,6 +1639,9 @@ export const CREATE_SHAPE_CATALOG: CreateShapeCatalogEntry[] = [
         ],
     },
     { id: 'circle', label: '圆', kind: 'circle', title: '在右键处画一个圆' },
+    // 文字和「点」「圆」一样是单成员，不单独分类。它点下去会先弹一个输入与渲染对话框
+    // （内容 / 字号 / 颜色 / 字体 / 背景），确定后才生成 TEXT 指令。
+    { id: 'text', label: '文字', kind: 'text', title: '在右键处插入一段文字（支持 $LaTeX$）' },
     {
         id: 'polygon',
         label: '多边形',
@@ -1367,6 +1661,31 @@ export const CREATE_SHAPE_CATALOG: CreateShapeCatalogEntry[] = [
     },
 ];
 
+/**
+ * 空选右键新建「文字」时用户填的内容与样式。
+ *
+ * 单独放一个字段而不是塞进 `CreateShapeSpec` 顶层，是因为只有 `kind === 'text'` 才用得上；
+ * 顶层塞一堆 `textFontSize` 之类的可选字段会让其它图形的调用点也得写一堆 `undefined`。
+ */
+export interface CreateTextSpec {
+    /** 文字内容。支持 `$LaTeX$` 片段；空串视为无效（不生成指令）。 */
+    content: string;
+    /** 字号，单位像素。 */
+    fontSize: number;
+    /** 文字颜色，CSS 颜色字符串（`#rrggbb` 或颜色名）。 */
+    color: string;
+    /** 字体族。 */
+    fontFamily: string;
+    /** 是否斜体。 */
+    italic: boolean;
+    /** 是否粗体。 */
+    bold: boolean;
+    /** 背景色；空串表示无背景。 */
+    backgroundColor: string;
+    /** 背景内边距（像素），仅在有背景色时有效。 */
+    padding: number;
+}
+
 export interface CreateShapeSpec {
     kind: CreateShapeKind;
     /** 右键处的逻辑坐标，新图形以此为落脚点。 */
@@ -1376,6 +1695,8 @@ export interface CreateShapeSpec {
      * 这样不同缩放下新建的图形看起来一样大。
      */
     size: number;
+    /** 只有 `kind === 'text'` 用得到：文字内容与样式。 */
+    text?: CreateTextSpec;
 }
 
 /**
@@ -1467,6 +1788,29 @@ export function buildCreateShapeCommands(spec: CreateShapeSpec, context: Command
             return [`CREATE AXIS name=${allocate('axes')}`];
         case 'grid':
             return [`CREATE GRID name=${allocate('grid')}`];
+        case 'text': {
+            const text = spec.text;
+            if (!text || text.content.trim() === '') return [];
+            // TEXT 不是几何对象、也没有名字，直接吃坐标，所以不需要先建落脚点。
+            // 内容放在最后（DSL 的 text= 会一直吃到行尾），这样内容里的空格不会把它截断。
+            const options: string[] = [];
+            if (Number.isFinite(text.fontSize) && text.fontSize > 0) {
+                options.push(`fontSize=${formatNumber(text.fontSize)}`);
+            }
+            if (text.color) options.push(`color=${text.color}`);
+            if (text.fontFamily) options.push(`fontFamily="${text.fontFamily}"`);
+            const fontStyle = text.italic ? 'italic' : 'normal';
+            const fontWeight = text.bold ? 'bold' : 'normal';
+            if (fontStyle !== 'normal') options.push(`fontStyle=${fontStyle}`);
+            if (fontWeight !== 'normal') options.push(`fontWeight=${fontWeight}`);
+            if (text.backgroundColor) options.push(`backgroundColor=${text.backgroundColor}`);
+            if (text.backgroundColor && Number.isFinite(text.padding) && text.padding > 0) {
+                options.push(`padding=${formatNumber(text.padding)}`);
+            }
+            const head = `TEXT x=${formatNumber(ax)} y=${formatNumber(ay)}`;
+            const stylePart = options.length > 0 ? ` ${options.join(' ')}` : '';
+            return [`${head}${stylePart} text="${escapeTextContent(text.content)}"`];
+        }
         default:
             return [];
     }
