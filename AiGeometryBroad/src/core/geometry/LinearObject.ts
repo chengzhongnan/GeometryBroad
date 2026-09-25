@@ -1,4 +1,4 @@
-import { GeometricObject, type DrawOptions, type DrawLabelOptions, type IPoint, type VisibleRect, toScreenPoint, resolveLineWidth } from './base';
+import { GeometricObject, type DrawTransform, type DrawOptions, type DrawLabelOptions, type IPoint, type VisibleRect, toScreenPoint, resolveLineWidth } from './base';
 import { Point, PointNativeObject } from './Point';
 
 // 沿单位方向向量 (ux, uy) 从锚点出发，求直线/射线与可视矩形的相交区间。
@@ -59,15 +59,160 @@ export class LinearNativeObject {
   public p2: PointNativeObject;
 }
 
+/**
+ * 截止点的方向。
+ *
+ * - `'left'`：声明该点**负方向**一侧不绘制，DSL 写 `-A`（「从 A 开始」）；
+ * - `'right'`：声明该点**正方向**一侧不绘制，DSL 写 `+A`（「到 A 为止」）；
+ * - `null`：不带方向，DSL 只写 `A`。
+ *
+ * 多个截止点沿参数方向逐个**翻转**绘制状态，起点是否绘制由第一个截止点的方向决定
+ * （第一个点写 `-A` 就说明 A 之前本来就没画）。详见 `getVisibleParameterIntervals`。
+ */
+export type CutSide = 'left' | 'right' | null;
+
+export interface LinearCutPoint {
+  point: Point;
+  side: CutSide;
+}
+
 // 线性对象的抽象基类
 export abstract class LinearObject extends GeometricObject {
   public p1: Point;
   public p2: Point;
+  /**
+   * 绘制截止点数组。点对象本身保留引用，因此用户拖动截止点时，线的可见区间会随之更新。
+   *
+   * 沿 p1 → p2 的参数方向排序后逐个翻转绘制状态。起点是否绘制由**第一个**截止点的
+   * 方向决定：写 `-A` 意味着 A 的负方向一侧本来就不画，所以从隐藏态开始；其余情况从
+   * 绘制态开始（这也是全部截止点都不带方向时的老行为）。于是：
+   *
+   * - 空数组：正常绘制；
+   * - `A`：画到 A 为止（从定义域起点到 A）；
+   * - `A,B`：跳过 A 到 B，两侧都画（挖掉中间一段）；
+   * - `-A,+B`：从 A 开始、到 B 结束 —— 直线/射线被截成线段 [A,B]；
+   * - `+A,-B`：A 之前和 B 之后都画，中间不画；
+   * - `-A,+B,-C,+D`：画 [A,B] ∪ [C,D]，以此类推。
+   *
+   * 带方向是必须的：派生线（中垂线 / 平行线…）的两个定义点是内部合成点，
+   * 没法像 `CREATE LINE` 那样交换 p1/p2 来表达「删掉某一侧」。
+   */
+  public cutPoints: LinearCutPoint[] = [];
 
   constructor(name: string, type: string, p1: Point, p2: Point) {
     super(name, type);
     this.p1 = p1;
     this.p2 = p2;
+  }
+
+  /** 接受裸点（等价于不带方向）或已带方向的截止点，统一存成 `LinearCutPoint`。 */
+  public setCutPoints(cuts: Array<Point | LinearCutPoint>): void {
+    this.cutPoints = cuts
+      .filter(Boolean)
+      .map(cut => (cut instanceof Point ? { point: cut, side: null } : cut))
+      // 用鸭子类型而不是 `instanceof Point`：截止点只要能被投影到参数轴上就够用，
+      // 没必要把它和某个具体子类绑死。
+      .filter(cut => cut.point && typeof cut.point.x === 'number' && typeof cut.point.y === 'number');
+  }
+
+  /** 定义域下界：线段和射线从 p1 起算（参数 0），直线向两端无限延伸。 */
+  protected get domainStart(): number {
+    return this.type === 'line' ? -Infinity : 0;
+  }
+
+  /** 定义域上界：只有线段封到 p2（参数 1）。 */
+  protected get domainEnd(): number {
+    return this.type === 'segment' ? 1 : Infinity;
+  }
+
+  /** 把点投影到 p1 → p2 的归一化参数轴（p1 = 0，p2 = 1）。 */
+  protected parameterOf(point: Point): number | null {
+    const dx = this.p2.x - this.p1.x;
+    const dy = this.p2.y - this.p1.y;
+    const lengthSquared = dx * dx + dy * dy;
+    if (!(lengthSquared > 1e-12)) return null;
+    const value = ((point.x - this.p1.x) * dx + (point.y - this.p1.y) * dy) / lengthSquared;
+    return Number.isFinite(value) ? value : null;
+  }
+
+  /**
+   * 截止点按参数升序排好，并过滤掉落在定义域之外的。
+   *
+   * 不去重：连续裁剪可能需要在同一边界处再次翻转可见状态，
+   * 例如已有 `A,B` 后再删除 B 之后的可见尾部会追加一个 B。
+   */
+  protected getOrderedCutPoints(): Array<{ cut: LinearCutPoint; value: number }> {
+    const lo = this.domainStart;
+    const hi = this.domainEnd;
+    return this.cutPoints
+      .map(cut => ({ cut, value: this.parameterOf(cut.point) }))
+      .filter((entry): entry is { cut: LinearCutPoint; value: number } => (
+        entry.value !== null && entry.value >= lo - 1e-9 && entry.value <= hi + 1e-9
+      ))
+      .sort((a, b) => a.value - b.value);
+  }
+
+  /**
+   * 归一化参数轴上的可见区间（p1 = 0，p2 = 1）。
+   *
+   * 沿参数方向扫描，每个截止点翻转一次绘制状态：
+   * 起点状态由第一个截止点的方向决定 —— 它写 `-A` 就说明 A 的负方向本来就没画，
+   * 于是从隐藏态起步；否则从绘制态起步（所有截止点都不带方向时的老行为）。
+   */
+  protected getVisibleParameterIntervals(): Array<[number, number]> {
+    const lo = this.domainStart;
+    const hi = this.domainEnd;
+    const ordered = this.getOrderedCutPoints();
+    if (ordered.length === 0) return [[lo, hi]];
+
+    const intervals: Array<[number, number]> = [];
+    let visible = ordered[0].cut.side !== 'left';
+    let cursor = lo;
+    for (const { value } of ordered) {
+      if (value <= cursor + 1e-9) {
+        // 和定义域起点重合：这一侧没有长度可画，直接翻转状态。
+        visible = !visible;
+        continue;
+      }
+      if (visible) intervals.push([cursor, value]);
+      cursor = value;
+      visible = !visible;
+    }
+    if (visible && hi > cursor + 1e-9) intervals.push([cursor, hi]);
+    return intervals;
+  }
+
+  /** 命中测试复用绘制语义：被截止点砍掉的部分不可选。 */
+  public isParameterVisible(parameter: number): boolean {
+    if (this.type === 'segment' && (parameter < -1e-9 || parameter > 1 + 1e-9)) return false;
+    if (this.type === 'ray' && parameter < -1e-9) return false;
+
+    const ordered = this.getOrderedCutPoints();
+    if (ordered.length === 0) return true;
+
+    let visible = ordered[0].cut.side !== 'left';
+    for (const { value } of ordered) {
+      if (parameter < value - 1e-9) return visible;
+      if (Math.abs(parameter - value) <= 1e-9) return true;
+      visible = !visible;
+    }
+    return visible;
+  }
+
+  /** 把可见区间从归一化参数轴换算到屏幕参数轴，并与本次绘制范围求交。 */
+  protected getVisibleDrawIntervals(
+    extent: [number, number],
+    parameterToScreen: (parameter: number) => number,
+  ): Array<[number, number]> {
+    const intervals: Array<[number, number]> = [];
+    for (const [start, end] of this.getVisibleParameterIntervals()) {
+      const a = parameterToScreen(start);
+      const b = parameterToScreen(end);
+      const from = Math.max(extent[0], Math.min(a, b));
+      const to = Math.min(extent[1], Math.max(a, b));
+      if (to > from + 1e-9) intervals.push([from, to]);
+    }
+    return intervals;
   }
 
   getDrawLabelPosition(transform: { scale: number; offsetX: number; offsetY: number; }, options: DrawLabelOptions, textWidth: number, textHeight: number): IPoint {
@@ -140,9 +285,9 @@ export abstract class LinearObject extends GeometricObject {
   }
 
   // 统一的描边样式设置
-  protected applyStrokeStyle(ctx: CanvasRenderingContext2D, transform: { scale: number }, options?: DrawOptions): void {
+  protected applyStrokeStyle(ctx: CanvasRenderingContext2D, transform: DrawTransform, options?: DrawOptions): void {
     ctx.strokeStyle = options?.color || 'black';
-    ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform.scale) * (options?.highlight ? 2 : 1);
+    ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform) * (options?.highlight ? 2 : 1);
     if (options?.dashed) {
       ctx.setLineDash([5, 5]);
     } else {
@@ -163,7 +308,7 @@ export abstract class LinearObject extends GeometricObject {
    */
   protected resolveDrawExtent(
     ctx: CanvasRenderingContext2D,
-    transform: { scale: number; offsetX: number; offsetY: number },
+    transform: DrawTransform,
     options: DrawOptions | undefined,
     anchorX: number,
     anchorY: number,
@@ -420,7 +565,7 @@ export class Line extends LinearObject {
     super(name, 'line', p1, p2);
   }
 
-  public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
+  public draw(ctx: CanvasRenderingContext2D, transform: DrawTransform, options?: DrawOptions): void {
     ctx.save();
     ctx.beginPath();
     this.applyStrokeStyle(ctx, transform, options);
@@ -452,10 +597,13 @@ export class Line extends LinearObject {
       return;
     }
 
-    ctx.moveTo(anchorX + ux * extent[0], anchorY + uy * extent[0]);
-    ctx.lineTo(anchorX + ux * extent[1], anchorY + uy * extent[1]);
+    const intervals = this.getVisibleDrawIntervals(extent, parameter => (parameter - 0.5) * distance);
+    for (const [from, to] of intervals) {
+      ctx.moveTo(anchorX + ux * from, anchorY + uy * from);
+      ctx.lineTo(anchorX + ux * to, anchorY + uy * to);
+    }
 
-    ctx.stroke();
+    if (intervals.length > 0) ctx.stroke();
     ctx.restore();
   }
 }
@@ -471,7 +619,7 @@ export class Segment extends LinearObject {
     return this.p1.distanceTo(this.p2);
   }
 
-  public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
+  public draw(ctx: CanvasRenderingContext2D, transform: DrawTransform, options?: DrawOptions): void {
     ctx.save();
     ctx.beginPath();
 
@@ -480,10 +628,26 @@ export class Segment extends LinearObject {
     const start = toScreenPoint(this.p1.x, this.p1.y, transform);
     const through = toScreenPoint(this.p2.x, this.p2.y, transform);
 
-    ctx.moveTo(start.x, start.y);
-    ctx.lineTo(through.x, through.y);
+    const dx = through.x - start.x;
+    const dy = through.y - start.y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    if (distance < 1e-9) {
+      ctx.restore();
+      return;
+    }
 
-    ctx.stroke();
+    const ux = dx / distance;
+    const uy = dy / distance;
+    const intervals = this.getVisibleDrawIntervals(
+      [0, distance],
+      parameter => parameter * distance,
+    );
+    for (const [from, to] of intervals) {
+      ctx.moveTo(start.x + ux * from, start.y + uy * from);
+      ctx.lineTo(start.x + ux * to, start.y + uy * to);
+    }
+
+    if (intervals.length > 0) ctx.stroke();
     ctx.restore();
   }
 }
@@ -515,7 +679,7 @@ export class Ray extends LinearObject {
     return new PointNativeObject(startPoint.x + dx * scale, startPoint.y + dy * scale);
   }
 
-  public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
+  public draw(ctx: CanvasRenderingContext2D, transform: DrawTransform, options?: DrawOptions): void {
     ctx.save();
     ctx.beginPath();
 
@@ -544,10 +708,13 @@ export class Ray extends LinearObject {
       return;
     }
 
-    ctx.moveTo(start.x + ux * extent[0], start.y + uy * extent[0]);
-    ctx.lineTo(start.x + ux * extent[1], start.y + uy * extent[1]);
+    const intervals = this.getVisibleDrawIntervals(extent, parameter => parameter * distance);
+    for (const [from, to] of intervals) {
+      ctx.moveTo(start.x + ux * from, start.y + uy * from);
+      ctx.lineTo(start.x + ux * to, start.y + uy * to);
+    }
 
-    ctx.stroke();
+    if (intervals.length > 0) ctx.stroke();
     ctx.restore();
   }
 }

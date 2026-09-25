@@ -45,3 +45,9 @@ Thumbs.db
 
 # Project-local WorkBuddy metadata
 .workbuddy-ai/
+.workbuddy/
+outputs/
+
+# Transient esbuild bundles from scripts/*.mts verification runs
+*.bundle.mjs
+*.bundle.css

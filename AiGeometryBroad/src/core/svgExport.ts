@@ -10,6 +10,8 @@ export interface SvgExportViewState {
     // 画布平移量（屏幕像素）
     offsetX: number;
     offsetY: number;
+    // 视图旋转角（弧度，绕画布中心）。导出要和画布上看到的一致，就必须带上它。
+    rotation: number;
 }
 
 export interface SvgExportOptions {
@@ -28,6 +30,7 @@ const DEFAULT_VIEW: SvgExportViewState = {
     scale: 1,
     offsetX: 0,
     offsetY: 0,
+    rotation: 0,
 };
 
 function escapeRegExp(value: string): string {
@@ -82,16 +85,18 @@ export function exportScriptToSvg(script: string, options: SvgExportOptions): st
         x: view.offsetX,
         y: view.offsetY,
         scale: view.scale,
+        rotation: view.rotation,
     });
     interpreter.setViewCenter(view.centerX, view.centerY);
     // SVG 渲染上下文没有预置视图变换，标签坐标需要由解释器自己完成换算
     interpreter.setContextPreTransformed(false);
-    // 将当前画布的外层缩放/平移合并到所有几何对象和标签的坐标中，
+    // 将当前画布的外层缩放/平移/旋转合并到所有几何对象和标签的坐标中，
     // 同时把默认直线/射线裁剪区域固定为整个 SVG 画布。
     interpreter.setRenderTransform({
         scale: view.scale,
         offsetX: view.offsetX,
         offsetY: view.offsetY,
+        rotation: view.rotation,
     });
 
     interpreter.execute(script);
@@ -111,7 +116,9 @@ export function exportScriptToSvg(script: string, options: SvgExportOptions): st
     const frameCount = Math.max(1, Math.floor(
         primaryAnimation.period || inferredFrames || (primaryAnimation.isRepeat ? defaultFrames : 1)
     ));
-    const frameInterval = Math.max(1, primaryAnimation.interval);
+    // interval=0 表示「跟随显示器刷新率」，没有确定时长，导出时按 60fps 估算，
+    // 否则 durationMs 会退化成 frameCount × 1ms，SVG 快到看不清。
+    const frameInterval = Math.max(1000 / 60, primaryAnimation.interval);
     const frames: string[][] = [];
     let contentBounds = context.getBounds();
 

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import styled from 'styled-components';
 import Editor, { type Monaco } from '@monaco-editor/react'; // 👈 1. 引入 Monaco 类型
+import { ALL_META_COMMANDS, GEOMETRIC_COMMANDS } from '../core/dslCommandNames';
 
 interface ScriptInputPanelProps {
   title: string;
@@ -27,12 +28,12 @@ function setupGeoScriptLanguage(monaco: Monaco) {
   // 第二步: 定义 Monarch 词法规则
   monaco.languages.setMonarchTokensProvider(LANGUAGE_ID, {
     ignoreCase: true,
-    keywords:  ['CLEAR', 'SET', 'HELP', 'VIEW', 'TRANSLATE', 'DRAW', 'TEXT', 'MEASURE', 'RUN', 'CODE', 'WITH', 'CALCULATE', 'GETOBJ', 'PRINT', 'CREATE'],
-    typeKeywords: [
-      'POINT', 'LINE', 'SEGMENT', 'RAY', 'MIDPOINT', 'PERPENDICULAR_FOOT', 'REFLECTED_POINT', 'ROTATED_POINT',
-      'INTERSECT', 'POINT_ON_LINE', 'PERP_BISECTOR', 'PERPENDICULAR', 'PARALLEL', 'ANGLE_BISECTOR', 'CIRCUMCIRCLE',
-      'INCIRCLE', 'TANGENT', 'POLYGON', 'TRIANGLE', 'RECTANGLE', 'CIRCLE', 'ELLIPSE', 'PARABOLA', 'HYPERBOLA',
-      'ANGLE', 'FOCIS', 'RANDOMPOINT', 'SLOT', 'ANIMATION'],
+    // 两份清单都从 dslCommandNames.ts 取，不再手抄。手抄的结果就是高亮跟解释器漂移：
+    // `TRANSLATE`（没有任何实现）一直被点亮成关键字，而 `REGION` / `AXIS` / `GRID` /
+    // `FUNCTION` / `CURVE` / `POINTSET` 这些真指令反倒不会被点亮。
+    // 别名（`WITHRUN` / `MESSAGE`）也算，它们写出来是合法的。
+    keywords: [...ALL_META_COMMANDS] as string[],
+    typeKeywords: [...GEOMETRIC_COMMANDS] as string[],
     operators: ['='],
     symbols: /[=]+/,
     escapes: /\\(?:[abfnrtv\\"']|x[0-9A-Fa-f]{1,4}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})/,

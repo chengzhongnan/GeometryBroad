@@ -1,4 +1,4 @@
-import { LinearObject } from './geometry/LinearObject';
+import { LinearObject, type CutSide, type LinearCutPoint } from './geometry/LinearObject';
 import {
     GeometricObject,
     type IPoint,
@@ -23,9 +23,18 @@ import {
     Curve
 } from './geometry/types';
 
-import { toScreenPoint } from './geometry/base';
+import { toScreenPoint, fromScreenPoint, DEFAULT_POINT_RADIUS_PIXELS, resolvePointRadius, type DrawTransform } from './geometry/base';
+import {
+    buildCanvasMatrix,
+    degreesToRadians,
+    isUsableView,
+    rotateAbout,
+    viewPivot,
+    type CanvasView,
+} from './viewTransform';
 import { calculate } from './expression';
 import { getHelpMessages } from './HelpCommand';
+import { isGeometricCommandName, isMetaCommandName } from './dslCommandNames';
 import { splitLatexParts, latexRegionMask } from './latexSplit';
 import {
     getCachedKatexCanvas,
@@ -35,16 +44,32 @@ import {
 } from './katexRender';
 import type { CustomFunction } from './geometry/types';
 
+// AXIS / GRID 的默认值不再写死逻辑单位，而是按「屏幕上多少像素」换算，
+// 这样同一个 CREATE AXIS 在任意 VIEW scale 下都能得到一致的观感。
+// 目标刻度间距：约 64 像素一个刻度（数字 12px 时既不挤也不稀）。
+const AXIS_TARGET_TICK_PIXELS = 64;
+// 默认刻度线总长度 / 箭头长度（屏幕像素）。
+// 注意：绘制时刻度是从 origin 向两侧各画 tickSize，所以视觉总长度是 tickSize 的两倍，
+// 由「视觉总长度」换算 tickSize 时要除以 2。
+const AXIS_TICK_PIXELS = 10;
+const AXIS_ARROW_PIXELS = 13;
+// 无法拿到可见区域时的兜底半宽（逻辑单位）
+const AXIS_FALLBACK_HALF_SPAN = 10;
+
+
 interface AnimationState {
     name: string; // 动画名称
     code: string; // 动画帧代码名称，这里必须是通过代码块创建的一个代码块
     slot: string;   // 动画槽位名称，动画的当前帧在这个槽位中
     currentFrame: number; // 当前帧索引
-    interval: number; // 帧间隔时间（毫秒）
+    interval: number; // 帧间隔时间（毫秒）；0 表示每个 requestAnimationFrame 都推进一帧
     period?: number; // 可选的完整周期帧数（period 参数）
     isRunning: boolean; // 是否正在运行
     isRepeat: boolean; // 是否循环播放
-    animationTimer: number; // 计时器
+    // 上一帧实际执行时的时间戳（performance.now 量级）；-1 表示还没跑过第一帧。
+    // 调度不再靠每个动画各自的 setTimeout，而是由 onAnimationFrame 的 rAF 循环
+    // 用这个字段判断「到点没有」，所以多个动画可以共用一个循环。
+    lastFrameTime: number;
 }
 
 type onMessageCallback = (level: string, line: number, message: string) => void;
@@ -59,7 +84,50 @@ export interface VariableInfo {
     objectType?: string;
     randomObject?: boolean;
     randomSource?: string;
+    // 点自身的 frozen 属性（`CREATE POINT ... frozen=true`）。
+    // 与随机对象那种「冻结当前坐标」是两套机制，所以单独给一个字段，
+    // 面板据此决定显示哪一个 Freeze 按钮。
+    pointFrozen?: boolean;
+    // 对象创建指令在脚本中的物理行号（1-based），用于把属性改动写回正确的行。
+    lineNumber?: number;
     details?: Record<string, string>;
+    editableProperties?: EditableObjectProperty[];
+    // 直线/射线/线段的截止点。它是一串「点名 + 方向」，不是数值，
+    // 所以不能塞进 editableProperties（那张表只处理数值），单独给一个字段。
+    editableCutPoints?: EditableCutPointsProperty;
+    // 对象的显示标签。和 editableCutPoints 同理：字符串值 + 可能落在 DRAW 行上，
+    // 塞不进只认数值和定义行的 editableProperties。
+    editableLabel?: EditableLabelProperty;
+}
+
+/**
+ * 线性对象的截止点属性。
+ *
+ * `value` 是可直接写回 `cutPoints=` 的 DSL 片段，例如 `-A,+B`。
+ */
+export interface EditableCutPointsProperty {
+    label: string;
+    value: string;
+    lineNumber: number;
+    editable: boolean;
+    reason?: string;
+}
+
+/**
+ * 对象的显示标签（供属性面板显示 / 编辑）。
+ *
+ * 值是字符串（可以写中文、写 `$LaTeX$`），所以既不能塞进 editableProperties
+ * （那张表只处理数值），也和 editableCutPoints 只是长得像：
+ * 标签是**样式**，跟着「真正把对象画出来的那条指令」走，行号不一定是定义行。
+ */
+export interface EditableLabelProperty {
+    label: string;
+    /** 当前标签文本（已去引号）。空串表示不显示标签。 */
+    value: string;
+    /** 要写回的那一行（1-based）：定义行写了 draw=true 就是定义行，否则是 DRAW 行。 */
+    lineNumber: number;
+    editable: boolean;
+    reason?: string;
 }
 
 // DSL解释器的主要状态
@@ -83,6 +151,14 @@ interface InterpreterState {
         centerX: number;
         centerY: number;
         scale: number;
+        /**
+         * 脚本声明的视图旋转角（**度**，正值 = 屏幕上顺时针），对应 `VIEW rotation=`。
+         *
+         * 与 scale 一样是「烘进坐标」的基准量：交互式旋转（鼠标拖拽）在它之上再叠一层，
+         * 所以重新框选视图（重置视图）只会清掉交互那层，脚本声明的角度仍然保留。
+         * 存度而不是弧度，是因为它直接对应 DSL 参数，避免每次读都要换算。
+         */
+        rotation: number;
 
         backgroundColor: string;
         penColor: string;
@@ -93,7 +169,6 @@ interface InterpreterState {
         pointFill: boolean;
         drawLabelForPoints: boolean;
         drawLabelForOthers: boolean;
-        drawAfterCreate: boolean;
         // 直线/射线的绘制长度（逻辑单位）。null 表示未指定，
         // 此时只延伸到可视区域边缘，避免无限长的线把导出 SVG 撑得非常大。
         lineLength: number | null;
@@ -104,6 +179,19 @@ interface InterpreterState {
     renderScale: number;
     renderOffsetX: number;
     renderOffsetY: number;
+    // SVG 导出路径的交互式旋转角（弧度）。Canvas 路径不用它 —— 那里的旋转
+    // 由 applyCanvasViewTransform 写进 ctx 矩阵。
+    renderRotation: number;
+    // 画布外层矩阵的缩放（来自 setTransform 的 transform.scale）。
+    // 用来把默认线宽折算成恒定像素粗细：绘制坐标 -> 屏幕像素的倍率。
+    // 只在 contextPreTransformed=true（Canvas 路径）时有意义；SVG 导出取 1。
+    outerScale: number;
+    // 画布外层矩阵的平移与交互式旋转（来自 setTransform）。三者一起描述
+    // 「画布中心 + 旋转 · (outerScale · 变换前坐标 + 平移)」这个外层相似变换，
+    // 单独拆出来存是因为旋转的轴心要按 canvas 尺寸算，不能在 setTransform 里丢掉。
+    outerPanX: number;
+    outerPanY: number;
+    outerRotation: number;
     animationAutoStart: boolean; // 是否自动启动动画计时器
     variableInfo: Map<string, VariableInfo>; // 用户可见的变量信息
     frozenRandomValues: Map<string, number>; // 固定后的随机变量值
@@ -114,7 +202,83 @@ interface InterpreterState {
     selectedLabelId?: string; // 当前选中标签
     labelPositions: Map<string, IPoint>; // 用户拖动后的标签逻辑坐标
     labelHitRegions: LabelHitRegion[];
+    textHitRegions: TextHitRegion[];
     renderedObjectNames: string[];
+    sourceBindings: Map<string, SourceBinding>;
+    /**
+     * 全部顶层指令的解析结果（CODE 块里的不算）。
+     * sourceBindings 只收「带 name 的定义指令」，而删除对象还要找 DRAW / FILL / MEASURE
+     * 这类不建对象、只引用对象的指令，所以单独留一份完整列表。
+     */
+    topLevelCommands: ParsedCommand[];
+    previewObjectProperties: Map<string, Map<ObjectPropertyKey, number>>;
+    textElements: Map<string, TextElement>;
+    pointSets: Map<string, Point[]>;
+    /** 当前正在执行的指令行号，供「事后才发现的错误」在消息里报出准确位置。 */
+    currentCommandLine: number;
+    /**
+     * 「create 时写了 draw=true」的几何对象，等脚本跑完统一绘制。
+     *
+     * 用数组保序：绘制顺序 = 创建顺序，所以 z 序与「逐个立即绘制」时一致。
+     * 统一后置的原因见 `collectDraw`。
+     */
+    pendingDraws: PendingDraw[];
+    /**
+     * 创建时还没解析出来的截止点引用，按对象名索引。
+     *
+     * 和绘制是**两件独立的事**：即使这条线这次不画（`draw=false`），引用也要补全，
+     * 否则后面 `DRAW obj=X` 把它画出来时截止点是缺的。所以单独放一份。
+     */
+    pendingCutResolutions: Map<string, PendingCutResolution>;
+    /** executeLines 的嵌套深度，只有回到最外层才冲刷待绘队列。 */
+    executeDepth: number;
+}
+
+/** 一个「create 时写了 draw=true」、等着脚本跑完统一绘制的几何对象。 */
+interface PendingDraw {
+    /** 绘制参数（创建时那一行的副本）。 */
+    params: Map<string, string>;
+    object: GeometricObject;
+    /** 点的标签名（`drawObject` 需要），非点对象是 undefined。 */
+    label: string | undefined;
+}
+
+/** 一个创建时引用了尚未定义的点的线性对象。 */
+interface PendingCutResolution {
+    object: LinearObject;
+    /** 解析失败的截止点引用（点名 + 方向）。 */
+    cuts: Array<{ name: string; side: CutSide }>;
+    lineNumber: number;
+}
+
+export type ObjectPropertyKey = 'x' | 'y' | 'radius' | 'radiusX' | 'radiusY' | 'rotation' | 'width' | 'height';
+
+export interface EditableObjectProperty {
+    key: ObjectPropertyKey;
+    label: string;
+    value: number;
+    lineNumber: number;
+    editable: boolean;
+    reason?: string;
+}
+
+/**
+ * 一条顶层指令的解析结果。给「改写脚本」用：删除对象、裁剪线性对象都要靠它
+ * 定位「哪一行定义了谁、哪一行引用了谁」。
+ */
+export interface TopLevelCommandInfo {
+    /** 指令名，已大写（POINT / DRAW / LINE ...）。 */
+    command: string;
+    type: 'meta' | 'geometric';
+    /** 解析好的参数表，值已去掉引号。 */
+    params: Map<string, string>;
+    /** 该指令在脚本里的真实物理行号（1-based）。 */
+    lineNumber: number;
+}
+
+interface SourceBinding {
+    command: ParsedCommand;
+    lineNumber: number;
 }
 
 // 解析后的指令接口
@@ -136,6 +300,26 @@ interface LabelHitRegion {
     position: IPoint;
 }
 
+interface TextHitRegion {
+    objectName: string;
+    x: number;
+    y: number;
+    width: number;
+    ascent: number;
+    descent: number;
+}
+
+interface TextElement {
+    name: string;
+    text: string;
+    x: number;
+    y: number;
+    width: number;
+    ascent: number;
+    descent: number;
+    lineNumber: number;
+}
+
 export type CanvasSelection =
     | { kind: 'object'; name: string }
     | { kind: 'label'; id: string; objectName: string; position: IPoint; screenAnchor: IPoint }
@@ -143,10 +327,31 @@ export type CanvasSelection =
 
 const SELECTED_OBJECT_COLOR = '#e11d48';
 
+/**
+ * 能产生线性对象、并且接受 `cutPoints` 的创建指令。
+ *
+ * 派生线（中垂线 / 垂线 / 平行线 / 角平分线）的两个定义点是内部合成点，DSL 里引用不到，
+ * 所以它们只能靠「带方向的截止点」删掉某一侧 —— 这正是这个白名单存在的理由：
+ * 只要指令在这里，属性面板就会给出截止点输入框，右键截取也能写回原定义行。
+ */
+const LINEAR_CUT_COMMANDS = new Set([
+    'LINE', 'SEGMENT', 'RAY',
+    'PERP_BISECTOR', 'PERPENDICULAR', 'PARALLEL', 'ANGLE_BISECTOR',
+]);
+
+/** 把一个截止点写成 DSL 片段：`+A`（砍正方向）/ `-A`（砍负方向）/ `A`（不带方向）。 */
+export function formatLinearCutPoint(cut: LinearCutPoint): string {
+    const prefix = cut.side === 'right' ? '+' : cut.side === 'left' ? '-' : '';
+    return `${prefix}${cut.point.name}`;
+}
+
 // 几何作图DSL解释器
 export class GeometryDSLInterpreter {
     private state: InterpreterState;
     private zeroThresholdValue: number = 1e-6;
+    // 当前挂起的动画帧回调。浏览器是 requestAnimationFrame，Node 是 setTimeout。
+    // 全解释器只有一个，所有动画共用一个循环，不再每个动画挂一条定时器链。
+    private scheduledFrame: { cancel: () => void } | null = null;
 
     constructor(canvas?: HTMLCanvasElement, onMessage?: onMessageCallback) {
         this.state = {
@@ -169,17 +374,21 @@ export class GeometryDSLInterpreter {
                 centerX: 0,
                 centerY: 0,
                 scale: 1,
+                rotation: 0,
 
                 backgroundColor: 'white',
                 penColor: 'black',
                 penSize: 1,
                 labelFont: '12px Arial',
                 labelSize: 12,
-                pointRadius: 3,
-                pointFill: true,
+                // 默认点半径。必须是 DEFAULT_POINT_RADIUS_PIXELS（4）—— 这就是历史上
+                // 「不写 radius= 的点」实际用的值，接上 SET item=pointRadius 后默认行为不能变。
+                pointRadius: DEFAULT_POINT_RADIUS_PIXELS,
+                // 默认点是否实心。历史行为是「不写 real= 就是空心点」，所以默认 false；
+                // （解释器自己算出来的点走 Point 构造函数的 real=true，不受这里影响。）
+                pointFill: false,
                 drawLabelForPoints: true,
                 drawLabelForOthers: false,
-                drawAfterCreate: false,
                 lineLength: null,
             },
             onMessage: onMessage,
@@ -188,6 +397,11 @@ export class GeometryDSLInterpreter {
             renderScale: 1,
             renderOffsetX: 0,
             renderOffsetY: 0,
+            renderRotation: 0,
+            outerScale: 1,
+            outerPanX: 0,
+            outerPanY: 0,
+            outerRotation: 0,
             animationAutoStart: true,
             variableInfo: new Map(),
             frozenRandomValues: new Map(),
@@ -198,7 +412,17 @@ export class GeometryDSLInterpreter {
             selectedLabelId: undefined,
             labelPositions: new Map(),
             labelHitRegions: [],
+            textHitRegions: [],
             renderedObjectNames: [],
+            sourceBindings: new Map(),
+            topLevelCommands: [],
+            previewObjectProperties: new Map(),
+            textElements: new Map(),
+            pointSets: new Map(),
+            currentCommandLine: 0,
+            pendingDraws: [],
+            pendingCutResolutions: new Map(),
+            executeDepth: 0,
         };
     }
 
@@ -219,9 +443,46 @@ export class GeometryDSLInterpreter {
         });
     }
 
-    private executeLines(lines: string[], setLineNumber: boolean): void {
+    private recordSourceBinding(command: ParsedCommand): void {
+        const commandName = command.command.toUpperCase();
+        if (commandName === 'TEXT') {
+            const name = command.params.get('name') || command.params.get('id') || `text_${command.lineNumber}`;
+            this.state.sourceBindings.set(name, { command, lineNumber: command.lineNumber });
+            return;
+        }
+        const name = command.params.get('name') || command.params.get('n');
+        if (!name || command.type !== 'geometric') return;
+        this.state.sourceBindings.set(name, { command, lineNumber: command.lineNumber });
+    }
+
+    private getTextObjectName(params: Map<string, string>, lineNumber: number): string {
+        return params.get('name') || params.get('id') || `text_${lineNumber}`;
+    }
+
+    private executeLines(lines: LogicalLine[], setLineNumber: boolean): void {
+        // 只有回到最外层才把收集到的几何对象画出来：RUN / WITH / 动画帧会递归调用到这里，
+        // 内层提前画就看不到后面才定义的点（截止点、交点都是前向引用）。
+        // 这也相当于脚本末尾隐式补了一条 `DRAW`。
+        this.state.executeDepth++;
+        try {
+            // 最外层执行前先把画布视图矩阵写好（含旋转）。动画逐帧也走这里，
+            // 所以拖动旋转之后动画帧的位置同样是对的，不需要各自记着设矩阵。
+            if (this.state.executeDepth === 1) this.applyCanvasViewTransform();
+            this.executeLinesInner(lines, setLineNumber);
+        } finally {
+            this.state.executeDepth--;
+            if (this.state.executeDepth === 0) this.flushPendingDraws();
+        }
+    }
+
+    private executeLinesInner(lines: LogicalLine[], setLineNumber: boolean): void {
         for (let i = 0; i < lines.length; i++) {
-            const line = lines[i].trim();
+            const entry = lines[i];
+            // entry.line 是这条逻辑指令在原始脚本中的物理行号。
+            // 空行/注释/跨行引号/行末续行都只影响逻辑行的合并，不再影响行号，
+            // 因此上报给 UI 的行号与编辑器里看到的一致。
+            const lineNumber = entry.line;
+            const line = entry.text.trim();
 
             // 跳过空行和注释
             if (!line || line.startsWith('#')) {
@@ -232,16 +493,16 @@ export class GeometryDSLInterpreter {
             if (line.startsWith('[')) {
                 // 不允许在代码块中再包含代码块
                 if (!setLineNumber) {
-                    console.error(`Nested code blocks are not allowed at line ${i + 1}: ${line}`);
-                    this.state.onMessage?.('error', i + 1, `Nested code blocks are not allowed at line ${i + 1}: ${line}`);
+                    console.error(`Nested code blocks are not allowed at line ${lineNumber}: ${line}`);
+                    this.state.onMessage?.('error', lineNumber, `Nested code blocks are not allowed at line ${lineNumber}: ${line}`);
                 }
 
                 // 使用lastCodeName创建代码段
                 const code = line.slice(1).trim();
 
                 if (this.state.lastCodeName && code) {
-                    const command = this.parseLine(line, setLineNumber ? i + 1 : -1);
-                    this.addCommand(this.state.lastCodeName, line, command, i + 1);
+                    const command = this.parseLine(line, setLineNumber ? lineNumber : -1);
+                    this.addCommand(this.state.lastCodeName, line, command, lineNumber);
                 }
                 continue;
             } else if (line.endsWith(']')) {
@@ -253,19 +514,21 @@ export class GeometryDSLInterpreter {
             try {
                 if (this.state.lastCodeName) {
                     // 如果当前行在代码片段中，添加到当前代码片段
-                    const command = this.parseLine(line, setLineNumber ? i + 1 : -1);
-                    this.addCommand(this.state.lastCodeName, line, command, i + 1);
+                    const command = this.parseLine(line, setLineNumber ? lineNumber : -1);
+                    this.addCommand(this.state.lastCodeName, line, command, lineNumber);
                 } else {
-                    // 否则执行当前行指令
-                    const command = this.parseLine(line, setLineNumber ? i + 1 : -1);
+                    // 否则执行当前行指令，同时建立“对象名 -> 创建命令”的源代码映射。
+                    const command = this.parseLine(line, setLineNumber ? lineNumber : -1);
                     if (command) {
+                        this.state.topLevelCommands.push(command);
+                        this.recordSourceBinding(command);
                         this.executeCommand(command);
                     }
                 }
 
             } catch (error) {
-                console.error(`Error executing line ${i + 1}: ${line}`, error);
-                this.state.onMessage?.('error', i + 1, `Error executing line ${i + 1}: ${line} - ${error}`);
+                console.error(`Error executing line ${lineNumber}: ${line}`, error);
+                this.state.onMessage?.('error', lineNumber, `Error executing line ${lineNumber}: ${line} - ${error}`);
             }
         }
     }
@@ -274,36 +537,147 @@ export class GeometryDSLInterpreter {
     public execute(script: string): void {
         // 清空state中的命令和slot
         this.state.codes.clear();
-        // 清空动画计时器
-        this.state.animations.forEach((v, k) => {
-            if (v.animationTimer > 0) {
-                clearTimeout(v.animationTimer);
-                v.animationTimer = 0;
-            }
-        })
+        // 脚本重跑会重建全部动画，先停掉驱动循环，否则旧循环会继续空转。
+        this.cancelScheduledFrame();
         this.state.animations.clear();
         this.state.lastCodeName = undefined;
         this.state.objects.clear();
         this.state.slots.clear();
         this.state.functions.clear();
         this.state.variableInfo.clear();
+        this.state.sourceBindings.clear();
+        this.state.topLevelCommands = [];
+        this.state.textElements.clear();
+        this.state.pointSets.clear();
         this.state.labelHitRegions = [];
+        this.state.textHitRegions = [];
         this.state.renderedObjectNames = [];
+        // 对象被清空，上一轮收集的待绘对象与未解析的截止点引用也随之作废。
+        this.state.pendingDraws = [];
+        this.state.pendingCutResolutions.clear();
+        this.state.executeDepth = 0;
 
-        const lines = joinMultilineText(script).split('\n');
+        const lines = buildLogicalLines(script);
         this.executeLines(lines, true);
     }
 
-    public setTransform(canvas: HTMLCanvasElement, transform: { x: number; y: number; scale: number; }) {
+    public setTransform(canvas: HTMLCanvasElement, transform: { x: number; y: number; scale: number; rotation?: number }) {
         this.state.canvas = canvas;
 
+        // 记住外层矩阵的缩放，默认线宽靠它折算回恒定像素粗细。
+        // scale 为 0 / 非法时退回 1，避免后面算出 Infinity。
+        const scale = Number.isFinite(transform.scale) && Math.abs(transform.scale) > this.zeroThresholdValue
+            ? transform.scale
+            : 1;
+        this.state.outerScale = scale;
+        this.state.outerPanX = Number.isFinite(transform.x) ? transform.x : 0;
+        this.state.outerPanY = Number.isFinite(transform.y) ? transform.y : 0;
+        this.state.outerRotation = Number.isFinite(transform.rotation) ? (transform.rotation as number) : 0;
+
         // 计算变换以后左上角的坐标
-        this.state.defaultOptions.canvasX = -transform.x / transform.scale;
-        this.state.defaultOptions.canvasY = -transform.y / transform.scale;
+        this.state.defaultOptions.canvasX = -this.state.outerPanX / scale;
+        this.state.defaultOptions.canvasY = -this.state.outerPanY / scale;
 
         // 计算变换后的宽高
-        this.state.defaultOptions.width = canvas.width / transform.scale;
-        this.state.defaultOptions.height = canvas.height / transform.scale;
+        this.state.defaultOptions.width = canvas.width / scale;
+        this.state.defaultOptions.height = canvas.height / scale;
+    }
+
+    /**
+     * 脚本声明的视图旋转（弧度）。`VIEW rotation=` 的角度在这里换算一次，
+     * 其余地方一律用弧度，免得度/弧度在若干处反复来回换算而走偏。
+     */
+    private getDeclaredRotationRadians(): number {
+        const degrees = this.state.defaultOptions.rotation;
+        return Number.isFinite(degrees) ? degreesToRadians(degrees) : 0;
+    }
+
+    /** 总旋转角 = 脚本声明的 + 交互式拖拽的。渲染、命中、坐标反算必须共用这一个值。 */
+    private getTotalRotationRadians(interactiveRotation = 0): number {
+        return this.getDeclaredRotationRadians()
+            + (Number.isFinite(interactiveRotation) ? interactiveRotation : 0);
+    }
+
+    /**
+     * 当前可见区域在「渲染坐标」里的范围。
+     *
+     * - Canvas 路径：可见区就是外层矩阵的**变换前**范围 —— θ=0 时正是 setTransform 算好的
+     *   canvasX/canvasY/width/height；有旋转时把画布四角反旋转回变换前坐标再取包围盒。
+     * - SVG 路径：坐标已经是最终输出坐标，「可见区」是整块画布；有旋转时同样取包围盒。
+     *
+     * 有旋转时返回的是**轴对齐包围盒**，比真实可见区略大。这只影响无限长直线、射线、
+     * 坐标轴、网格往外延伸多远，不会把可见部分裁掉 —— 是刻意的保守取法。
+     */
+    private getVisibleViewRect(): { x: number; y: number; width: number; height: number } {
+        const opts = this.state.defaultOptions;
+        const canvas = this.state.canvas;
+        const width = canvas?.width || opts.width;
+        const height = canvas?.height || opts.height;
+        const angle = this.getTotalRotationRadians();
+
+        const aabb = (points: IPoint[]) => {
+            let minX = Infinity;
+            let minY = Infinity;
+            let maxX = -Infinity;
+            let maxY = -Infinity;
+            for (const point of points) {
+                minX = Math.min(minX, point.x);
+                minY = Math.min(minY, point.y);
+                maxX = Math.max(maxX, point.x);
+                maxY = Math.max(maxY, point.y);
+            }
+            return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+        };
+
+        if (!this.state.contextPreTransformed) {
+            if (!angle) return { x: 0, y: 0, width, height };
+            const pivot = viewPivot(width, height);
+            return aabb([
+                rotateAbout({ x: 0, y: 0 }, pivot, angle),
+                rotateAbout({ x: width, y: 0 }, pivot, angle),
+                rotateAbout({ x: 0, y: height }, pivot, angle),
+                rotateAbout({ x: width, y: height }, pivot, angle),
+            ]);
+        }
+
+        if (!angle) {
+            return { x: opts.canvasX, y: opts.canvasY, width: opts.width, height: opts.height };
+        }
+        const pivot = viewPivot(width, height);
+        const scale = this.state.outerScale;
+        return aabb([
+            { x: 0, y: 0 },
+            { x: width, y: 0 },
+            { x: 0, y: height },
+            { x: width, y: height },
+        ].map(corner => {
+            const unrotated = rotateAbout(corner, pivot, -angle);
+            return {
+                x: (unrotated.x - this.state.outerPanX) / scale,
+                y: (unrotated.y - this.state.outerPanY) / scale,
+            };
+        }));
+    }
+
+    /**
+     * 把画布外层矩阵（平移 / 缩放 / 旋转）写进 ctx。
+     *
+     * 为什么由解释器来做、而不是让调用方在 setTransform 时设好：
+     * 总旋转角要同时叠加 `VIEW rotation=`（脚本里）和交互式旋转（画布组件里），
+     * 两边各持一半，只有解释器两边都看得到。脚本里改一次 VIEW，这里下一帧就是对的，
+     * 不会出现「画布算好矩阵之后脚本才改旋转」的一帧错位。
+     */
+    private applyCanvasViewTransform(): void {
+        const ctx = this.state.ctx;
+        const canvas = this.state.canvas;
+        if (!ctx || !canvas || !this.state.contextPreTransformed) return;
+        const matrix = buildCanvasMatrix({
+            x: this.state.outerPanX,
+            y: this.state.outerPanY,
+            scale: this.state.outerScale,
+            rotation: this.state.outerRotation,
+        }, canvas.width, canvas.height, this.getDeclaredRotationRadians());
+        ctx.setTransform(matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5]);
     }
 
     // 设置视图中心的逻辑坐标（供 SVG 导出等非交互渲染使用）
@@ -322,13 +696,15 @@ export class GeometryDSLInterpreter {
 
     // 设置 SVG 等无预置 Canvas 变换场景的额外渲染变换。
     // Canvas 模式保持默认值（1, 0, 0），由 ctx.setTransform 提供缩放和平移。
-    public setRenderTransform(transform: { scale: number; offsetX: number; offsetY: number }): void {
+    public setRenderTransform(transform: { scale: number; offsetX: number; offsetY: number; rotation?: number }): void {
         const scale = Number.isFinite(transform.scale) && Math.abs(transform.scale) > this.zeroThresholdValue
             ? transform.scale
             : 1;
         this.state.renderScale = scale;
         this.state.renderOffsetX = Number.isFinite(transform.offsetX) ? transform.offsetX : 0;
         this.state.renderOffsetY = Number.isFinite(transform.offsetY) ? transform.offsetY : 0;
+        // SVG 导出没有外层矩阵，交互式旋转只能在这里并入坐标。
+        this.state.renderRotation = Number.isFinite(transform.rotation) ? (transform.rotation as number) : 0;
 
         // 外部变换由解释器直接应用时，绘制坐标已经是 SVG/屏幕坐标；
         // 可视区域和 CLEAR 背景都应覆盖完整的虚拟画布。
@@ -360,9 +736,26 @@ export class GeometryDSLInterpreter {
         );
     }
 
-    // 导出等离线场景可以关闭自动计时器，再通过 stepAnimation 逐帧采样
+    // 导出等离线场景可以关闭自动播放，再通过 stepAnimation 逐帧采样
     public setAnimationAutoStart(autoStart: boolean): void {
         this.state.animationAutoStart = autoStart;
+        if (autoStart) {
+            // 打开时若已有动画在跑，立刻接管驱动；离线导出场景此时还没有动画，不会启动。
+            if (Array.from(this.state.animations.values()).some(animation => animation.isRunning)) {
+                this.startAnimationLoop();
+            }
+        } else {
+            this.cancelScheduledFrame();
+        }
+    }
+
+    // 停掉驱动循环并结束所有动画。
+    // 组件卸载 / 丢弃解释器实例时调用：否则 rAF 循环会继续对已经脱离文档的 canvas 绘制。
+    public dispose(): void {
+        this.cancelScheduledFrame();
+        for (const animation of this.state.animations.values()) {
+            animation.isRunning = false;
+        }
     }
 
     public setFrozenRandomVariables(values: Record<string, number>): void {
@@ -376,8 +769,12 @@ export class GeometryDSLInterpreter {
     public getVariables(): VariableInfo[] {
         const variables = Array.from(this.state.variableInfo.values()).map(variable => ({ ...variable }));
         const objects = Array.from(this.state.objects.values()).map(object => {
-            const frozen = this.state.frozenRandomObjects.has(object.name);
             const randomSource = this.state.randomObjectSources.get(object.name);
+            const pointFrozen = object.type === 'point' && (object as Point).frozen === true;
+            // 随机对象用「冻结当前坐标」那套；普通点用脚本里的 frozen 属性。
+            const frozen = randomSource
+                ? this.state.frozenRandomObjects.has(object.name)
+                : pointFrozen;
             return {
                 name: object.name,
                 expression: randomSource || object.type,
@@ -387,10 +784,266 @@ export class GeometryDSLInterpreter {
                 objectType: object.type,
                 randomObject: Boolean(randomSource),
                 randomSource,
+                pointFrozen,
+                lineNumber: this.getSourceLineForObject(object.name) ?? undefined,
                 details: this.getObjectDetails(object),
+                editableProperties: this.getEditableObjectProperties(object.name),
+                editableCutPoints: this.getEditableCutPoints(object.name),
+                editableLabel: this.getEditableLabel(object.name),
             };
         });
-        return [...variables, ...objects];
+        const texts = Array.from(this.state.textElements.values()).map(text => ({
+            name: text.name,
+            expression: 'TEXT',
+            value: 'text',
+            kind: 'object' as const,
+            frozen: false,
+            objectType: 'text',
+            lineNumber: this.getSourceLineForObject(text.name) ?? undefined,
+            details: {
+                type: 'text',
+                'position.x': this.formatObjectNumber(text.x),
+                'position.y': this.formatObjectNumber(text.y),
+                text: text.text,
+            },
+            editableProperties: this.getEditableObjectProperties(text.name),
+        }));
+        return [...variables, ...objects, ...texts];
+    }
+
+    /**
+     * 渲染时在内存里维护的“代码行 <-> 对象”映射：
+     * 返回该对象创建指令在原始脚本中的真实物理行号（1-based）。
+     * 空行、注释、跨行引号值和行末续行都不会影响这个行号。
+     */
+    public getSourceLineForObject(name: string): number | null {
+        const binding = this.state.sourceBindings.get(name);
+        if (!binding || !(binding.lineNumber > 0)) return null;
+        return binding.lineNumber;
+    }
+
+    /**
+     * 顶层指令（CODE 块里的除外）的解析结果，供**脚本改写**使用。
+     *
+     * 删除对象、把直线/射线裁剪成线段，这两件事都是「改写脚本」而不是「追加指令」，
+     * 需要知道每条指令定义或引用了哪些对象。这里直接交出解释器已经解析好的参数表，
+     * 免得再写第二个手写参数扫描器 —— `parseParameters` 那套引号 / 空值 / 行尾注释
+     * 规则很容易抄错，而抄错的后果是改坏用户的脚本。
+     *
+     * 只收顶层指令：CODE 块里的对象没有稳定的源码行，本来也不该被脚本改写碰到。
+     */
+    public getTopLevelCommands(): ReadonlyArray<TopLevelCommandInfo> {
+        return this.state.topLevelCommands.map(entry => ({
+            command: entry.command,
+            type: entry.type,
+            // 复制一份，调用方拿去做字符串拼接，别让它有机会改到解释器的内部状态。
+            params: new Map(entry.params),
+            lineNumber: entry.lineNumber,
+        }));
+    }
+
+    public getEditableObjectProperties(name: string): EditableObjectProperty[] {
+        const binding = this.state.sourceBindings.get(name);
+        if (!binding) return [];
+
+        const command = binding.command.command.toUpperCase();
+        const propertyKeys: Array<{ key: ObjectPropertyKey; label: string; aliases: string[] }> =
+            command === 'TEXT'
+                ? [
+                    { key: 'x', label: '位置 X', aliases: ['x'] },
+                    { key: 'y', label: '位置 Y', aliases: ['y'] },
+                ]
+                : command === 'POINT'
+                ? [
+                    { key: 'x', label: '位置 X', aliases: ['x'] },
+                    { key: 'y', label: '位置 Y', aliases: ['y'] },
+                    { key: 'radius', label: '半径', aliases: ['radius', 'r'] },
+                ]
+                : command === 'CIRCLE'
+                    ? [{ key: 'radius', label: '半径', aliases: ['radius', 'r'] }]
+                    : command === 'ELLIPSE'
+                        ? [
+                            { key: 'radiusX', label: '半径 X', aliases: ['radiusX', 'rx'] },
+                            { key: 'radiusY', label: '半径 Y', aliases: ['radiusY', 'ry'] },
+                            { key: 'rotation', label: '旋转角', aliases: ['rotation', 'angle'] },
+                        ]
+                        : command === 'RECTANGLE'
+                            ? [
+                                { key: 'width', label: '宽度', aliases: ['width', 'w'] },
+                                { key: 'height', label: '高度', aliases: ['height', 'h'] },
+                            ]
+                            : [];
+
+        return propertyKeys.flatMap(({ key, label, aliases }) => {
+            const raw = aliases.map(alias => binding.command.params.get(alias)).find(value => value !== undefined);
+            const value = raw === undefined ? undefined : Number(raw);
+            if (value === undefined || !Number.isFinite(value)) return [];
+            const isLiteral = this.isLiteralNumber(raw!);
+            return [{
+                key,
+                label,
+                value: this.getPreviewProperty(name, key) ?? value,
+                lineNumber: binding.lineNumber,
+                editable: isLiteral,
+                reason: isLiteral ? undefined : '该属性由槽位或表达式驱动，请先在代码中改为数值。',
+            }];
+        });
+    }
+
+    /**
+     * 线性对象的截止点属性（供属性面板显示 / 编辑）。
+     *
+     * 只在「这条线的定义指令确实支持 `cutPoints`」时返回。画布上还有大量线性对象
+     * 来自 CODE 块或内部构造（`L_pb_<mid>` 这类合成点），它们没有稳定的源码行，
+     * 改定义行没有意义，所以直接不显示。
+     */
+    public getEditableCutPoints(name: string): EditableCutPointsProperty | undefined {
+        const object = this.state.objects.get(name);
+        if (!(object instanceof LinearObject)) return undefined;
+        const binding = this.state.sourceBindings.get(name);
+        if (!binding || !LINEAR_CUT_COMMANDS.has(binding.command.command.toUpperCase())) return undefined;
+
+        // 优先显示脚本里原本写的那串：它可能引用了还没定义的点（这种引用不会进 cutPoints），
+        // 按解析结果重建会把那部分悄悄丢掉，用户一改就把代码里的写法覆盖没了。
+        const raw = binding.command.params.get('cutPoints')
+            ?? binding.command.params.get('cutoffPoints')
+            ?? binding.command.params.get('cuts');
+
+        return {
+            label: '截止点',
+            value: raw !== undefined
+                ? raw.trim()
+                : object.cutPoints.map(formatLinearCutPoint).join(','),
+            lineNumber: binding.lineNumber,
+            editable: true,
+            reason: '写 +A 隐藏 A 的正方向一侧，写 -A 隐藏负方向一侧；-A,+B 把直线截成线段 [A,B]',
+        };
+    }
+
+    /**
+     * 找出「这个对象的标签该挂在哪儿」。
+     *
+     * 标签是样式，跟着真正把对象画出来的指令走：
+     *   1. 定义行自己就画（`draw=true`）→ 定义行；
+     *   2. 否则找把它画出来的 `DRAW obj=X`（`DRAW obj=A,B` 要拆开比）→ 那一条 DRAW；
+     *   3. 都没有 → 对象根本没画出来，标签挂哪儿都不会显示，返回 null。
+     *
+     * 读和写必须用同一个来源：如果显示时读定义行、写回时写到 DRAW 行，用户就会看到
+     * 「面板里明明写着 A，画布上却是 B」，看起来完全像个 bug。
+     */
+    private resolveLabelSource(name: string): { lineNumber: number; params: Map<string, string>; onDrawLine: boolean } | null {
+        const binding = this.state.sourceBindings.get(name);
+        if (!binding) return null;
+
+        if ((binding.command.params.get('draw') ?? '').toLowerCase() === 'true') {
+            return { lineNumber: binding.lineNumber, params: binding.command.params, onDrawLine: false };
+        }
+
+        for (const entry of this.state.topLevelCommands) {
+            if (entry.command.toUpperCase() !== 'DRAW') continue;
+            const target = entry.params.get('obj') ?? entry.params.get('o');
+            if (!target) continue;
+            if (target.split(',').some(item => item.trim() === name)) {
+                return { lineNumber: entry.lineNumber, params: entry.params, onDrawLine: true };
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 对象的标签属性（供属性面板显示 / 编辑）。
+     *
+     * 只在「这个对象确实被画出来了」时给编辑入口 —— 画都没画出来，标签写哪儿都不会
+     * 显示，给一个能改的输入框只会让人以为坏了。这种情况仍然返回一条记录，
+     * 把原因写在 reason 里，面板据此把输入框置灰。
+     */
+    public getEditableLabel(name: string): EditableLabelProperty | undefined {
+        // TEXT 的文字内容就是它自己，没有「标签」这个概念；内部合成的点也没有源码行。
+        if (!this.state.objects.has(name)) return undefined;
+        const binding = this.state.sourceBindings.get(name);
+        if (!binding) return undefined;
+
+        const source = this.resolveLabelSource(name);
+        if (!source) {
+            return {
+                label: '标签',
+                value: '',
+                lineNumber: binding.lineNumber,
+                editable: false,
+                reason: '这个对象还没有被画出来（定义行没有 draw=true，也没有 DRAW 指令），先让它出现在图上再设标签。',
+            };
+        }
+
+        // `l` 只在 DRAW 行上当标签别名：定义行上 `l` 在 PERPENDICULAR_FOOT / REGION
+        // 里是「线」的意思，读错了会把线名当成标签显示出来。
+        const value = source.params.get('label')
+            ?? (source.onDrawLine ? source.params.get('l') : undefined)
+            ?? '';
+
+        return {
+            label: '标签',
+            value,
+            lineNumber: source.lineNumber,
+            editable: true,
+            reason: '留空表示不显示标签。标签写在脚本的 label= 上，可以写中文或 $LaTeX$。',
+        };
+    }
+
+    public getEditableElementPosition(name: string): { type: string; x: number; y: number; frozen: boolean } | null {
+        const object = this.state.objects.get(name);
+        if (object && typeof (object as any).x === 'number' && typeof (object as any).y === 'number') {
+            return {
+                type: object.type,
+                x: this.getPreviewProperty(name, 'x') ?? (object as any).x,
+                y: this.getPreviewProperty(name, 'y') ?? (object as any).y,
+                frozen: this.isObjectFrozen(name),
+            };
+        }
+        const text = this.state.textElements.get(name);
+        if (text) {
+            return {
+                type: 'text',
+                x: this.getPreviewProperty(name, 'x') ?? text.x,
+                y: this.getPreviewProperty(name, 'y') ?? text.y,
+                frozen: false,
+            };
+        }
+        return null;
+    }
+
+    /**
+     * 该对象是否被冻结、禁止在画布上拖动。
+     * 目前只有 POINT 支持 `frozen=true`；其它类型和解释器自动生成的点都是 false。
+     */
+    public isObjectFrozen(name: string): boolean {
+        const object = this.state.objects.get(name);
+        return object?.type === 'point' && (object as Point).frozen === true;
+    }
+
+    public previewObjectPropertyChange(name: string, key: ObjectPropertyKey, value: number): boolean {
+        if (!Number.isFinite(value)) return false;
+        const editable = this.getEditableObjectProperties(name).find(property => property.key === key);
+        if (!editable?.editable) return false;
+        let properties = this.state.previewObjectProperties.get(name);
+        if (!properties) {
+            properties = new Map();
+            this.state.previewObjectProperties.set(name, properties);
+        }
+        properties.set(key, value);
+        return true;
+    }
+
+    public clearPreviewObjectProperties(name?: string): void {
+        if (name) this.state.previewObjectProperties.delete(name);
+        else this.state.previewObjectProperties.clear();
+    }
+
+    private getPreviewProperty(name: string, key: ObjectPropertyKey): number | undefined {
+        return this.state.previewObjectProperties.get(name)?.get(key);
+    }
+
+    private isLiteralNumber(value: string): boolean {
+        return /^[-+]?(?:\d+\.?\d*|\.\d+)$/.test(value.trim());
     }
 
     public setRandomObjectFrozen(name: string, frozen: boolean): void {
@@ -410,10 +1063,14 @@ export class GeometryDSLInterpreter {
         return Object.fromEntries(this.state.frozenRandomObjects.entries());
     }
 
+    private formatObjectNumber(value: number): string {
+        return Number(value.toFixed(6)).toString();
+    }
+
     private getObjectDetails(object: GeometricObject): Record<string, string> {
         const details: Record<string, string> = { type: object.type };
         const candidate = object as any;
-        const format = (value: number): string => Number(value.toFixed(6)).toString();
+        const format = (value: number): string => this.formatObjectNumber(value);
         const pointDetails = (prefix: string, point: { x: number; y: number } | undefined) => {
             if (point) {
                 details[`${prefix}.x`] = format(point.x);
@@ -425,6 +1082,8 @@ export class GeometryDSLInterpreter {
             pointDetails('position', candidate);
             if (typeof candidate.radius === 'number') details.radius = format(candidate.radius);
             if (typeof candidate.real === 'boolean') details.real = String(candidate.real);
+            // 只有 POINT 有这个字段，所以其它对象不会多出一行噪声。
+            if (typeof candidate.frozen === 'boolean') details.frozen = String(candidate.frozen);
         }
         if (candidate.center) pointDetails('center', candidate.center);
         if (typeof candidate.radius === 'number') details.radius = format(candidate.radius);
@@ -492,11 +1151,13 @@ export class GeometryDSLInterpreter {
     }
 
     private isMetaCommand(cmd: string, includeCreate: boolean = false): boolean {
-        const metaCommands = ['CLEAR', 'SET', 'HELP', 'VIEW', 'TRANSLATE', 'DRAW', 'TEXT', 'FILL', 'MEASURE', 'RUN', 'CODE', 'WITH', 'CALCULATE', 'GETOBJ', 'PRINT', 'MESSAGE'];
-        if (includeCreate) {
-            metaCommands.push('CREATE');
-        }
-        return metaCommands.includes(cmd.toUpperCase());
+        // 清单只有一份，见 dslCommandNames.ts（以前这里和 HelpCommand 各存一份，漂移过）。
+        // `WITHRUN`（WITH 的历史别名）和 `MESSAGE`（PRINT 的别名）也在里面 ——
+        // 它们和主名字共用同一段实现，漏掉就会被当成几何指令报 "Unknown geometric command"。
+        const upper = cmd.toUpperCase();
+        // `CREATE` 只在允许它出现的位置才算元指令：`CREATE <几何指令>` 走的是几何分支。
+        if (upper === 'CREATE') return includeCreate;
+        return isMetaCommandName(upper);
     }
 
     // 解析单行指令
@@ -506,11 +1167,12 @@ export class GeometryDSLInterpreter {
             line = line.trim();
             if (!line) return null;
 
-            // 去掉# 后面的内容
-            const commentIndex = line.indexOf('#');
-            if (commentIndex !== -1) {
-                line = line.substring(0, commentIndex);
-                line = line.trim();
+            // 去掉注释，但不能把颜色值中的 # 当成注释：
+            // `color=#eeeeee` 中的 # 位于参数值内，只有行首或空白后的 # 才是注释起点。
+            const commentMatch = /(^|\s)#/.exec(line);
+            if (commentMatch) {
+                const commentIndex = commentMatch.index + commentMatch[1].length;
+                line = line.substring(0, commentIndex).trim();
                 if (!line) return null;
             }
 
@@ -535,6 +1197,16 @@ export class GeometryDSLInterpreter {
                 const secondPart = parts[1].toUpperCase();
                 if (!secondPart) {
                     return null;
+                }
+                // 指令名只可能是 [A-Z_]，绝不会含 `=`。所以第二段带 `=` 就说明这一行
+                // 不是 `<CREATE> <几何指令> ...` 的形状，直接取 parts[1] 会把**参数**当成
+                // 指令名（`FOOBAR x=1` 报 "Unknown geometric command: X=1"，完全看不出问题在哪）。
+                // 这里改成报第一个词，并区分两种常见写法错误。
+                if (secondPart.includes('=')) {
+                    throw new Error(isGeometricCommandName(firstPart)
+                        // 例如 `POINT name=A x=0 y=0` 漏了 CREATE
+                        ? `几何指令 ${firstPart} 必须写在 CREATE 之后, 例如 "CREATE ${firstPart} ..."`
+                        : `未知指令: ${firstPart}（几何指令需写在 CREATE 之后）`);
                 }
                 command = secondPart;
                 paramString = parts.slice(2).join(' ');
@@ -643,6 +1315,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
     // 执行解析后的指令
     private executeCommand(command: ParsedCommand): void {
+        this.state.currentCommandLine = command.lineNumber;
         if (command.type === 'meta') {
             this.executeMetaCommand(command.command.toUpperCase(), command.params, command.rawCommand, command.lineNumber);
         } else {
@@ -683,6 +1356,7 @@ private parseParameters(paramString: string): Map<string, string> {
             case 'CODE':
                 this.createCodeBlock(params);
                 break;
+            case 'WITH':
             case 'WITHRUN':
                 this.executeWithRun(params);
                 break;
@@ -731,11 +1405,14 @@ private parseParameters(paramString: string): Map<string, string> {
             case 'INTERSECT':
                 this.createIntersection(params);
                 break;
-            case 'ANGLEINTERSECT':
-                this.createAngleIntersection(params);
-                break;
             case 'POINT_ON_LINE':
                 this.createPointOnLine(params);
+                break;
+            case 'POINT_ON_CIRCLE':
+                this.createPointOnCircle(params);
+                break;
+            case 'CIRCLE_CENTER':
+                this.createCircleCenter(params);
                 break;
             case 'PERP_BISECTOR':
                 this.createPerpBisector(params);
@@ -760,6 +1437,15 @@ private parseParameters(paramString: string): Map<string, string> {
                 break;
             case 'POLYGON':
                 this.createPolygon(params);
+                break;
+            case 'POINTSET':
+                this.createPointSet(params);
+                break;
+            case 'AXIS':
+                this.createAxis(params);
+                break;
+            case 'GRID':
+                this.createGrid(params);
                 break;
             case 'REGION':
                 this.createRegion(params);
@@ -811,7 +1497,10 @@ private parseParameters(paramString: string): Map<string, string> {
     // 元指令清空画板
     private executeClear(params: Map<string, string>): void {
         const color = this.parseColor(params, 'color') || this.parseColor(params, 'c') || this.state.defaultOptions.penColor;
-        const geoColor = this.parseColor(params, 'getColor') || this.parseColor(params, 'g') || this.state.defaultOptions.geoColor;
+        // `geoColor` 以前写成了 `getColor`（拼写错误），于是 HELP 和文档都推荐的
+        // `CLEAR geoColor=red` 被静默忽略，只有别名 `g=` 生效。`getColor` 在仓库里
+        // 没有任何使用处，所以直接改名，不保留这个错拼的别名。
+        const geoColor = this.parseColor(params, 'geoColor') || this.parseColor(params, 'g') || this.state.defaultOptions.geoColor;
         const labelColor = this.parseColor(params, 'labelColor') || this.parseColor(params, 'l') || this.state.defaultOptions.labelColor;
 
         // 确认我们有 canvas 的 2D 渲染上下文 (context)
@@ -837,6 +1526,17 @@ private parseParameters(paramString: string): Map<string, string> {
             // 4. 恢复之前保存的 canvas 状态 (可选，但推荐)
             ctx.restore();
         }
+
+        // CLEAR 抹掉了整块画布，上一轮登记的标签/文字命中区域和绘制顺序也随之失效。
+        // 动画每帧都是「CLEAR + 重画」，不在这里清理会让这三个列表随帧数无限增长，
+        // 既拖慢命中检测，又会留下已经看不见的「幽灵」标签可被点选。
+        this.state.labelHitRegions = [];
+        this.state.textHitRegions = [];
+        this.state.renderedObjectNames = [];
+        // 收集到的待绘对象同理：CLEAR 把它们连同画布一起抹掉，
+        // 否则「先建对象再 CLEAR」的脚本会在清屏之后把它们又画回来。
+        this.state.pendingDraws = [];
+        this.state.pendingCutResolutions.clear();
     }
 
     // 设置属性
@@ -886,24 +1586,34 @@ private parseParameters(paramString: string): Map<string, string> {
                 case 'drawlabelforothers':
                     this.state.defaultOptions.drawLabelForOthers = GeometryDSLInterpreter.parseBoolean(value);
                     break;
-                case 'drawaftercreate':
-                    this.state.defaultOptions.drawAfterCreate = GeometryDSLInterpreter.parseBoolean(value);
-                    break;
                 case 'linelength':
                 case 'linelen':
                     this.state.defaultOptions.lineLength = this.parseLineLength(params, value);
                     break;
                 case 'geocolor':
+                // help 里一直写着 `geoColor/defaultGeoColor` 两个名字，但只实现了前者，
+                // 于是 `SET item=defaultGeoColor ...` 会抛 Unknown setting item。补上别名。
+                case 'defaultgeocolor':
                     this.state.defaultOptions.geoColor = value;
                     break;
+                // 这两个以前写的是 canvasX / canvasY —— 那是**由画布外层变换推导出来的**
+                // 可视矩形原点（见 setTransform / setRenderTransform），不是视图中心，
+                // 而且每次重算都会被覆盖。文档写的是「视图中心X/Y坐标」，`SET scale` 也确实
+                // 写的是 scale，所以这里应当和 VIEW centerX/centerY 落到同一个字段。
                 case 'centerx':
-                    this.state.defaultOptions.canvasX = parseFloat(value);
+                    this.state.defaultOptions.centerX = parseFloat(value);
                     break;
                 case 'centery':
-                    this.state.defaultOptions.canvasY = parseFloat(value);
+                    this.state.defaultOptions.centerY = parseFloat(value);
                     break;
                 case 'scale':
                     this.state.defaultOptions.scale = parseFloat(value);
+                    break;
+                // 视图旋转（度），与 `VIEW rotation=` 落到同一个字段。
+                case 'rotation':
+                case 'rotate':
+                case 'angle':
+                    this.state.defaultOptions.rotation = parseFloat(value);
                     break;
 
                 default:
@@ -990,19 +1700,65 @@ private parseParameters(paramString: string): Map<string, string> {
             }
             this.state.defaultOptions.scale = scale;
         }
+        // 视图旋转：绕画布中心转，单位是**度**（正值 = 屏幕上顺时针），与 scale 同级。
+        // `angle` 是等价别名，方便手写脚本时少查一次参数名。
+        if (params.has('rotation') || params.has('rotate') || params.has('angle')) {
+            const rotation = this.getNumberValue(params, 'rotation')
+                ?? this.getNumberValue(params, 'rotate')
+                ?? this.getNumberValue(params, 'angle');
+            if (rotation === undefined || !Number.isFinite(rotation)) {
+                throw new Error('VIEW command requires rotation parameter');
+            }
+            this.state.defaultOptions.rotation = rotation;
+        }
     }
 
     private drawObject(ctx: CanvasRenderingContext2D, params: Map<string, string>, obj: GeometricObject, label: string | undefined): void {
         // 记录实际绘制顺序，命中检测时让视觉上层的对象优先。
         this.state.renderedObjectNames.push(obj.name);
 
+        // 「绘制坐标 -> 最终屏幕像素」的倍率，只用来折算默认线宽/点半径。
+        // Canvas：坐标还要经过外层 ctx.setTransform，所以倍率是那个矩阵的缩放；
+        // SVG：viewBox 与画布同尺寸，1 用户单位就是 1 像素，倍率恒为 1。
+        // 注意不能用下面的 transform.scale —— 它含 VIEW scale，而 VIEW scale 已经烘进坐标里了。
+        const pixelScale = this.state.contextPreTransformed ? this.state.outerScale : 1;
+
         // 解析绘制选项
         const options: DrawOptions = {};
-        if (params.has('color')) options.color = this.parseColor(params, 'color') || this.parseColor(params, 'c') || this.state.defaultOptions.geoColor;
-        if (params.has('width')) options.lineWidth = this.getNumberValue(params, 'width') || this.getNumberValue(params, 'w') || 1; // 默认线宽为1
+        if (params.has('color')) {
+            options.color = this.parseColor(params, 'color') || this.parseColor(params, 'c') || this.state.defaultOptions.geoColor;
+        } else {
+            // 没写 `color=` 就用 `CLEAR geoColor=` / `SET item=geoColor` 设的默认几何色。
+            // 几何类里取色的写法是 `options?.color || 'black'`，而默认 geoColor 恰好也是 'black'，
+            // 所以**不设 geoColor 时与「根本不传 color」渲染完全相同**（逐字节可验）。
+            // 以前这里只在写了 `color=` 时才赋值，于是 HELP 承诺的
+            // 「geoColor: 后续几何图形的默认颜色」其实从没生效过。
+            options.color = this.state.defaultOptions.geoColor;
+        }
+        if (params.has('width')) {
+            options.lineWidth = this.getNumberValue(params, 'width') || this.getNumberValue(params, 'w') || 1; // 默认线宽为1
+        } else {
+            // 没写 width= 就用 `SET item=penSize` 的默认线宽。
+            // penSize 与默认线宽同口径（**屏幕像素**），而 options.lineWidth 是逻辑单位、
+            // 会被外层变换按 pixelScale 放大，所以这里先折回逻辑单位，画出来才是恒定的 penSize 像素。
+            // 默认 penSize=1 与 DEFAULT_LINE_WIDTH_PIXELS 相同 → 不设 SET 时行为完全不变。
+            options.lineWidth = this.state.defaultOptions.penSize / Math.max(Math.abs(pixelScale), 1e-6);
+        }
         if (params.has('fill')) options.fillColor = this.parseColor(params, 'fill') || this.parseColor(params, 'f') || this.state.defaultOptions.backgroundColor;
+        // 没写 radius= 的点用它当默认半径（屏幕像素）。命中检测必须用同一个值，
+        // 否则「点画多大」和「点多容易被点中」会对不上（见 hitTestSelection）。
+        options.defaultPointRadiusPixels = this.state.defaultOptions.pointRadius;
+        // 虚线样式有三种写法，都要认：
+        //   style=dashed / s=dashed  —— HELP 里主推的写法；
+        //   dashed=true / dash=true  —— AXIS/GRID 用的是这个布尔形式，用户很自然会照搬到这里，
+        //                               以前这里只认 style，于是 `CREATE CIRCUMCIRCLE ... dashed=true`
+        //                               被静默忽略、圆画成实线。
+        // dashed=false 显式关掉，覆盖可能同时出现的 style=dashed。
         if (params.has('style') && params.get('style') === 'dashed') options.dashed = true;
         if (params.has('s') && params.get('s') === 'dashed') options.dashed = true;
+        if (params.has('dashed') || params.has('dash')) {
+            options.dashed = this.getBooleanParam(params, false, 'dashed', 'dash');
+        }
         const isObjectSelected = this.state.selectedObjectNames.has(obj.name)
             || this.state.selectedObjectName === obj.name;
         if (isObjectSelected) {
@@ -1018,35 +1774,32 @@ private parseParameters(paramString: string): Map<string, string> {
         if (this.state.defaultOptions.lineLength != null) {
             options.length = this.state.defaultOptions.lineLength;
         }
-        // 可视区域（画布坐标），供直线/射线裁剪使用
-        options.visibleRect = {
-            x: this.state.defaultOptions.canvasX,
-            y: this.state.defaultOptions.canvasY,
-            width: this.state.defaultOptions.width,
-            height: this.state.defaultOptions.height,
-        };
+        // 可视区域（画布坐标），供直线/射线裁剪使用。
+        // 有视图旋转时这里返回旋转后矩形的包围盒（略大），只影响线往画布外多画一点。
+        options.visibleRect = this.getVisibleViewRect();
 
         // 计算变换参数。Canvas 的外层缩放/平移由 ctx.setTransform 提供；
         // SVG 导出没有这个外层矩阵，因此由 renderScale/renderOffset 直接合并进来。
-        const viewScale = this.state.defaultOptions.scale;
-        const baseOffsetX = this.state.canvas!.width / 2 - this.state.defaultOptions.centerX * viewScale;
-        const baseOffsetY = this.state.canvas!.height / 2 - this.state.defaultOptions.centerY * viewScale;
-        const transform = {
-            scale: this.state.renderScale * viewScale,
-            offsetX: this.state.renderScale * baseOffsetX + this.state.renderOffsetX,
-            offsetY: this.state.renderScale * baseOffsetY + this.state.renderOffsetY
-        };
+        const transform = this.getTextRenderTransform(pixelScale);
 
         obj.draw(ctx, transform, options);
 
-        // 处理标签
-        if (label != null || params.has('label') || params.has('l')) {
-            const _label = label || params.get('label') || params.get('l');
+        // 处理标签。**总开关放在这里**，不要在 collectDraw 里再判一次 ——
+        // 两处各写一份条件迟早会走偏。点看 `drawLabelForPoints`，其它对象看 `drawLabelForOthers`。
+        //
+        // 标签有两个显式来源：创建行上的 `label=`，以及 `DRAW obj=X label=Y` 上的。
+        // 空串当作「没有标签」，这样面板里把标签清空就是真的不显示。
+        // **不再回落到对象名** —— 名字是给引用用的标识符，不是给用户看的文字。
+        const autoLabel = obj instanceof Point
+            ? this.state.defaultOptions.drawLabelForPoints
+            : this.state.defaultOptions.drawLabelForOthers;
+        const explicitLabel = label ?? params.get('label') ?? params.get('l');
+        if (autoLabel && explicitLabel != null && explicitLabel !== '') {
             // 标签与几何对象一样，都需要完整的逻辑坐标到画布坐标换算。
             // Canvas 的 ctx 只预置了拖拽平移/缩放，不包含 centerX/centerY 的视图偏移；
             // SVG 上下文也没有预置变换，因此两种渲染路径都传入完整 transform。
             const labelId = `label:${obj.name}:${this.state.labelHitRegions.length}`;
-            this.drawLabel(obj, _label!, params, transform, labelId);
+            this.drawLabel(obj, explicitLabel, params, transform, labelId);
         }
     }
 
@@ -1067,6 +1820,19 @@ private parseParameters(paramString: string): Map<string, string> {
 
             if (!this.state.ctx) {
                 throw new Error('No canvas context available for drawing');
+            }
+
+            // `DRAW obj=X` 一般就是「显式、带样式、画在这个位置」，按原样立即绘制。
+            // 但有两种情况不能在这里画：
+            //   1) 它已经在待绘队列里（create 上写了 draw=true）—— 再画一次的话，
+            //      最后统一绘制的那一次会盖在上面，`DRAW` 指定的样式反而失效。
+            //      所以只把这次的样式并到队列项上，位置仍是创建顺序里的位置。
+            //   2) 它的截止点还没解析出来（引用的点还没建）—— 「还没准备好」，
+            //      现在画就是整条，而画布只增不减、之后盖不掉。并入待绘队列等冲刷。
+            const queued = this.state.pendingDraws.some(entry => entry.object === obj);
+            if (queued || this.state.pendingCutResolutions.has(name)) {
+                this.mergePendingDraw(params, obj, undefined);
+                continue;
             }
 
             this.drawObject(this.state.ctx, params, obj, undefined);
@@ -1107,6 +1873,15 @@ private parseParameters(paramString: string): Map<string, string> {
             if (!(obj instanceof Polygon || obj instanceof CircularRegion || obj instanceof CurveCircleRegion || obj instanceof Circle || obj instanceof Ellipse)) {
                 throw new Error(`FILL only supports closed objects: region, circular-region, curve-circle-region, polygon, triangle, rectangle, circle, or ellipse. Object ${name} is ${obj.type}`);
             }
+
+            // 对象写了 draw=true、还排在待绘队列里没画。这里立即画的话，末尾统一绘制
+            // 那一次会用 create 时的样式（没有 fill、color 也回落到默认黑）盖上去，
+            // `FILL` 的填充和 borderColor 就被吃掉了。并进队列项，等统一绘制一次画对。
+            if (this.state.pendingDraws.some(entry => entry.object === obj)) {
+                this.mergePendingDraw(drawParams, obj, undefined);
+                continue;
+            }
+
             this.drawObject(this.state.ctx, drawParams, obj, undefined);
         }
     }
@@ -1315,7 +2090,7 @@ private parseParameters(paramString: string): Map<string, string> {
         }
 
         // 执行代码片段
-        this.executeLines(commands.map(x => x.rawCommand), false);
+        this.executeLines(toLogicalLines(commands), false);
     }
 
     // 创建代码块
@@ -1350,7 +2125,7 @@ private parseParameters(paramString: string): Map<string, string> {
         }
 
         // 执行代码片段
-        this.executeLines(commands.map(x => x.rawCommand), false);
+        this.executeLines(toLogicalLines(commands), false);
     }
 
     /**
@@ -1472,8 +2247,9 @@ private parseParameters(paramString: string): Map<string, string> {
     private executeText(params: Map<string, string>, rawCommand: string, lineNumber: number): void {
         if (!this.state.ctx || !this.state.canvas) return;
 
-        const x = this.getNumberValue(params, 'x');
-        const y = this.getNumberValue(params, 'y');
+        const textObjectName = this.getTextObjectName(params, lineNumber);
+        const x = this.getPreviewProperty(textObjectName, 'x') ?? this.getNumberValue(params, 'x');
+        const y = this.getPreviewProperty(textObjectName, 'y') ?? this.getNumberValue(params, 'y');
         if (x === undefined || y === undefined) {
             throw new Error('TEXT command requires x and y parameters');
         }
@@ -1499,9 +2275,12 @@ private parseParameters(paramString: string): Map<string, string> {
         const fontFamily = params.get('fontFamily') || params.get('font') || 'Arial';
         const fontStyle = params.get('fontStyle') || 'normal';
         const fontWeight = params.get('fontWeight') || 'normal';
-        const color = this.parseColor(params, 'color')
+        const baseColor = this.parseColor(params, 'color')
             || this.parseColor(params, 'c')
             || this.state.defaultOptions.labelColor;
+        const color = this.state.selectedObjectNames.has(textObjectName) || this.state.selectedObjectName === textObjectName
+            ? SELECTED_OBJECT_COLOR
+            : baseColor;
         const padding = this.getNumberValue(params, 'padding')
             || this.getNumberValue(params, 'p')
             || 0;
@@ -1562,6 +2341,24 @@ private parseParameters(paramString: string): Map<string, string> {
             }
         }
         const totalWidth = cursorX - screenPoint.x;
+        this.state.textElements.set(textObjectName, {
+            name: textObjectName,
+            text,
+            x,
+            y,
+            width: totalWidth,
+            ascent: maxAscent,
+            descent: maxDescent,
+            lineNumber,
+        });
+        this.state.textHitRegions.push({
+            objectName: textObjectName,
+            x,
+            y,
+            width: totalWidth,
+            ascent: maxAscent,
+            descent: maxDescent,
+        });
 
         // 背景框（可选）
         const backgroundColor = this.parseColor(params, 'backgroundColor')
@@ -1622,14 +2419,27 @@ private parseParameters(paramString: string): Map<string, string> {
         return measureKatex(latex, fontSize, color, displayMode);
     }
 
-    private getTextRenderTransform(): { scale: number; offsetX: number; offsetY: number } {
+    /**
+     * 「逻辑坐标 -> 渲染坐标」的变换。
+     *
+     * Canvas 路径只算到外层矩阵**之前**（ctx 自己带平移/缩放/旋转）；
+     * SVG 导出路径没有外层矩阵，所以把 renderScale / renderOffset / renderRotation 全并进来，
+     * 直接一步算到最终输出坐标。
+     */
+    private getTextRenderTransform(pixelScale?: number): DrawTransform {
         const viewScale = this.state.defaultOptions.scale;
         const baseOffsetX = this.state.canvas!.width / 2 - this.state.defaultOptions.centerX * viewScale;
         const baseOffsetY = this.state.canvas!.height / 2 - this.state.defaultOptions.centerY * viewScale;
+        const canvas = this.state.canvas!;
         return {
             scale: this.state.renderScale * viewScale,
             offsetX: this.state.renderScale * baseOffsetX + this.state.renderOffsetX,
             offsetY: this.state.renderScale * baseOffsetY + this.state.renderOffsetY,
+            ...(pixelScale != null ? { pixelScale } : {}),
+            // Canvas 路径的旋转由 ctx 矩阵施加，这里必须保持 0，否则会转两遍；
+            // SVG 导出没有外层矩阵，才把旋转（脚本声明的 + 交互式的）烘进坐标。
+            rotation: this.state.contextPreTransformed ? 0 : this.getTotalRotationRadians(this.state.renderRotation),
+            pivot: viewPivot(canvas.width, canvas.height),
         };
     }
 
@@ -1699,10 +2509,23 @@ private parseParameters(paramString: string): Map<string, string> {
     // 几何指令实现示例（需要根据实际的几何对象类来实现）
     private createPoint(params: Map<string, string>): void {
         const name = params.get('name');
-        const x = this.getNumberValue(params, 'x') || 0; // 默认值为0
-        const y = this.getNumberValue(params, 'y') || 0; // 默认值为0
-        const radius = this.getNumberValue(params, 'radius') || 1; // 默认半径为1
-        const real = GeometryDSLInterpreter.parseBoolean(params.get('real'));
+        const parsedX = this.getNumberValue(params, 'x');
+        const parsedY = this.getNumberValue(params, 'y');
+        const parsedRadius = this.getNumberValue(params, 'radius');
+        const x = name ? this.getPreviewProperty(name, 'x') ?? parsedX ?? 0 : parsedX ?? 0;
+        const y = name ? this.getPreviewProperty(name, 'y') ?? parsedY ?? 0 : parsedY ?? 0;
+        // radius 是屏幕像素值；不写就用默认点半径，跟解释器自己算出来的点（中点、垂足、
+        // 交点…）保持一致。**不要**再乘 VIEW scale，否则大 scale 下点会变成巨大的圆盘。
+        // 不写 radius 时**不要**在这里补默认值：留给 Point 走 explicitRadius=false 分支，
+        // 由 resolvePointRadius 用 `SET item=pointRadius`（屏幕像素）统一决定。
+        // 这样 CREATE POINT 和解释器自己算出来的点（中点、交点…）大小口径一致。
+        const radius = name ? this.getPreviewProperty(name, 'radius') ?? parsedRadius : parsedRadius;
+        // 不写 real= 时用 `SET item=pointFill`（默认 false → 空心点，与历史行为一致）。
+        const real = params.has('real')
+            ? GeometryDSLInterpreter.parseBoolean(params.get('real'))
+            : this.state.defaultOptions.pointFill;
+        // 冻结属性：写进脚本后由这里解析回来，画布据此拒绝拖动（见 isObjectFrozen）。
+        const frozen = GeometryDSLInterpreter.parseBoolean(params.get('frozen'));
 
         if (!name) {
             throw new Error('POINT command requires name parameter');
@@ -1710,11 +2533,185 @@ private parseParameters(paramString: string): Map<string, string> {
 
         // 这里需要创建实际的Point对象
         const point = new Point(name, x, y, radius, real);
+        point.frozen = frozen;
         this.state.objects.set(name, point);
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, point, name);
+            this.collectDraw(params, point);
+        }
+    }
+
+    /**
+     * 从 DSL 的 `cutPoints=A,B`（兼容 cutoffPoints/cuts）解析截止点引用。
+     *
+     * 每个条目可以带方向前缀：
+     *   - `A`  → 不带方向，走交替语义；
+     *   - `+A` → 隐藏 A 的正方向一侧，保留参数 ≤ A 的部分；
+     *   - `-A` → 隐藏 A 的负方向一侧，保留参数 ≥ A 的部分。
+     *
+     * `-A,+B` 就是把直线截成线段 [A,B]；`+A,-B` 则是挖掉中间一段。
+     * 只要有一个条目带方向，整条线就走「各砍一侧」语义（见 LinearObject）。
+     */
+    private applyLinearCutPoints(
+        params: Map<string, string>,
+        object: LinearObject,
+    ): void {
+        const raw = params.get('cutPoints') || params.get('cutoffPoints') || params.get('cuts');
+        if (raw === undefined || raw.trim() === '') return;
+        const cuts: LinearCutPoint[] = [];
+        const pending: Array<{ name: string; side: CutSide }> = [];
+        for (const rawEntry of raw.split(',')) {
+            const entry = rawEntry.trim();
+            if (!entry) continue;
+            // 前缀和点名之间允许有空格（`- A`），方便手写。
+            const matched = /^([+-]?)\s*(.+)$/.exec(entry);
+            if (!matched) continue;
+            const side: CutSide = matched[1] === '+' ? 'right' : matched[1] === '-' ? 'left' : null;
+            const pointName = matched[2].trim();
+            if (!pointName) continue;
+            const point = this.getObject(pointName);
+            if (point === undefined) {
+                // 还没定义：先记下来，等脚本跑完再补 —— 线上的点、交点都只能在这条线之后创建。
+                pending.push({ name: pointName, side });
+                continue;
+            }
+            if (!(point instanceof Point)) {
+                throw new Error(`cutPoints reference ${pointName} is not a point`);
+            }
+            cuts.push({ point, side });
+        }
+        object.setCutPoints(cuts);
+        if (pending.length > 0) {
+            // 登记到待解析表：**与这条线这次画不画无关**。即使当前是 draw=false，
+            // 后面一条 `DRAW obj=X` 仍可能把它画出来，那时截止点必须是全的。
+            this.state.pendingCutResolutions.set(object.name, {
+                object,
+                cuts: pending,
+                lineNumber: this.state.currentCommandLine,
+            });
+        }
+    }
+
+    /**
+     * 收集一个「create 时写了 draw=true」的几何对象，等脚本跑完统一绘制。
+     *
+     * **为什么所有几何对象都后置**：截止点、交点、线上取点这类东西天然是前向引用
+     * （它们只能建在引用它们的对象之后）。逐个特判「谁需要延迟」既容易漏、又难维护，
+     * 干脆几何对象一律不在 create 时画，等对象表建完再一次性画。
+     * 这样任何对象都能引用在它后面才创建的东西，不必为每种前向引用各写一套。
+     *
+     * 只对几何对象这么做：TEXT / AXIS 之类仍立即绘制（它们不参与几何引用，
+     * 且通常要求压在图形之上）。
+     *
+     * 代价：脚本里显式写的 `DRAW obj=X` 会排在所有 `draw=true` 对象**下面**
+     * （前者在指令位置就画了，后者统一等到最后）。要调整层级就用 `DRAW obj=X` 显式画。
+     *
+     * 调用点都在 `if (draw === 'true' && this.state.ctx)` 守卫里，所以这里不再重复判断。
+     */
+    private collectDraw(
+        params: Map<string, string>,
+        object: GeometricObject,
+    ): void {
+        // 标签**只认脚本里显式写的 `label=` / `l=`**，不再回落到对象名：
+        // 名字是给引用用的标识符（自动生成的还是 `perp1` 这种），画到图上没有意义。
+        // 「画不画」的总开关在 `drawObject` 里判（只有那里知道对象是点还是别的），
+        // 这里只负责把值取出来存进待绘队列。
+        const effectiveLabel = params.get('label') ?? params.get('l');
+
+        const existing = this.state.pendingDraws.find(entry => entry.object === object);
+        if (existing) {
+            // 走到这里基本只剩「同名对象被重建」：新定义应当**完全取代**旧样式，
+            // 所以整体替换而不是叠加（叠加会把上一个定义的 width/color 带过来）。
+            // `DRAW` / `FILL` 改样式不走这里，走 `mergePendingDraw`。
+            existing.params = new Map(params);
+            if (effectiveLabel !== undefined) existing.label = effectiveLabel;
+            return;
+        }
+        this.state.pendingDraws.push({
+            // 复制一份：指令表在 execute 之间会重建，留着引用没有意义，但复制成本极低。
+            params: new Map(params),
+            object,
+            label: effectiveLabel,
+        });
+    }
+
+    /**
+     * 给一个**已经在待绘队列里**的对象改样式 —— `DRAW obj=X` / `FILL obj=X` 走这里。
+     *
+     * 和 `collectDraw` 的区别只在「已有队列项时怎么合并」：`collectDraw` 是整体替换
+     * （创建点用它，同名重建时新定义应当完全生效），这里是在原有样式上**叠加**。
+     * 文档里写的也是「只覆盖其样式」：create 上写的 `width` / `radius` 不该因为
+     * 后面一条只改颜色的 `DRAW` 就丢掉。
+     *
+     * 对象还不在队列里时退化成入队 —— `DRAW` 命中「截止点尚未解析」的情况走这条。
+     */
+    private mergePendingDraw(
+        params: Map<string, string>,
+        object: GeometricObject,
+        label: string | undefined,
+    ): void {
+        const existing = this.state.pendingDraws.find(entry => entry.object === object);
+        if (existing) {
+            for (const [key, value] of params) existing.params.set(key, value);
+            if (label !== undefined) existing.label = label;
+            return;
+        }
+        this.state.pendingDraws.push({
+            params: new Map(params),
+            object,
+            label,
+        });
+    }
+
+    /**
+     * 把创建时解析不出来的截止点补进对象。
+     *
+     * 这时整份脚本已经跑完，线上取的点、交点都建出来了，绝大多数引用都能解析。
+     * 仍然缺失的只记一条 warning，让这条线按完整绘制 —— 不静默丢线。
+     */
+    private resolvePendingCuts(): void {
+        const resolutions = Array.from(this.state.pendingCutResolutions.values());
+        this.state.pendingCutResolutions.clear();
+
+        for (const entry of resolutions) {
+            const missing: string[] = [];
+            const cuts: LinearCutPoint[] = [...entry.object.cutPoints];
+            for (const item of entry.cuts) {
+                const point = this.getObject(item.name);
+                if (point instanceof Point) cuts.push({ point, side: item.side });
+                else missing.push(item.name);
+            }
+            entry.object.setCutPoints(cuts);
+
+            if (missing.length > 0) {
+                this.state.onMessage?.(
+                    'warning',
+                    entry.lineNumber,
+                    `${entry.object.name} 的 cutPoints 引用了不存在的点：${missing.join('、')}，该线按完整绘制`,
+                );
+            }
+        }
+    }
+
+    /**
+     * 画掉所有收集到的对象。由 `executeLines` 回到最外层时自动调用 ——
+     * 相当于脚本末尾隐式补了一条 `DRAW`，不需要用户在代码里显式写。
+     *
+     * 先解析截止点再绘制：顺序反了就会照着「还没补全截止点」的样子画，
+     * 而画布只增不减，之后盖不掉。
+     * 绘制顺序 = 创建顺序，所以 z 序与「逐个立即绘制」时一致。
+     */
+    private flushPendingDraws(): void {
+        this.resolvePendingCuts();
+
+        const pending = this.state.pendingDraws;
+        this.state.pendingDraws = [];
+        if (pending.length === 0 || !this.state.ctx) return;
+
+        const ctx = this.state.ctx;
+        for (const entry of pending) {
+            this.drawObject(ctx, entry.params, entry.object, entry.label);
         }
     }
 
@@ -1736,11 +2733,10 @@ private parseParameters(paramString: string): Map<string, string> {
 
         // 这里需要创建实际的Line对象
         const line = new Line(name, p1 as Point, p2 as Point);
+        this.applyLinearCutPoints(params, line);
         this.state.objects.set(name, line);
-
-        const draw = params.get('draw');
-        if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, line, undefined);
+        if (params.get('draw') === 'true' && this.state.ctx) {
+            this.collectDraw(params, line);
         }
     }
 
@@ -1762,11 +2758,10 @@ private parseParameters(paramString: string): Map<string, string> {
 
         // 这里需要创建实际的Segment对象
         const segment = new Segment(name, p1 as Point, p2 as Point);
+        this.applyLinearCutPoints(params, segment);
         this.state.objects.set(name, segment);
-
-        const draw = params.get('draw');
-        if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, segment, undefined);
+        if (params.get('draw') === 'true' && this.state.ctx) {
+            this.collectDraw(params, segment);
         }
     }
 
@@ -1792,11 +2787,10 @@ private parseParameters(paramString: string): Map<string, string> {
 
         // 这里需要创建实际的Ray对象
         const ray = new Ray(name, vertex as Point, p1 as Point);
+        this.applyLinearCutPoints(params, ray);
         this.state.objects.set(name, ray);
-
-        const draw = params.get('draw');
-        if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, ray, undefined);
+        if (params.get('draw') === 'true' && this.state.ctx) {
+            this.collectDraw(params, ray);
         }
     }
 
@@ -1830,14 +2824,18 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, midpoint, name);
+            this.collectDraw(params, midpoint);
         }
     }
 
     private createPerpendicularFoot(params: Map<string, string>): void {
         const name = params.get('name') || params.get('n');
-        const pointName = params.get('point') || params.get('p');
-        const lineName = params.get('obj') || params.get('o') || params.get('line');
+        // 文档里写的是 `from=` / `on=`（见 DSL_V6 2.2.4），实现里历史上只认 point/obj/line，
+        // 于是照文档写的示例会直接报「need name, point and line」。这里把两套别名都收下，
+        // 既修好文档示例，也不影响已经在用 point/obj 的脚本。
+        const pointName = params.get('point') || params.get('p') || params.get('from') || params.get('f');
+        const lineName = params.get('line') || params.get('l')
+            || params.get('obj') || params.get('o') || params.get('on');
 
         if (!name || !pointName || !lineName) {
             throw new Error('PerpendicularFoot need name, point and line');
@@ -1882,7 +2880,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, footPoint, name);
+            this.collectDraw(params, footPoint);
         }
     }
 
@@ -1920,7 +2918,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, reflectedPoint, name);
+                this.collectDraw(params, reflectedPoint);
             }
 
         } else if (axisName) {
@@ -1955,7 +2953,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, reflectedPoint, name);
+                this.collectDraw(params, reflectedPoint);
             }
 
         } else {
@@ -2016,7 +3014,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, rotatedPoint, name);
+            this.collectDraw(params, rotatedPoint);
         }
     }
 
@@ -2032,7 +3030,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, intersectionPoint, name);
+            this.collectDraw(params, intersectionPoint);
         }
     }
 
@@ -2045,21 +3043,27 @@ private parseParameters(paramString: string): Map<string, string> {
         const names = name.split(',');
 
         if (intersectionPoints.length == 1) {
-            // 如果只有一个交点
+            // 如果只有一个交点（两圆相切）
+            // 相切点如果已经被别的指令命名过，就不要再建一次，也不要覆盖它。
+            const existing = this.findPoint(intersectionPoints[0].x, intersectionPoints[0].y);
+            if (existing) {
+                return;
+            }
             const intersectionPoint = new Point(names[0], intersectionPoints[0].x, intersectionPoints[0].y);
             this.state.objects.set(intersectionPoint.name, intersectionPoint);
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, intersectionPoint, name);
+                this.collectDraw(params, intersectionPoint);
             }
 
             return;
         }
 
         if (intersectionPoints.length == 2) {
-            // 如果有两个交点
-            // 从当前object里面查找Point，如果找到，那么一个点，那么就忽略第二个点的命名
+            // 两个交点里，可能其中一个已经作为已命名点存在了（比如先点过、或用别的指令建过）。
+            // 这时只补建「还没有的那个」—— 关键是不能拿已存在点的名字去建另一个交点：
+            // 那样会用一个新坐标覆盖掉老点，把已经画在图上的点悄悄挪走。
             const findPoint0 = this.findPoint(intersectionPoints[0].x, intersectionPoints[0].y);
             const findPoint1 = this.findPoint(intersectionPoints[1].x, intersectionPoints[1].y);
 
@@ -2068,41 +3072,40 @@ private parseParameters(paramString: string): Map<string, string> {
                 return;
             }
 
-            if (findPoint0) {
-                const intersectionPoint = new Point(names[0], intersectionPoints[1].x, intersectionPoints[1].y);
+            const draw = params.get('draw');
+
+            if (findPoint0 || findPoint1) {
+                // 已存在的是哪一个，就建另一个：坐标取「未被占用的那个交点」，
+                // 名字仍然取 names[0]（调用方只给一个待用名时也成立）。
+                const missing = findPoint0 ? intersectionPoints[1] : intersectionPoints[0];
+                const missingName = names[0];
+                // 该名字若已被占用（例如正好等于已存在点的名字），就不要重复建，避免覆盖。
+                const occupant = this.state.objects.get(missingName);
+                if (occupant instanceof Point && occupant.distanceTo2(missing.x, missing.y) <= this.zeroThresholdValue) {
+                    return;
+                }
+                const intersectionPoint = new Point(missingName, missing.x, missing.y);
                 this.state.objects.set(intersectionPoint.name, intersectionPoint);
 
-                const draw = params.get('draw');
                 if (draw != null && draw == 'true' && this.state.ctx) {
-                    this.drawObject(this.state.ctx, params, intersectionPoint, name);
+                    this.collectDraw(params, intersectionPoint);
                 }
 
                 return;
             }
 
-            if (findPoint1) {
-                const intersectionPoint = new Point(names[0], intersectionPoints[0].x, intersectionPoints[0].y);
-                this.state.objects.set(intersectionPoint.name, intersectionPoint);
-
-                const draw = params.get('draw');
-                if (draw != null && draw == 'true' && this.state.ctx) {
-                    this.drawObject(this.state.ctx, params, intersectionPoint, name);
-                }
-
-                return;
-            }
-
-
-            // 如果有两个交点
+            // 两个交点都还没有命名，一次建两个。
+            // 老脚本可能只给一个名字（`name=P`）就指望建两个交点：这时第二个名字退化成
+            // `<名字>_2`，跟解释器里其它合成点的命名习惯一致，不至于丢一个点或撞名。
+            const secondName = names[1] && names[1].length > 0 ? names[1] : `${names[0]}_2`;
             const intersectionPoint1 = new Point(names[0], intersectionPoints[0].x, intersectionPoints[0].y);
-            const intersectionPoint2 = new Point(names[1], intersectionPoints[1].x, intersectionPoints[1].y);
+            const intersectionPoint2 = new Point(secondName, intersectionPoints[1].x, intersectionPoints[1].y);
             this.state.objects.set(intersectionPoint1.name, intersectionPoint1);
             this.state.objects.set(intersectionPoint2.name, intersectionPoint2);
 
-            const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, intersectionPoint1, intersectionPoint1.name);
-                this.drawObject(this.state.ctx, params, intersectionPoint2, intersectionPoint2.name);
+                this.collectDraw(params, intersectionPoint1);
+                this.collectDraw(params, intersectionPoint2);
             }
 
             return;
@@ -2117,21 +3120,27 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const names = name.split(',');
         if (points.length === 1) {
-            // 如果只有一个交点
+            // 如果只有一个交点（直线与圆相切）
+            // 相切点若已被命名过，就不要再建一次、也不要覆盖。
+            const existing = this.findPoint(points[0].x, points[0].y);
+            if (existing) {
+                return;
+            }
             const intersectionPoint = new Point(names[0], points[0].x, points[0].y);
             this.state.objects.set(intersectionPoint.name, intersectionPoint);
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, intersectionPoint, name);
+                this.collectDraw(params, intersectionPoint);
             }
 
             return;
         }
 
         if (points.length === 2) {
-            // 如果有两个交点
-            // 从当前object里面查找Point，如果找到，那么一个点，那么就忽略第二个点的命名
+            // 两个交点里可能已经有一个作为已命名点存在了，这时只补建「缺少的那个」。
+            // 与 TwoCirclesIntersection 同样的规矩：绝不能用已存在点的名字去建另一个交点，
+            // 那会把图上已有的点用新坐标覆盖掉。
             const findPoint0 = this.findPoint(points[0].x, points[0].y);
             const findPoint1 = this.findPoint(points[1].x, points[1].y);
 
@@ -2140,71 +3149,45 @@ private parseParameters(paramString: string): Map<string, string> {
                 return;
             }
 
-            if (findPoint0) {
-                const draw = params.get('draw');
-                // 第一个点已经命名了，并且与当前点的命名相同，就不做操作，否则再创建一个点
-                if (findPoint0.name != names[0]) {
-                    const intersectionPoint = new Point(names[0], points[1].x, points[1].y);
-                    this.state.objects.set(intersectionPoint.name, intersectionPoint);
+            const draw = params.get('draw');
 
-                    if (draw != null && draw == 'true' && this.state.ctx) {
-                        this.drawObject(this.state.ctx, params, intersectionPoint, names[0]);
-                    }
+            if (findPoint0 || findPoint1) {
+                const missing = findPoint0 ? points[1] : points[0];
+                const missingName = names[0];
+                const occupant = this.state.objects.get(missingName);
+                if (occupant instanceof Point && occupant.distanceTo2(missing.x, missing.y) <= this.zeroThresholdValue) {
+                    return;
                 }
-
-                const intersectionPoint = new Point(names[1], points[1].x, points[1].y);
+                const intersectionPoint = new Point(missingName, missing.x, missing.y);
                 this.state.objects.set(intersectionPoint.name, intersectionPoint);
 
-
                 if (draw != null && draw == 'true' && this.state.ctx) {
-                    this.drawObject(this.state.ctx, params, intersectionPoint, name[1]);
-                }
-
-                return;
-            }
-
-
-            if (findPoint1) {
-                const draw = params.get('draw');
-                // 第二个点已经命名了，并且与当前点的命名相同，就不做操作，否则再创建一个点
-                if (findPoint1.name != names[1]) {
-                    const intersectionPoint = new Point(names[1], points[0].x, points[0].y);
-                    this.state.objects.set(intersectionPoint.name, intersectionPoint);
-
-                    if (draw != null && draw == 'true' && this.state.ctx) {
-                        this.drawObject(this.state.ctx, params, intersectionPoint, names[1]);
-                    }
-                }
-
-                const intersectionPoint = new Point(names[0], points[0].x, points[0].y);
-                this.state.objects.set(intersectionPoint.name, intersectionPoint);
-
-
-                if (draw != null && draw == 'true' && this.state.ctx) {
-                    this.drawObject(this.state.ctx, params, intersectionPoint, name[0]);
+                    this.collectDraw(params, intersectionPoint);
                 }
                 return;
             }
 
-            // 两个点都没有命名
-
+            // 两个点都没有命名。名字给一个时第二个退化成 `<名字>_2`（与圆-圆求交一致）。
+            const secondName = names[1] && names[1].length > 0 ? names[1] : `${names[0]}_2`;
             const intersectionPoint1 = new Point(names[0], points[0].x, points[0].y);
-            const intersectionPoint2 = new Point(names[1], points[1].x, points[1].y);
+            const intersectionPoint2 = new Point(secondName, points[1].x, points[1].y);
 
             this.state.objects.set(intersectionPoint1.name, intersectionPoint1);
             this.state.objects.set(intersectionPoint2.name, intersectionPoint2);
 
-            const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, intersectionPoint1, intersectionPoint1.name);
-                this.drawObject(this.state.ctx, params, intersectionPoint2, intersectionPoint2.name);
+                this.collectDraw(params, intersectionPoint1);
+                this.collectDraw(params, intersectionPoint2);
             }
         }
     }
 
     private createIntersection(params: Map<string, string>): void {
         // 实现两个对象交点创建
-        const name = params.get('name');
+        // HELP 里写的是 `name (或n, ...)`，但这里历史上只认 `name`，照文档写 `n=P`
+        // 会直接报「requires name, obj1, and obj2 parameters」。和 createPerpendicularFoot
+        // 当初踩的是同一个坑：文档写了别名、实现只认主名。
+        const name = params.get('name') || params.get('n');
 
         const obj1Name = params.get('obj1') || params.get('o1');
         const obj2Name = params.get('obj2') || params.get('o2');
@@ -2266,10 +3249,6 @@ private parseParameters(paramString: string): Map<string, string> {
 
     }
 
-    private createAngleIntersection(params: Map<string, string>): void {
-
-    }
-
     private createPointOnLine(params: Map<string, string>): void {
         // 实现线上点创建
         const name = params.get('name');
@@ -2302,7 +3281,76 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, newPoint, name);
+            this.collectDraw(params, newPoint);
+        }
+    }
+
+    /**
+     * 在圆周边上、以「圆心为原点、给定角度（度）」的位置创建一点。
+     *
+     * 与 POINT_ON_LINE 同理：点引用的是圆对象本身，每次脚本重跑都重新按
+     * `center + radius·(cosθ, sinθ)` 算一遍，所以拖动圆（圆心或半径变化）时
+     * 这个点会跟着圆走，不会脱钩。右键菜单里的「圆周边上离鼠标最近的点」
+     * 就是拿这个命令 + 鼠标相对圆心的角度实现的。
+     */
+    private createPointOnCircle(params: Map<string, string>): void {
+        const name = params.get('name');
+        const circleName = params.get('circle') || params.get('c');
+        const angleStr = params.get('angle') || params.get('a');
+
+        if (!name || !circleName || angleStr == null) {
+            throw new Error('POINT_ON_CIRCLE command requires name, circle, and angle parameters');
+        }
+
+        const circleRaw = this.getObject(circleName);
+        if (!circleRaw || !(circleRaw instanceof Circle)) {
+            throw new Error(`Circle ${circleName} not found`);
+        }
+        const circle = circleRaw as Circle;
+
+        const angleDegrees = this.getNumberValue(params, 'angle') ?? this.getNumberValue(params, 'a');
+        if (angleDegrees == null || isNaN(angleDegrees)) {
+            throw new Error(`Invalid angle value: ${angleStr}`);
+        }
+
+        const angleRad = angleDegrees * (Math.PI / 180);
+        const newX = circle.center.x + circle.radius * Math.cos(angleRad);
+        const newY = circle.center.y + circle.radius * Math.sin(angleRad);
+        const newPoint = new Point(name, newX, newY);
+        this.state.objects.set(name, newPoint);
+
+        const draw = params.get('draw');
+        if (draw != null && draw == 'true' && this.state.ctx) {
+            this.collectDraw(params, newPoint);
+        }
+    }
+
+    /**
+     * 创建圆的圆心点。
+     *
+     * 同样引用圆对象本身（每次重跑都从 `circle.center` 重新取坐标），
+     * 所以圆心点会跟着圆一起移动。「选中一个圆 → 创建圆心」就是它。
+     */
+    private createCircleCenter(params: Map<string, string>): void {
+        const name = params.get('name');
+        const circleName = params.get('circle') || params.get('c');
+
+        if (!name || !circleName) {
+            throw new Error('CIRCLE_CENTER command requires name and circle parameters');
+        }
+
+        const circleRaw = this.getObject(circleName);
+        if (!circleRaw || !(circleRaw instanceof Circle)) {
+            throw new Error(`Circle ${circleName} not found`);
+        }
+        const circle = circleRaw as Circle;
+
+        const centerPoint = new Point(name, circle.center.x, circle.center.y);
+        this.state.objects.set(name, centerPoint);
+
+        const draw = params.get('draw');
+        if (draw != null && draw == 'true' && this.state.ctx) {
+            this.collectDraw(params, centerPoint);
         }
     }
 
@@ -2348,11 +3396,12 @@ private parseParameters(paramString: string): Map<string, string> {
 
         // 创建垂直平分线对象
         const perpBisector = new Line(name, midpoint, newPoint);
+        // 派生线的两个定义点都是内部合成点（`name_<mid>` / `name_<dir>`），
+        // 没法像 LINE 那样靠交换 p1/p2 来删某一侧，所以方向标记在这里是必需的。
+        this.applyLinearCutPoints(params, perpBisector);
         this.state.objects.set(name, perpBisector);
-
-        const draw = params.get('draw');
-        if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, perpBisector, undefined);
+        if (params.get('draw') === 'true' && this.state.ctx) {
+            this.collectDraw(params, perpBisector);
         }
     }
 
@@ -2383,11 +3432,10 @@ private parseParameters(paramString: string): Map<string, string> {
 
         // 创建垂线
         const perpendicularLine = new Line(name, point, perpPoint);
+        this.applyLinearCutPoints(params, perpendicularLine);
         this.state.objects.set(name, perpendicularLine);
-
-        const draw = params.get('draw');
-        if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, perpendicularLine, undefined);
+        if (params.get('draw') === 'true' && this.state.ctx) {
+            this.collectDraw(params, perpendicularLine);
         }
     }
 
@@ -2419,13 +3467,11 @@ private parseParameters(paramString: string): Map<string, string> {
 
         // 创建平行线
         const parallelLine = new Line(name, point, parallelPoint);
+        this.applyLinearCutPoints(params, parallelLine);
         this.state.objects.set(name, parallelLine);
-
-        const draw = params.get('draw');
-        if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, parallelLine, undefined);
+        if (params.get('draw') === 'true' && this.state.ctx) {
+            this.collectDraw(params, parallelLine);
         }
-
     }
 
     private createAngleBisector(params: Map<string, string>): void {
@@ -2451,11 +3497,10 @@ private parseParameters(paramString: string): Map<string, string> {
 
         // 创建角平分线
         const bisectorLine = new Line(name, angle.vertex, bisectorPoint);
+        this.applyLinearCutPoints(params, bisectorLine);
         this.state.objects.set(name, bisectorLine);
-
-        const draw = params.get('draw');
-        if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, bisectorLine, undefined);
+        if (params.get('draw') === 'true' && this.state.ctx) {
+            this.collectDraw(params, bisectorLine);
         }
     }
 
@@ -2486,7 +3531,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, circle, undefined);
+            this.collectDraw(params, circle);
         }
     }
 
@@ -2517,7 +3562,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, circle, undefined);
+            this.collectDraw(params, circle);
         }
     }
 
@@ -2564,7 +3609,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, segment, undefined);
+                this.collectDraw(params, segment);
             }
 
         } else {
@@ -2595,8 +3640,8 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, segment1, undefined);
-                this.drawObject(this.state.ctx, params, segment2, undefined);
+                this.collectDraw(params, segment1);
+                this.collectDraw(params, segment2);
             }
         }
     }
@@ -2628,8 +3673,388 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, polygon, undefined);
+            this.collectDraw(params, polygon);
         }
+    }
+
+    private getNumberParam(params: Map<string, string>, ...keys: string[]): number | undefined {
+        for (const key of keys) {
+            const value = this.getNumberValue(params, key);
+            if (value !== undefined && Number.isFinite(value)) return value;
+        }
+        return undefined;
+    }
+
+    private getBooleanParam(params: Map<string, string>, defaultValue: boolean, ...keys: string[]): boolean {
+        for (const key of keys) {
+            const value = params.get(key);
+            if (value !== undefined) return GeometryDSLInterpreter.parseBoolean(value);
+        }
+        return defaultValue;
+    }
+
+    private formatAxisNumber(value: number): string {
+        const rounded = Math.abs(value) < 1e-10 ? 0 : Math.round(value * 1e6) / 1e6;
+        return String(rounded);
+    }
+
+    private drawArrowhead(
+        ctx: CanvasRenderingContext2D,
+        transform: { scale: number; offsetX: number; offsetY: number },
+        tip: IPoint,
+        direction: 'right' | 'up' | 'left' | 'down',
+        size: number,
+    ): void {
+        const half = size * 0.45;
+        const wingA = direction === 'right'
+            ? { x: tip.x - size, y: tip.y - half }
+            : direction === 'left'
+                ? { x: tip.x + size, y: tip.y - half }
+                : direction === 'up'
+                    ? { x: tip.x - half, y: tip.y - size }
+                    : { x: tip.x - half, y: tip.y + size };
+        const wingB = direction === 'right'
+            ? { x: tip.x - size, y: tip.y + half }
+            : direction === 'left'
+                ? { x: tip.x + size, y: tip.y + half }
+                : direction === 'up'
+                    ? { x: tip.x + half, y: tip.y - size }
+                    : { x: tip.x + half, y: tip.y + size };
+        const screenTip = toScreenPoint(tip.x, tip.y, transform);
+        const screenA = toScreenPoint(wingA.x, wingA.y, transform);
+        const screenB = toScreenPoint(wingB.x, wingB.y, transform);
+        ctx.beginPath();
+        ctx.moveTo(screenTip.x, screenTip.y);
+        ctx.lineTo(screenA.x, screenA.y);
+        ctx.moveTo(screenTip.x, screenTip.y);
+        ctx.lineTo(screenB.x, screenB.y);
+        ctx.stroke();
+    }
+
+    // 当前可见区域对应的逻辑坐标范围。
+    // Canvas 路径的 ctx 已预置 setTransform，可见区域是 canvasX/canvasY/width/height 这块「画布坐标」；
+    // SVG 导出路径没有预置变换，可见区域就是整块 SVG 画布。两条路径都要能算对。
+    private getVisibleLogicalBounds(): { minX: number; maxX: number; minY: number; maxY: number } | null {
+        if (!this.state.canvas) return null;
+        const transform = this.getTextRenderTransform();
+        if (!(Math.abs(transform.scale) > this.zeroThresholdValue)) return null;
+
+        const visible = this.getVisibleViewRect();
+        if (!(visible.width > 0) || !(visible.height > 0)) return null;
+
+        // 渲染坐标 -> 逻辑坐标（y 轴方向相反）。
+        // 变换里可能带旋转（SVG 路径），所以四角都要算：只反算两个角会漏掉旋转后
+        // 探出去的那部分，坐标轴 / 网格的范围在小画布上会不够宽。
+        const corners = [
+            fromScreenPoint(visible.x, visible.y, transform),
+            fromScreenPoint(visible.x + visible.width, visible.y, transform),
+            fromScreenPoint(visible.x, visible.y + visible.height, transform),
+            fromScreenPoint(visible.x + visible.width, visible.y + visible.height, transform),
+        ];
+        return {
+            minX: Math.min(...corners.map(corner => corner.x)),
+            maxX: Math.max(...corners.map(corner => corner.x)),
+            minY: Math.min(...corners.map(corner => corner.y)),
+            maxY: Math.max(...corners.map(corner => corner.y)),
+        };
+    }
+
+    // 把任意步长吸附到 1/2/5 × 10^n 这一系列「整数级」数值，让刻度落在好读的数上。
+    private niceStep(rawStep: number): number {
+        if (!(rawStep > 0) || !Number.isFinite(rawStep)) return 1;
+        const exponent = Math.floor(Math.log10(rawStep));
+        const base = Math.pow(10, exponent);
+        const normalized = rawStep / base;
+        const factor = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
+        return factor * base;
+    }
+
+    // AXIS / GRID 共用的「默认范围 + 默认步长」解析。
+    //
+    // 简化目标：`CREATE AXIS name=axes` / `CREATE GRID name=grid` 一个参数都不写也要好看。
+    // 所以默认值这样取：
+    // - 范围贴合当前可见区域（原来写死 origin±10，换个 scale 就整条跑到画布外）；
+    // - 步长按 scale 自动选「整数级」数值，使刻度间距约 AXIS_TARGET_TICK_PIXELS 像素，
+    //   数字既不会挤成一团也不会稀疏到没有意义；
+    // - 范围向外吸附到步长的整数倍，保证网格线落在整数刻度上。
+    // 任何显式给出的参数都优先，行为与以前一致。
+    private resolveAxisRange(
+        params: Map<string, string>,
+        scale: number,
+        originX: number,
+        originY: number,
+    ): { minX: number; maxX: number; minY: number; maxY: number; xStep: number; yStep: number } {
+        const autoStep = this.niceStep(AXIS_TARGET_TICK_PIXELS / scale);
+        const explicitXStep = this.getNumberParam(params, 'xStep', 'step');
+        const explicitYStep = this.getNumberParam(params, 'yStep', 'step');
+        const xStep = Math.abs(explicitXStep ?? autoStep);
+        // 只给了 xStep 时让 yStep 跟着走，避免「方形网格」被拆成两套步长。
+        const yStep = Math.abs(explicitYStep ?? explicitXStep ?? autoStep);
+
+        const view = this.getVisibleLogicalBounds() ?? {
+            minX: originX - AXIS_FALLBACK_HALF_SPAN,
+            maxX: originX + AXIS_FALLBACK_HALF_SPAN,
+            minY: originY - AXIS_FALLBACK_HALF_SPAN,
+            maxY: originY + AXIS_FALLBACK_HALF_SPAN,
+        };
+
+        const snapFloor = (value: number, step: number) => Math.floor(value / step + 1e-9) * step;
+        const snapCeil = (value: number, step: number) => Math.ceil(value / step - 1e-9) * step;
+
+        return {
+            minX: this.getNumberParam(params, 'xMin', 'xmin', 'minX') ?? snapFloor(view.minX, xStep),
+            maxX: this.getNumberParam(params, 'xMax', 'xmax', 'maxX') ?? snapCeil(view.maxX, xStep),
+            minY: this.getNumberParam(params, 'yMin', 'ymin', 'minY') ?? snapFloor(view.minY, yStep),
+            maxY: this.getNumberParam(params, 'yMax', 'ymax', 'maxY') ?? snapCeil(view.maxY, yStep),
+            xStep,
+            yStep,
+        };
+    }
+
+    private createAxis(params: Map<string, string>): void {
+        if (!this.state.ctx || !this.state.canvas) return;
+        const originX = this.getNumberParam(params, 'originX', 'ox') ?? 0;
+        const originY = this.getNumberParam(params, 'originY', 'oy') ?? 0;
+        const transform = this.getTextRenderTransform();
+        const scale = Math.abs(transform.scale) > this.zeroThresholdValue ? Math.abs(transform.scale) : 1;
+        const { minX, maxX, minY, maxY, xStep, yStep } = this.resolveAxisRange(params, scale, originX, originY);
+        const tickSize = Math.abs(this.getNumberParam(params, 'tickSize', 'tick') ?? (AXIS_TICK_PIXELS / 2) / scale);
+        const arrowSize = Math.abs(this.getNumberParam(params, 'arrowSize', 'arrow') ?? AXIS_ARROW_PIXELS / scale);
+        const width = Math.max(0.1, this.getNumberParam(params, 'width', 'lineWidth') ?? 1);
+        const fontSize = Math.max(1, this.getNumberParam(params, 'fontSize', 'fs') ?? 12);
+        const color = this.parseColor(params, 'color') || '#666666';
+        const labelColor = this.parseColor(params, 'labelColor') || color;
+        const numbers = this.getBooleanParam(params, true, 'numbers', 'showNumbers');
+        const arrows = this.getBooleanParam(params, true, 'arrows', 'showArrows');
+        const bothArrows = this.getBooleanParam(params, false, 'bothArrows');
+        const showOrigin = this.getBooleanParam(params, true, 'origin', 'showOrigin');
+        const showLabels = this.getBooleanParam(params, true, 'labels', 'axisLabels', 'showLabels');
+        const dashed = this.getBooleanParam(params, false, 'dashed', 'dash');
+        const xLabel = params.get('xLabel') || params.get('xlabel') || 'x';
+        const yLabel = params.get('yLabel') || params.get('ylabel') || 'y';
+        const originLabel = params.get('originLabel') || params.get('olabel') || 'O';
+        if (!(maxX > minX) || !(maxY > minY) || !(xStep > 0) || !(yStep > 0)) {
+            throw new Error('AXIS requires maxX>minX, maxY>minY, and positive xStep/yStep');
+        }
+
+        const ctx = this.state.ctx;
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.fillStyle = labelColor;
+        ctx.lineWidth = width;
+        ctx.setLineDash(dashed ? [4, 4] : []);
+        if (originY >= minY && originY <= maxY) {
+            const left = toScreenPoint(minX, originY, transform);
+            const right = toScreenPoint(maxX, originY, transform);
+            ctx.beginPath();
+            ctx.moveTo(left.x, left.y);
+            ctx.lineTo(right.x, right.y);
+            ctx.stroke();
+            if (arrows) this.drawArrowhead(ctx, transform, { x: maxX, y: originY }, 'right', arrowSize);
+            if (arrows && bothArrows) this.drawArrowhead(ctx, transform, { x: minX, y: originY }, 'left', arrowSize);
+        }
+        if (originX >= minX && originX <= maxX) {
+            const bottom = toScreenPoint(originX, minY, transform);
+            const top = toScreenPoint(originX, maxY, transform);
+            ctx.beginPath();
+            ctx.moveTo(bottom.x, bottom.y);
+            ctx.lineTo(top.x, top.y);
+            ctx.stroke();
+            if (arrows) this.drawArrowhead(ctx, transform, { x: originX, y: maxY }, 'up', arrowSize);
+            if (arrows && bothArrows) this.drawArrowhead(ctx, transform, { x: originX, y: minY }, 'down', arrowSize);
+        }
+
+        ctx.setLineDash([]);
+        if (numbers) {
+            ctx.font = `${fontSize}px Arial`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            if (originY >= minY && originY <= maxY) {
+                const first = Math.ceil((minX - originX) / xStep - 1e-9);
+                const last = Math.floor((maxX - originX) / xStep + 1e-9);
+                for (let index = first; index <= last; index++) {
+                    const value = originX + index * xStep;
+                    if (Math.abs(value - originX) <= 1e-9) continue;
+                    const tickA = toScreenPoint(value, originY - tickSize, transform);
+                    const tickB = toScreenPoint(value, originY + tickSize, transform);
+                    ctx.beginPath();
+                    ctx.moveTo(tickA.x, tickA.y);
+                    ctx.lineTo(tickB.x, tickB.y);
+                    ctx.stroke();
+                    const labelPoint = toScreenPoint(value, originY - tickSize * 2.2, transform);
+                    // 刻度数字按「相对原点」的偏移标注，而不是绝对逻辑坐标。
+                    // 这样把 originY 挪到 260 画第二个坐标系时，轴上的 0/1/2 仍然是该坐标系自己的刻度；
+                    // origin 为默认 (0,0) 时两者完全等价。
+                    ctx.fillText(this.formatAxisNumber(index * xStep), labelPoint.x, labelPoint.y);
+                }
+            }
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'middle';
+            if (originX >= minX && originX <= maxX) {
+                const first = Math.ceil((minY - originY) / yStep - 1e-9);
+                const last = Math.floor((maxY - originY) / yStep + 1e-9);
+                for (let index = first; index <= last; index++) {
+                    const value = originY + index * yStep;
+                    if (Math.abs(value - originY) <= 1e-9) continue;
+                    const tickA = toScreenPoint(originX - tickSize, value, transform);
+                    const tickB = toScreenPoint(originX + tickSize, value, transform);
+                    ctx.beginPath();
+                    ctx.moveTo(tickA.x, tickA.y);
+                    ctx.lineTo(tickB.x, tickB.y);
+                    ctx.stroke();
+                    const labelPoint = toScreenPoint(originX - tickSize * 2.2, value, transform);
+                    // 同上：y 轴数字同样相对 originY 标注。
+                    ctx.fillText(this.formatAxisNumber(index * yStep), labelPoint.x, labelPoint.y);
+                }
+            }
+        }
+
+        if (showOrigin && originX >= minX && originX <= maxX && originY >= minY && originY <= maxY) {
+            const point = toScreenPoint(originX, originY, transform);
+            ctx.fillStyle = labelColor;
+            ctx.beginPath();
+            ctx.arc(point.x, point.y, Math.max(1.5, tickSize * Math.abs(transform.scale) * 0.35), 0, Math.PI * 2);
+            ctx.fill();
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            ctx.fillText(originLabel, point.x + tickSize * Math.abs(transform.scale), point.y + tickSize * Math.abs(transform.scale));
+        }
+        if (showLabels) {
+            ctx.font = `${fontSize}px Arial`;
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'middle';
+            if (originY >= minY && originY <= maxY) {
+                const point = toScreenPoint(maxX, originY, transform);
+                ctx.fillText(xLabel, point.x + tickSize * Math.abs(transform.scale), point.y);
+            }
+            if (originX >= minX && originX <= maxX) {
+                const point = toScreenPoint(originX, maxY, transform);
+                ctx.fillText(yLabel, point.x + tickSize * Math.abs(transform.scale), point.y - tickSize * Math.abs(transform.scale));
+            }
+        }
+        ctx.restore();
+    }
+
+    private createGrid(params: Map<string, string>): void {
+        if (!this.state.ctx || !this.state.canvas) return;
+        const transform = this.getTextRenderTransform();
+        const scale = Math.abs(transform.scale) > this.zeroThresholdValue ? Math.abs(transform.scale) : 1;
+        // 网格和坐标轴共用同一套「默认范围 + 默认步长」，两者不写范围时也会自动对齐。
+        const { minX, maxX, minY, maxY, xStep, yStep } = this.resolveAxisRange(params, scale, 0, 0);
+        const width = Math.max(0.1, this.getNumberParam(params, 'width', 'lineWidth') ?? 1);
+        const fontSize = Math.max(1, this.getNumberParam(params, 'fontSize', 'fs') ?? 10);
+        const color = this.parseColor(params, 'color') || '#e5e7eb';
+        const labelColor = this.parseColor(params, 'labelColor') || color;
+        const dashed = this.getBooleanParam(params, true, 'dashed', 'dash');
+        const numbers = this.getBooleanParam(params, false, 'numbers', 'showNumbers');
+        if (!(maxX > minX) || !(maxY > minY) || !(xStep > 0) || !(yStep > 0)) {
+            throw new Error('GRID requires maxX>minX, maxY>minY, and positive xStep/yStep');
+        }
+
+        const ctx = this.state.ctx;
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.fillStyle = labelColor;
+        ctx.lineWidth = width;
+        ctx.setLineDash(dashed ? [3, 3] : []);
+        const firstX = Math.ceil(minX / xStep - 1e-9);
+        const lastX = Math.floor(maxX / xStep + 1e-9);
+        for (let index = firstX; index <= lastX; index++) {
+            const x = index * xStep;
+            const bottom = toScreenPoint(x, minY, transform);
+            const top = toScreenPoint(x, maxY, transform);
+            ctx.beginPath();
+            ctx.moveTo(bottom.x, bottom.y);
+            ctx.lineTo(top.x, top.y);
+            ctx.stroke();
+        }
+        const firstY = Math.ceil(minY / yStep - 1e-9);
+        const lastY = Math.floor(maxY / yStep + 1e-9);
+        for (let index = firstY; index <= lastY; index++) {
+            const y = index * yStep;
+            const left = toScreenPoint(minX, y, transform);
+            const right = toScreenPoint(maxX, y, transform);
+            ctx.beginPath();
+            ctx.moveTo(left.x, left.y);
+            ctx.lineTo(right.x, right.y);
+            ctx.stroke();
+        }
+        if (numbers) {
+            ctx.setLineDash([]);
+            ctx.font = `${fontSize}px Arial`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            for (let index = firstX; index <= lastX; index++) {
+                const x = index * xStep;
+                const point = toScreenPoint(x, minY, transform);
+                ctx.fillText(this.formatAxisNumber(x), point.x, point.y + fontSize * 0.3);
+            }
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'middle';
+            for (let index = firstY; index <= lastY; index++) {
+                const y = index * yStep;
+                const point = toScreenPoint(minX, y, transform);
+                ctx.fillText(this.formatAxisNumber(y), point.x - fontSize * 0.3, point.y);
+            }
+        }
+        ctx.restore();
+    }
+
+    /**
+     * 创建一个有序点集。
+     *
+     * 支持两种来源：
+     * - points=A,B,C：引用已有点；
+     * - curve=f start=1 end=-1 step=0.1：按曲线采样生成点集。
+     * 点集只作为区域/路径的边界数据存在，不会污染对象列表。
+     */
+    private createPointSet(params: Map<string, string>): void {
+        const name = params.get('name') || params.get('n');
+        if (!name) throw new Error('POINTSET command requires name parameter');
+
+        const pointsParam = params.get('points') || params.get('p');
+        if (pointsParam) {
+            const points: Point[] = [];
+            for (const pointName of pointsParam.split(',').map(value => value.trim()).filter(Boolean)) {
+                const point = this.getObject(pointName);
+                if (!point || !(point instanceof Point)) {
+                    throw new Error(`Point ${pointName} not found or is not a valid point object`);
+                }
+                points.push(point);
+            }
+            if (points.length < 2) throw new Error('POINTSET points form requires at least 2 points');
+            this.state.pointSets.set(name, points);
+            return;
+        }
+
+        const curveName = params.get('curve') || params.get('source') || params.get('obj');
+        if (!curveName) {
+            throw new Error('POINTSET command requires points=<A,B,...> or curve=<curve>');
+        }
+        const curve = this.getObject(curveName);
+        if (!(curve instanceof Curve)) throw new Error(`Object ${curveName} is not a CURVE`);
+
+        const defaultStart = curve.rangeStart;
+        const defaultEnd = curve.rangeEnd;
+        const start = this.getNumberValue(params, 'start') ?? this.getNumberValue(params, 'xstart') ?? defaultStart;
+        const end = this.getNumberValue(params, 'end') ?? this.getNumberValue(params, 'xend') ?? defaultEnd;
+        const rawStep = this.getNumberValue(params, 'step') ?? this.getNumberValue(params, 'dx');
+        const direction = end >= start ? 1 : -1;
+        const step = Math.abs(rawStep ?? curve.sampleStep ?? 0.1) * direction;
+        if (!Number.isFinite(start) || !Number.isFinite(end) || !Number.isFinite(step) || Math.abs(step) <= 1e-12) {
+            throw new Error('POINTSET curve form requires finite start, end, and non-zero step');
+        }
+
+        const sampleCount = Math.min(10000, Math.max(1, Math.floor(Math.abs((end - start) / step))));
+        const points: Point[] = [];
+        for (let index = 0; index <= sampleCount; index++) {
+            const x = index === sampleCount ? end : start + step * index;
+            if (direction > 0 && x > end + 1e-10) break;
+            if (direction < 0 && x < end - 1e-10) break;
+            points.push(new Point(`${name}_<${points.length}>`, x, curve.evaluate(x)));
+        }
+        if (points.length < 2) throw new Error('POINTSET curve form produced fewer than 2 points');
+        this.state.pointSets.set(name, points);
     }
 
     /**
@@ -2661,7 +4086,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw === 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, region, undefined);
+                this.collectDraw(params, region);
             }
             return;
         }
@@ -2678,14 +4103,50 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw === 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, region, undefined);
+                this.collectDraw(params, region);
+            }
+            return;
+        }
+
+        const pointSetsParam = params.get('pointSets') || params.get('pointsets') || params.get('sets') || params.get('set');
+        if (pointSetsParam) {
+            const points: Point[] = [];
+            for (const setName of pointSetsParam.split(',').map(value => value.trim()).filter(Boolean)) {
+                const pointSet = this.state.pointSets.get(setName);
+                if (!pointSet) {
+                    throw new Error(`POINTSET ${setName} not found`);
+                }
+                for (const point of pointSet) {
+                    const previous = points[points.length - 1];
+                    if (previous && Math.abs(previous.x - point.x) <= 1e-9 && Math.abs(previous.y - point.y) <= 1e-9) continue;
+                    points.push(point);
+                }
+            }
+            // 多个点集通常首尾各自包含同一个交界点；去掉首尾重复点，
+            // 因为 Region 会自动闭合，保留它会生成零长度的闭合边。
+            if (points.length > 1) {
+                const first = points[0];
+                const last = points[points.length - 1];
+                if (Math.abs(first.x - last.x) <= 1e-9 && Math.abs(first.y - last.y) <= 1e-9) {
+                    points.pop();
+                }
+            }
+            if (points.length < 3) {
+                throw new Error('REGION pointSets form requires at least 3 combined points');
+            }
+            this.validateSimpleRegionBoundary(name, points);
+            const region = new Region(name, points);
+            this.state.objects.set(name, region);
+            const draw = params.get('draw');
+            if (draw === 'true' && this.state.ctx) {
+                this.collectDraw(params, region);
             }
             return;
         }
 
         const pointsParam = params.get('boundary') || params.get('points') || params.get('p');
         if (!pointsParam) {
-            throw new Error('REGION command requires boundary, circle + line + side, or curve + circle + side parameters');
+            throw new Error('REGION command requires boundary, pointSets, circle + line + side, or curve + circle + side parameters');
         }
 
         const pointNames = pointsParam.split(',').map(value => value.trim()).filter(Boolean);
@@ -2712,7 +4173,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw === 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, region, undefined);
+            this.collectDraw(params, region);
         }
     }
 
@@ -3028,7 +4489,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, triangle, undefined);
+            this.collectDraw(params, triangle);
         }
     }
 
@@ -3054,7 +4515,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, rectangle, undefined);
+            this.collectDraw(params, rectangle);
         }
     }
 
@@ -3081,7 +4542,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, circle, undefined);
+                this.collectDraw(params, circle);
             }
 
             return;
@@ -3101,7 +4562,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, circle, undefined);
+                this.collectDraw(params, circle);
             }
 
             return;
@@ -3125,7 +4586,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, circle, undefined);
+                this.collectDraw(params, circle);
             }
 
             return;
@@ -3247,8 +4708,8 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, c1, undefined);
-            this.drawObject(this.state.ctx, params, c2, undefined);
+            this.collectDraw(params, c1);
+            this.collectDraw(params, c2);
         }
 
         return { c1, c2 };
@@ -3275,7 +4736,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, ellipse, undefined);
+            this.collectDraw(params, ellipse);
         }
     }
 
@@ -3308,7 +4769,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, parabola, undefined);
+                this.collectDraw(params, parabola);
             }
 
             return;
@@ -3359,7 +4820,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, parabola, undefined);
+                this.collectDraw(params, parabola);
             }
 
             return;
@@ -3401,7 +4862,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, hyperbola, undefined);
+                this.collectDraw(params, hyperbola);
             }
 
             return;
@@ -3454,7 +4915,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, hyperbola, undefined);
+                this.collectDraw(params, hyperbola);
             }
 
             return;
@@ -3495,7 +4956,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, angle, undefined);
+                this.collectDraw(params, angle);
             }
 
         } else {
@@ -3515,7 +4976,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, angle, undefined);
+                this.collectDraw(params, angle);
             }
         }
 
@@ -3560,8 +5021,8 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, pt1, pt1.name);
-                this.drawObject(this.state.ctx, params, pt2, pt2.name);
+                this.collectDraw(params, pt1);
+                this.collectDraw(params, pt2);
             }
         }
     }
@@ -3597,7 +5058,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, point, name);
+                this.collectDraw(params, point);
             }
 
             return;
@@ -3615,7 +5076,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, point, name);
+                this.collectDraw(params, point);
             }
 
             return;
@@ -3633,7 +5094,7 @@ private parseParameters(paramString: string): Map<string, string> {
 
             const draw = params.get('draw');
             if (draw != null && draw == 'true' && this.state.ctx) {
-                this.drawObject(this.state.ctx, params, point, name);
+                this.collectDraw(params, point);
             }
 
             return;
@@ -3768,13 +5229,16 @@ private parseParameters(paramString: string): Map<string, string> {
         // 检查是否需要自动绘制
         const draw = params.get('draw');
         if (draw === 'true' && this.state.ctx) {
-            this.drawObject(this.state.ctx, params, curve, undefined);
+            this.collectDraw(params, curve);
         }
     }
 
     private createAnimation(params: Map<string, string>): void {
         const name = params.get('name');
-        const interval = parseFloat(params.get('interval') || '1000'); // 默认1秒
+        const rawInterval = parseFloat(params.get('interval') || '1000'); // 默认1秒
+        // interval 单位毫秒；0 表示「每个 requestAnimationFrame 都推进一帧」，即跟随显示器刷新率。
+        // 非法值退回默认 1 秒，否则 NaN 会让「到点没有」的判断永远为真，动画变成满速空转。
+        const interval = Number.isFinite(rawInterval) && rawInterval >= 0 ? rawInterval : 1000;
         const repeat = GeometryDSLInterpreter.parseBoolean(params.get('repeat') || 'false');
         // period 表示一个完整周期包含的帧数，主要供 SVG 导出采样。
         // frames / periodFrames 作为兼容别名保留，period 是推荐写法。
@@ -3815,37 +5279,96 @@ private parseParameters(paramString: string): Map<string, string> {
             interval: interval,
             period,
             isRunning: true,
-            animationTimer: 0
+            lastFrameTime: -1
         };
 
-
-        // 交互模式启动计时器；离线导出模式由 stepAnimation 手动逐帧采样
-        if (this.state.animationAutoStart) {
-            animation.animationTimer = setTimeout(() => {
-                this.runAnimationCode(animation);
-            }, 0);
-        }
-
-
         this.state.animations.set(name, animation);
+
+        // 交互模式接入 rAF 循环（所有动画共用一条）；
+        // 离线导出模式由 stepAnimation 手动逐帧采样。
+        if (this.state.animationAutoStart) {
+            this.startAnimationLoop();
+        }
 
         // console.log(`Created animation ${name} with code ${code} interval ${interval}ms and repeat ${repeat}`);
     }
 
-    // 执行动画代码
+    // 启动驱动循环。已经在跑就什么都不做，所以可以放心地每个动画各调一次。
+    private startAnimationLoop(): void {
+        if (!this.state.animationAutoStart) return;
+        if (this.scheduledFrame) return;
+        this.scheduleAnimationFrame(this.onAnimationFrame);
+    }
+
+    // 调度下一次动画帧。
+    // 浏览器走 requestAnimationFrame：回调与浏览器绘制同频，标签页隐藏时自动暂停，
+    // 也不会像 setTimeout 那样在后台继续排队、攒出一堆待执行的定时器。
+    // Node（离线测试 / SVG 导出）没有 rAF，退回 setTimeout，行为与旧实现一致。
+    private scheduleAnimationFrame(callback: (timestamp: number) => void): void {
+        if (typeof requestAnimationFrame === 'function') {
+            const handle = requestAnimationFrame(callback);
+            this.scheduledFrame = { cancel: () => cancelAnimationFrame(handle) };
+            return;
+        }
+        const handle = setTimeout(() => callback(this.animationNow()), 0);
+        this.scheduledFrame = { cancel: () => clearTimeout(handle) };
+    }
+
+    private cancelScheduledFrame(): void {
+        this.scheduledFrame?.cancel();
+        this.scheduledFrame = null;
+    }
+
+    private animationNow(): number {
+        return typeof performance !== 'undefined' && typeof performance.now === 'function'
+            ? performance.now()
+            : Date.now();
+    }
+
+    // 一个 rAF 回调驱动全部动画：每个动画用自己的 lastFrameTime 做节流，
+    // 到点的才跑 CODE 块，因此不同 interval 的动画可以共存且互不干扰。
+    private onAnimationFrame = (timestamp: number): void => {
+        this.scheduledFrame = null;
+        if (!this.state.animationAutoStart) return;
+
+        const now = Number.isFinite(timestamp) ? timestamp : this.animationNow();
+        let hasRunningAnimation = false;
+
+        for (const animation of Array.from(this.state.animations.values())) {
+            if (!animation.isRunning) continue;
+            // 第一帧不等间隔，动画一创建就先画出来。
+            const isFirstFrame = animation.lastFrameTime < 0;
+            if (!isFirstFrame && now - animation.lastFrameTime < animation.interval) {
+                hasRunningAnimation = true;
+                continue;
+            }
+            animation.lastFrameTime = now;
+            this.runAnimationCode(animation);
+            if (animation.isRunning) hasRunningAnimation = true;
+        }
+
+        // 全部跑完（非循环动画播完最后一帧）就自然停下，不再空转。
+        if (hasRunningAnimation) this.startAnimationLoop();
+    };
+
+    // 执行一帧：跑 CODE 块、推进帧号与插槽。
+    // 只负责「跑一帧」，不负责调度 —— 调度在 onAnimationFrame，离线导出走 stepAnimation。
     private runAnimationCode(animation: AnimationState): void {
         if (!this.state.ctx) return;
 
         const commands = this.state.codes.get(animation.code);
         if (!commands) {
             console.error(`Animation ${animation.name}: code ${animation.code} not found`);
+            // 旧实现靠「不再挂定时器」自然停住；现在循环由 isRunning 决定去留，
+            // 这里必须显式停掉，否则循环会一直空转。
+            animation.isRunning = false;
             return;
         }
 
         // 执行代码片段
-        this.executeLines(commands.map(x => x.rawCommand), false);
+        this.executeLines(toLogicalLines(commands), false);
 
-        // 如果动画已经终止了，不再继续执行
+        // CODE 块自己把动画停掉了（例如重名重建），这一帧就不再推进帧号。
         if (animation.isRunning === false) {
             console.log(`Animation ${animation.name} is not running, stopping execution.`);
             return;
@@ -3855,12 +5378,7 @@ private parseParameters(paramString: string): Map<string, string> {
         animation.currentFrame++;
         // 更新slot
         this.state.slots.set(animation.slot, animation.currentFrame);
-        if (animation.isRepeat && this.state.animationAutoStart) {
-            // 如果是循环动画，则重新开始
-            animation.animationTimer = setTimeout(() => {
-                this.runAnimationCode(animation);
-            }, animation.interval);
-        } else if (!animation.isRepeat) {
+        if (!animation.isRepeat) {
             // 如果不是循环动画，则停止
             animation.isRunning = false;
             console.log(`Animation ${animation.name} completed after ${animation.currentFrame} frames`);
@@ -3933,7 +5451,13 @@ private parseParameters(paramString: string): Map<string, string> {
             throw new Error(`Invalid label direction: ${direction}. Use 'up', 'down', 'left', or 'right'.`);
         }
 
-        const fontSize = parseFloat(params.get('fontSize') || params.get('fs') || '12');
+        // 默认字体来自 `SET item=labelFont`（形如 "12px Arial"）；指令上显式写的
+        // fontSize / fontFamily 优先。默认值 '12px Arial' 与历史硬编码一致 → 不设 SET 时不变。
+        const fontParts = /(\d+(?:\.\d+)?)px\s*(.*)$/.exec(this.state.defaultOptions.labelFont);
+        const defaultFontSize = fontParts ? parseFloat(fontParts[1]) : 12;
+        const defaultFontFamily = fontParts && fontParts[2].trim() ? fontParts[2].trim() : 'Arial';
+        const fontSize = parseFloat(params.get('fontSize') || params.get('fs') || String(defaultFontSize));
+        const fontFamily = params.get('fontFamily') || defaultFontFamily;
         const padding = parseFloat(params.get('padding') || params.get('p') || '2');
         const savedPosition = this.state.labelPositions.get(labelId);
         const isSelected = this.state.selectedObjectNames.has(obj.name)
@@ -3942,6 +5466,9 @@ private parseParameters(paramString: string): Map<string, string> {
         const labelOptions = {
             drawDirection: direction as 'down' | 'up' | 'left' | 'right',
             fontSize,
+            fontFamily,
+            // 点标签要绕开点的显示半径，口径必须和绘制/命中一致。
+            defaultPointRadiusPixels: this.state.defaultOptions.pointRadius,
             color: isSelected || isLabelSelected
                 ? SELECTED_OBJECT_COLOR
                 : this.parseColor(params, 'color') || this.parseColor(params, 'c') || this.state.defaultOptions.labelColor,
@@ -3951,7 +5478,7 @@ private parseParameters(paramString: string): Map<string, string> {
         };
 
         this.state.ctx.save();
-        this.state.ctx.font = `normal normal ${fontSize}px Arial`;
+        this.state.ctx.font = `normal normal ${fontSize}px ${fontFamily}`;
         const textWidth = this.state.ctx.measureText(label).width;
         const textHeight = fontSize > 0 ? fontSize : 12;
         const defaultPosition = obj.getDrawLabelPosition(transform, labelOptions, textWidth, textHeight);
@@ -3986,20 +5513,32 @@ private parseParameters(paramString: string): Map<string, string> {
         screenX: number,
         screenY: number,
         tolerancePx: number,
-        view: { x: number; y: number; scale: number },
+        view: CanvasView,
     ): CanvasSelection {
         const canvas = this.state.canvas;
-        if (!canvas || !Number.isFinite(view.scale) || view.scale <= 0) return null;
+        if (!canvas || !isUsableView(view)) return null;
 
         const viewScale = this.state.defaultOptions.scale;
         const baseOffsetX = canvas.width / 2 - this.state.defaultOptions.centerX * viewScale;
         const baseOffsetY = canvas.height / 2 - this.state.defaultOptions.centerY * viewScale;
-        const transform = {
+        // 这个变换把逻辑坐标一步算到屏幕像素（含外层平移/缩放/旋转），
+        // 与渲染路径「先行变换 + 后外层矩阵」的合成结果逐字节相同。
+        const rotation = this.getTotalRotationRadians(view.rotation);
+        const pivot = viewPivot(canvas.width, canvas.height);
+        const transform: DrawTransform = {
             scale: view.scale * viewScale,
             offsetX: view.x + view.scale * baseOffsetX,
             offsetY: view.y + view.scale * baseOffsetY,
+            // 与 drawObject 保持一致：Canvas 路径下像素缩放 = 画布自身的 setTransform scale。
+            // 命中半径（屏幕像素）需要这个值除掉，才能在大画布缩放下保持「贴着可见圆」。
+            pixelScale: view.scale,
+            rotation,
+            pivot,
         };
         const point = { x: screenX, y: screenY };
+        // 标签命中区是按**变换前**的矩形记下来的（见 drawLabel），有旋转时要把屏幕点
+        // 反旋转回那个坐标系再比，否则标签一转过角度就点不中。
+        const labelPoint = rotation ? rotateAbout(point, pivot, -rotation) : point;
         const tolerance = Math.max(6, tolerancePx);
         const pointTolerance = Math.min(tolerance, 7);
         const labelTolerance = Math.min(tolerance, 6);
@@ -4016,10 +5555,31 @@ private parseParameters(paramString: string): Map<string, string> {
             }
         }
         // 即使点没有单独的 DRAW 命令，也允许在其可见位置附近选中。
+        // 点的命中半径只有几像素，不像直线那样会拉出横跨画布的隐形墙，
+        // 所以这里保留全表兜底：线段端点这类「没单独画但位置可见」的点仍然抓得到。
         for (const [name, object] of this.state.objects) {
             if (checked.has(name)) continue;
             if (object instanceof Point && this.hitTestObject(object, point, pointTolerance, transform)) {
                 return { kind: 'object', name: object.name };
+            }
+        }
+
+        // TEXT 是独立的可编辑元素，不应被当作普通几何标签处理。
+        // 命中区域按绘制顺序逆序检查，后绘制的文本优先。
+        for (let i = this.state.textHitRegions.length - 1; i >= 0; i--) {
+            const region = this.state.textHitRegions[i];
+            const baseline = toScreenPoint(region.x, region.y, transform);
+            const textScale = view.scale;
+            const textWidth = region.width * textScale;
+            const textAscent = region.ascent * textScale;
+            const textDescent = region.descent * textScale;
+            if (
+                point.x >= baseline.x - labelTolerance &&
+                point.x <= baseline.x + textWidth + labelTolerance &&
+                point.y >= baseline.y - textAscent - labelTolerance &&
+                point.y <= baseline.y + textDescent + labelTolerance
+            ) {
+                return { kind: 'object', name: region.objectName };
             }
         }
 
@@ -4031,10 +5591,10 @@ private parseParameters(paramString: string): Map<string, string> {
             const labelWidth = region.width * view.scale;
             const labelHeight = region.height * view.scale;
             if (
-                point.x >= labelX - labelTolerance &&
-                point.x <= labelX + labelWidth + labelTolerance &&
-                point.y >= labelY - labelTolerance &&
-                point.y <= labelY + labelHeight + labelTolerance
+                labelPoint.x >= labelX - labelTolerance &&
+                labelPoint.x <= labelX + labelWidth + labelTolerance &&
+                labelPoint.y >= labelY - labelTolerance &&
+                labelPoint.y <= labelY + labelHeight + labelTolerance
             ) {
                 return {
                     kind: 'label',
@@ -4046,12 +5606,15 @@ private parseParameters(paramString: string): Map<string, string> {
             }
         }
 
-        // 先按绘制顺序命中，再用完整对象表兜底，避免线/段因没有进入绘制序列而不可选。
+        // 只命中真正画出来的对象，按绘制顺序逆序检查。
+        //
+        // 这里曾经把 state.objects 全表当兜底，结果那些「建了但没画」的辅助对象
+        // （中垂线、平行线的定义线等）也会参与命中。直线是无限长的，一条看不见的
+        // 辅助直线会横跨整张画布形成一条隐形墙：光标明明离所有可见图形很远，
+        // 却被判定为压在元素上，于是开锁状态下既不能平移也不能缩放。
+        // 判据统一成「看得见才可交互」——只有进入过绘制序列的对象才能被点中。
         checked.clear();
-        const candidates = [
-            ...this.state.renderedObjectNames.slice().reverse(),
-            ...Array.from(this.state.objects.keys()),
-        ];
+        const candidates = this.state.renderedObjectNames.slice().reverse();
         for (const name of candidates) {
             if (checked.has(name)) continue;
             checked.add(name);
@@ -4067,17 +5630,24 @@ private parseParameters(paramString: string): Map<string, string> {
     public screenToLogicalPoint(
         screenX: number,
         screenY: number,
-        view: { x: number; y: number; scale: number },
+        view: CanvasView,
     ): IPoint | null {
         const canvas = this.state.canvas;
-        if (!canvas || !Number.isFinite(view.scale) || view.scale <= 0) return null;
+        if (!canvas || !isUsableView(view)) return null;
         const viewScale = this.state.defaultOptions.scale;
         const baseOffsetX = canvas.width / 2 - this.state.defaultOptions.centerX * viewScale;
         const baseOffsetY = canvas.height / 2 - this.state.defaultOptions.centerY * viewScale;
         const fullScale = view.scale * viewScale;
+        // 先按画布中心反旋转（顺序与渲染路径相反），再退回视图平移缩放。
+        // rotation 为 0 时 unrotated 就是原坐标，与老实现完全一致。
+        const unrotated = rotateAbout(
+            { x: screenX, y: screenY },
+            viewPivot(canvas.width, canvas.height),
+            -this.getTotalRotationRadians(view.rotation),
+        );
         return {
-            x: (screenX - view.x - view.scale * baseOffsetX) / fullScale,
-            y: (view.y + view.scale * baseOffsetY - screenY) / fullScale,
+            x: (unrotated.x - view.x - view.scale * baseOffsetX) / fullScale,
+            y: (view.y + view.scale * baseOffsetY - unrotated.y) / fullScale,
         };
     }
 
@@ -4086,22 +5656,174 @@ private parseParameters(paramString: string): Map<string, string> {
         screenX: number,
         screenY: number,
         tolerancePx: number,
-        view: { x: number; y: number; scale: number },
+        view: CanvasView,
     ): string | null {
         const selection = this.hitTestSelection(screenX, screenY, tolerancePx, view);
         if (!selection) return null;
         return selection.kind === 'label' ? selection.objectName : selection.name;
     }
 
+    /**
+     * 用「选中高亮」样式在任意 2D 上下文中重绘单个对象。
+     *
+     * 供点操作对话框使用：对话框里只有一张从主画布复制过来的静态位图，
+     * 没有解释器渲染循环，所以这里复用与 drawObject 完全相同的变换与 DrawOptions 计算，
+     * 保证高亮的位置、线宽、点半径都和真实几何一致，不会出现「框偏了」的错觉。
+     *
+     * 变换的分工要和 Canvas 渲染路径保持一致：外层缩放/平移由调用方通过
+     * ctx.setTransform 提供，这里只负责 centerX/centerY 造成的视图偏移，
+     * 这样 visibleRect 才能沿用 setTransform 里算好的那块「画布坐标」区间。
+     */
+    public drawObjectHighlight(
+        ctx: CanvasRenderingContext2D,
+        name: string,
+        view: CanvasView,
+        options?: { color?: string },
+    ): boolean {
+        const canvas = this.state.canvas;
+        const obj = this.state.objects.get(name);
+        if (!canvas || !obj || !isUsableView(view)) return false;
+
+        const viewScale = this.state.defaultOptions.scale;
+        const baseOffsetX = canvas.width / 2 - this.state.defaultOptions.centerX * viewScale;
+        const baseOffsetY = canvas.height / 2 - this.state.defaultOptions.centerY * viewScale;
+        const transform: DrawTransform = {
+            scale: viewScale,
+            offsetX: baseOffsetX,
+            offsetY: baseOffsetY,
+            // 下面 ctx.setTransform 用 view.scale 作为外层矩阵，
+            // 所以折算默认线宽/点半径的倍率就是 view.scale。
+            pixelScale: view.scale,
+        };
+
+        const highlightColor = options?.color || SELECTED_OBJECT_COLOR;
+        const drawOptions: DrawOptions = {
+            highlight: true,
+            color: highlightColor,
+            // 直线/射线据此裁剪，避免高亮被画到画布外面去。
+            visibleRect: this.getVisibleViewRect(),
+        };
+        if (this.state.defaultOptions.lineLength != null) {
+            drawOptions.length = this.state.defaultOptions.lineLength;
+        }
+        // 实心点用的是 fillStyle，只改 color 是看不出高亮的。
+        if (obj instanceof Point) {
+            drawOptions.fillColor = highlightColor;
+        }
+
+        ctx.save();
+        this.applyViewMatrix(ctx, view);
+        obj.draw(ctx, transform, drawOptions);
+        ctx.restore();
+        return true;
+    }
+
+    /**
+     * 按视图状态设置 ctx 的外层矩阵。与 applyCanvasViewTransform 共用同一份算法 ——
+     * 高亮 / 预览是叠加在已渲染画布上的，矩阵只要差一点，红框就会和图形错开。
+     */
+    private applyViewMatrix(ctx: CanvasRenderingContext2D, view: CanvasView): void {
+        const canvas = this.state.canvas;
+        if (!canvas) return;
+        const matrix = buildCanvasMatrix(view, canvas.width, canvas.height, this.getDeclaredRotationRadians());
+        ctx.setTransform(matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5]);
+    }
+
+    /**
+     * 用「选中高亮」样式只描出线性对象上的一段，供「截取线段」的悬停预览使用。
+     *
+     * 和 `drawObjectHighlight` 的分工一样：外层缩放/平移由调用方通过 `ctx.setTransform` 提供，
+     * 这里只负责 centerX/centerY 造成的视图偏移。区别是两端可以用 `null` 表示无穷远，
+     * 这时按可见区域裁剪 —— 否则一条直线的预览会被画到画布外面去。
+     */
+    public drawLinearPortionHighlight(
+        ctx: CanvasRenderingContext2D,
+        name: string,
+        view: CanvasView,
+        range: { startT: number | null; endT: number | null },
+        options?: { color?: string },
+    ): boolean {
+        const canvas = this.state.canvas;
+        const obj = this.state.objects.get(name);
+        if (!canvas || !obj || !(obj instanceof LinearObject)) return false;
+        if (!isUsableView(view)) return false;
+
+        const viewScale = this.state.defaultOptions.scale;
+        const baseOffsetX = canvas.width / 2 - this.state.defaultOptions.centerX * viewScale;
+        const baseOffsetY = canvas.height / 2 - this.state.defaultOptions.centerY * viewScale;
+
+        const p1 = obj.p1;
+        const p2 = obj.p2;
+        const dx = p2.x - p1.x;
+        const dy = p2.y - p1.y;
+        const lengthSquared = dx * dx + dy * dy;
+        if (!(lengthSquared > 0)) return false;
+
+        // 可见区域的参数范围：把可见区四角换算回逻辑坐标再投影到线上。
+        // 走 getVisibleLogicalBounds 而不是自己拿画布四角反算 —— 有视图旋转时
+        // 「可见区」不再是画布矩形，少了这一步预览会在角上被提前截断。
+        const bounds = this.getVisibleLogicalBounds();
+        if (!bounds) return false;
+        const corners = [
+            { x: bounds.minX, y: bounds.minY },
+            { x: bounds.maxX, y: bounds.minY },
+            { x: bounds.minX, y: bounds.maxY },
+            { x: bounds.maxX, y: bounds.maxY },
+        ];
+        let visibleLo = Infinity;
+        let visibleHi = -Infinity;
+        for (const corner of corners) {
+            const t = ((corner.x - p1.x) * dx + (corner.y - p1.y) * dy) / lengthSquared;
+            visibleLo = Math.min(visibleLo, t);
+            visibleHi = Math.max(visibleHi, t);
+        }
+
+        const startT = range.startT === null ? visibleLo : Math.max(range.startT, visibleLo);
+        const endT = range.endT === null ? visibleHi : Math.min(range.endT, visibleHi);
+        if (!(endT > startT)) return false;
+
+        const toBase = (t: number) => ({
+            x: baseOffsetX + (p1.x + dx * t) * viewScale,
+            y: baseOffsetY - (p1.y + dy * t) * viewScale,
+        });
+        const start = toBase(startT);
+        const end = toBase(endT);
+
+        ctx.save();
+        this.applyViewMatrix(ctx, view);
+        ctx.beginPath();
+        ctx.moveTo(start.x, start.y);
+        ctx.lineTo(end.x, end.y);
+        ctx.strokeStyle = options?.color || SELECTED_OBJECT_COLOR;
+        // 预览是界面提示而不是几何图形，所以线宽固定成屏幕上的若干像素，不随缩放变粗变细。
+        ctx.lineWidth = 3 / view.scale;
+        ctx.setLineDash([9 / view.scale, 5 / view.scale]);
+        ctx.lineCap = 'round';
+        ctx.stroke();
+        ctx.restore();
+        return true;
+    }
+
     private hitTestObject(
         object: GeometricObject,
         point: IPoint,
         tolerance: number,
-        transform: { scale: number; offsetX: number; offsetY: number },
+        transform: DrawTransform,
     ): boolean {
         if (object instanceof Point) {
             const center = toScreenPoint(object.x, object.y, transform);
-            return Math.hypot(point.x - center.x, point.y - center.y) <= Math.max(tolerance, object.radius * Math.abs(transform.scale) + 4);
+            // 命中半径 = 屏幕上点圆的实际半径（像素），不能拿 object.radius × transform.scale
+            // 这种「逻辑半径 × 全缩放」的旧写法 —— 大 VIEW scale 或大画布缩放下，
+            // 可见圆只有几像素、命中半径却能膨胀到几百像素，导致右键点空白处仍命中点。
+            // 见 resolvePointRadius（点半径的语义是「屏幕像素，与 VIEW scale 无关」）。
+            const screenRadius = resolvePointRadius(
+                object.explicitRadius,
+                object.radius,
+                transform,
+                // 必须和 drawObject 用同一个默认半径，否则「画多大」和「点多容易被点中」会对不上。
+                this.state.defaultOptions.pointRadius,
+            );
+            return Math.hypot(point.x - center.x, point.y - center.y) <= Math.max(tolerance, screenRadius + 4);
         }
 
         if (object instanceof LinearObject) {
@@ -4173,7 +5895,7 @@ private parseParameters(paramString: string): Map<string, string> {
         line: LinearObject,
         point: IPoint,
         tolerance: number,
-        transform: { scale: number; offsetX: number; offsetY: number },
+        transform: DrawTransform,
     ): boolean {
         const start = toScreenPoint(line.p1.x, line.p1.y, transform);
         const end = toScreenPoint(line.p2.x, line.p2.y, transform);
@@ -4183,6 +5905,8 @@ private parseParameters(paramString: string): Map<string, string> {
         if (lengthSquared < 1e-9) return Math.hypot(point.x - start.x, point.y - start.y) <= tolerance;
 
         const projectedT = ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared;
+        // 与 LinearObject.draw 的截止点区间保持一致：看不见的缺口不应再次被右键/左键命中。
+        if (!line.isParameterVisible(projectedT)) return false;
         let t = projectedT;
         if (line instanceof Segment) {
             if (t < 0 || t > 1) return false;
@@ -4223,7 +5947,7 @@ private parseParameters(paramString: string): Map<string, string> {
         return inside;
     }
 
-    private sampleCircularRegion(region: CircularRegion, transform: { scale: number; offsetX: number; offsetY: number }): IPoint[] {
+    private sampleCircularRegion(region: CircularRegion, transform: DrawTransform): IPoint[] {
         const samples: IPoint[] = [
             toScreenPoint(region.startPoint.x, region.startPoint.y, transform),
             toScreenPoint(region.endPoint.x, region.endPoint.y, transform),
@@ -4274,6 +5998,118 @@ private parseParameters(paramString: string): Map<string, string> {
         }
     }
 
+    /**
+     * 取线性对象的两个定义点名字。
+     *
+     * 右键菜单里的等分点 / 延长 / 截取线段 / 中垂线都需要「对象自己的两个定义点」：
+     * 生成 `CREATE POINT_ON_LINE ... point=<p1>` 这类指令时必须引用真实存在的点对象，
+     * 才能让新图形随原图形一起变化；把算出来的坐标硬编码进脚本，一拖动就失效了。
+     */
+    public getLinearEndpointNames(name: string): { p1: string; p2: string } | null {
+        const object = this.getObject(name);
+        if (!object || !(object instanceof LinearObject)) return null;
+        return { p1: object.p1.name, p2: object.p2.name };
+    }
+
+    /**
+     * 取一个点对象的**逻辑坐标**。
+     *
+     * 只为「判断能不能作图」服务：三点共线时外接圆 / 内切圆 / 三角形都做不出来，
+     * 这个判断必须用坐标算叉积，光有名字算不了。
+     * 真正写进脚本的仍然是**点名**（不是坐标）—— 坐标一拖动就失效了。
+     */
+    public getPointCoords(name: string): { x: number; y: number } | null {
+        const object = this.getObject(name);
+        if (!object || !(object instanceof Point)) return null;
+        return { x: object.x, y: object.y };
+    }
+
+    /**
+     * 取**全部点对象**的名字与逻辑坐标。
+     *
+     * 两个圆求交点时，要先看这两个交点里是不是已经有点存在了 —— 有的话只补建另一个。
+     * 判断「点在不在交点上」必须遍历所有点比坐标，光有一个名字算不了。
+     * 同样只用于判断，写进脚本的仍是点名，不是坐标。
+     */
+    public getAllPointCoords(): Array<{ name: string; x: number; y: number }> {
+        const result: Array<{ name: string; x: number; y: number }> = [];
+        for (const [name, object] of this.state.objects) {
+            if (object instanceof Point) {
+                result.push({ name, x: object.x, y: object.y });
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 取线性对象两个定义点的**逻辑坐标**。
+     * 「在线上取点」要把鼠标位置投影到线上，光有名字算不了投影，得有真实坐标。
+     */
+    public getLinearEndpointCoords(name: string): { p1: { x: number; y: number }; p2: { x: number; y: number } } | null {
+        const object = this.getObject(name);
+        if (!object || !(object instanceof LinearObject)) return null;
+        return {
+            p1: { x: object.p1.x, y: object.p1.y },
+            p2: { x: object.p2.x, y: object.p2.y },
+        };
+    }
+
+    /**
+     * 取「落在某个线性对象上的全部点对象」，按沿线的归一化参数 t 升序返回。
+     *
+     * 「截取线段」的切割位置必须来自**真实存在的点**：只有点有名字，生成的 DSL 才能引用它，
+     * 图形被拖动时切割位置才会跟着走。用鼠标位置临时投影出来的切割点一拖动就和原图形脱钩了。
+     *
+     * 容差取对象长度的一个极小比例，只滤掉浮点误差，不把「差一点点」的点也算成切割位置。
+     */
+    public getPointsOnLinear(name: string): Array<{ name: string; t: number }> | null {
+        const object = this.getObject(name);
+        if (!object || !(object instanceof LinearObject)) return null;
+
+        const p1 = object.p1;
+        const p2 = object.p2;
+        const dx = p2.x - p1.x;
+        const dy = p2.y - p1.y;
+        const lengthSquared = dx * dx + dy * dy;
+        if (!(lengthSquared > 0)) return null;
+        const length = Math.sqrt(lengthSquared);
+        const tolerance = length * 1e-6 + 1e-9;
+
+        const found: Array<{ name: string; t: number }> = [];
+        for (const [pointName, candidate] of this.state.objects) {
+            if (!(candidate instanceof Point)) continue;
+            const offsetX = candidate.x - p1.x;
+            const offsetY = candidate.y - p1.y;
+            const cross = offsetX * dy - offsetY * dx;
+            if (Math.abs(cross) / length > tolerance) continue;
+            found.push({
+                name: pointName,
+                t: (offsetX * dx + offsetY * dy) / lengthSquared,
+            });
+        }
+
+        found.sort((a, b) => a.t - b.t);
+        return found;
+    }
+
+    /**
+     * 取一个圆对象的圆心点名、圆心逻辑坐标和半径。
+     *
+     * 右键菜单的「圆操作」（圆周上最近点 / 圆心 / 切线 / 法线）都要先知道圆心和半径：
+     * 最近点的角度 = atan2(鼠标.y − 圆心.y, 鼠标.x − 圆心.x)，距离/半径只用来判断能不能做。
+     * 写进脚本的仍是 `circle=圆名`，坐标只在菜单里算，不写死进 DSL。
+     */
+    public getCircleInfo(name: string): { centerName: string; center: { x: number; y: number }; radius: number } | null {
+        const object = this.getObject(name);
+        if (!object || !(object instanceof Circle)) return null;
+        return {
+            centerName: object.center.name,
+            center: { x: object.center.x, y: object.center.y },
+            radius: object.radius,
+        };
+    }
+
+
     // 查找一个点是否已经命名
     public findPoint(x: number, y: number): Point | undefined {
         for (let geoObjectKV of this.state.objects) {
@@ -4299,32 +6135,74 @@ private parseParameters(paramString: string): Map<string, string> {
     }
 }
 
-// TEXT 指令的 text="..." 值如果因为太长被作者换行写，原始脚本是按 \n
-// 拆成多行的，第二行会被当成新指令丢掉。这里在切行前先扫描，
-// 把 text=" 或 t=" 后面缺少闭合引号的行与后续行直接拼接（不加分隔符，
-// 避免破坏 LaTeX 的连续性，如 "$m=a^2+bn\n+c$" 必须拼成 "$m=a^2+bn+c$"）。
-function joinMultilineText(script: string): string {
-    const lines = script.split('\n');
-    const out: string[] = [];
-    let i = 0;
-    while (i < lines.length) {
-        let line = lines[i];
-        while (hasUnclosedTextQuote(line)) {
-            if (i + 1 >= lines.length) break;
-            i++;
-            line = line + lines[i];
-        }
-        out.push(line);
-        i++;
-    }
-    return out.join('\n');
+// 一条“逻辑指令”：可能由原始脚本的多行合并而来（跨行引号值或行末续行），
+// 但始终携带它在原始脚本中的物理起始行号（1-based）。
+interface LogicalLine {
+    text: string;
+    line: number;
 }
 
-// 行内是否出现 text=" 或 t=" 之后缺少成对引号的情况。
-// 仅作为粗略判别：用 `\b(?:text|t)="` 锁定引号起点，再统计从这个 `"` 到行末
+// 代码片段（[ ... ] 内的行）在 RUN / WITH / ANIMATION 时会重新执行，
+// 这里还原成带物理行号的逻辑行，保持行号与源码一致。
+function toLogicalLines(commands: ParsedCommand[]): LogicalLine[] {
+    return commands.map(command => ({ text: command.rawCommand, line: command.lineNumber }));
+}
+
+// 把原始脚本切分成可执行的逻辑行，同时保留真实物理行号。
+//
+// 需要合并成一条逻辑指令的情况有两种：
+//   1. 引号值跨行书写（text="..." / message="..." 没在同一行闭合）；
+//   2. 行末反斜杠续行。
+// 合并后的行号取该组的首行，这样空行、注释、跨行指令都不会让后续指令的
+// 行号发生偏移——UI 里上报的行号与编辑器里看到的行号完全一致。
+function buildLogicalLines(script: string): LogicalLine[] {
+    // 统一去掉 CRLF 的 \r，避免跨行合并时把 \r 留在参数值中间。
+    const physical = script.split('\n').map(line => line.replace(/\r$/, ''));
+
+    // 第一遍：合并未闭合的引号值。直接拼接（不加分隔符），
+    // 避免破坏 LaTeX 的连续性，如 "$m=a^2+bn\n+c$" 必须拼成 "$m=a^2+bn+c$"。
+    const merged: LogicalLine[] = [];
+    let i = 0;
+    while (i < physical.length) {
+        const startLine = i + 1;
+        let text = physical[i];
+        while (hasUnclosedQuotedValue(text)) {
+            if (i + 1 >= physical.length) break;
+            i++;
+            text = text + physical[i];
+        }
+        merged.push({ text, line: startLine });
+        i++;
+    }
+
+    // 第二遍：合并行末反斜杠续行。
+    // CREATE GRID name=grid \
+    // xMin=-10 xMax=10 \
+    // ...
+    // 反斜杠只在行尾作为续行标记时生效；参数值中的普通反斜杠保持不变。
+    const out: LogicalLine[] = [];
+    let pending: string[] = [];
+    let pendingLine = 0;
+    for (const entry of merged) {
+        const line = entry.text;
+        const continuation = /\\\s*$/.test(line);
+        const content = continuation ? line.replace(/\\\s*$/, '') : line;
+        if (pending.length === 0) pendingLine = entry.line;
+        pending.push(content.trim());
+        if (!continuation) {
+            out.push({ text: pending.join(' '), line: pendingLine });
+            pending = [];
+        }
+    }
+    if (pending.length > 0) out.push({ text: pending.join(' '), line: pendingLine });
+    return out;
+}
+
+// 行内是否出现 `键="` 之后缺少成对引号的情况（跨行书写的 text="..." /
+// message="..." 等）。仅作为粗略判别：锁定引号起点，再统计从这个 `"` 到行末
 // 之间未转义的 `"` 个数（奇数 = 未闭合）。
-function hasUnclosedTextQuote(line: string): boolean {
-    const re = /\b(?:text|t)="/g;
+function hasUnclosedQuotedValue(line: string): boolean {
+    const re = /\b\w+="/g;
     let match: RegExpExecArray | null;
     while ((match = re.exec(line)) !== null) {
         const quoteIdx = match.index + match[0].length - 1;

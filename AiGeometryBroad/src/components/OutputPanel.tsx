@@ -1,7 +1,8 @@
 import React, { useState, useMemo } from 'react';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
-import type { VariableInfo } from '../core/DSLInterpreter';
+import type { ObjectPropertyKey, VariableInfo } from '../core/DSLInterpreter';
+import type { PropertySyncOptions } from '../core/dslPropertySync';
 import { splitLatexParts } from '../core/latexSplit';
 import styled, { css } from 'styled-components';
 
@@ -46,15 +47,33 @@ interface OutputPanelProps {
   variables: VariableInfo[];
   onToggleRandomVariable: (name: string, frozen: boolean) => void;
   onToggleRandomObject: (name: string, frozen: boolean) => void;
+  onTogglePointFrozen: (name: string, frozen: boolean, lineNumber?: number) => void;
   selectedObjectName: string | null;
   onSelectObject: (name: string | null) => void;
+  onObjectPropertyChange: (name: string, changes: Partial<Record<ObjectPropertyKey, number>>, options?: PropertySyncOptions) => void;
+  /** 截止点：整串值写回 `cutPoints=`（例如 `-A,+B`）。 */
+  onCutPointsChange: (name: string, value: string, lineNumber?: number) => void;
+  /** 标签：整串文本写回 `label=`；空串表示不显示标签（把参数删掉）。 */
+  onLabelChange: (name: string, value: string, lineNumber?: number) => void;
+  /** 进入画布点选：点到的点会以 `sign` 指定的方向追加为截止点。 */
+  onPickCutPoint: (name: string, sign: '+' | '-') => void;
 }
 
-const OutputPanel: React.FC<OutputPanelProps> = ({ title, logs, variables, onToggleRandomVariable, onToggleRandomObject, selectedObjectName, onSelectObject }) => {
+interface ObjectDetailHandlers {
+  onObjectPropertyChange: OutputPanelProps['onObjectPropertyChange'];
+  onCutPointsChange: OutputPanelProps['onCutPointsChange'];
+  onLabelChange: OutputPanelProps['onLabelChange'];
+  onPickCutPoint: OutputPanelProps['onPickCutPoint'];
+}
+
+const OutputPanel: React.FC<OutputPanelProps> = ({ title, logs, variables, onToggleRandomVariable, onToggleRandomObject, onTogglePointFrozen, selectedObjectName, onSelectObject, onObjectPropertyChange, onCutPointsChange, onLabelChange, onPickCutPoint }) => {
+  const detailHandlers: ObjectDetailHandlers = { onObjectPropertyChange, onCutPointsChange, onLabelChange, onPickCutPoint };
   const [showLevel, setShowLevel] = useState(false);
   const [showLine, setShowLine] = useState(true);
   const [activeFilter] = useState('all');
-  const [activeTab, setActiveTab] = useState<'output' | 'variables'>('output');
+  // 默认停在 Variables：日常操作（看变量、改属性、冻结）都在这里，
+  // 日志只在排查问题时才需要切过去看。
+  const [activeTab, setActiveTab] = useState<'output' | 'variables'>('variables');
 
   const filteredLogs = useMemo(() => {
     if (activeFilter === 'all') return logs;
@@ -70,11 +89,11 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ title, logs, variables, onTog
   return (
     <PanelContainer>
       <TabHeaderContainer>
-        <TabButton $isActive={activeTab === 'output'} onClick={() => setActiveTab('output')}>
-          {title}
-        </TabButton>
         <TabButton $isActive={activeTab === 'variables'} onClick={() => setActiveTab('variables')}>
           Variables <TabCount>{variables.length}</TabCount>
+        </TabButton>
+        <TabButton $isActive={activeTab === 'output'} onClick={() => setActiveTab('output')}>
+          {title}
         </TabButton>
       </TabHeaderContainer>
 
@@ -161,9 +180,24 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ title, logs, variables, onTog
                   onClick={() => onSelectObject(object.name)}
                 >
                   <VariableName>{object.name}</VariableName>
+                  {/* 只有点能冻结。冻结写进 DSL 的 frozen 属性，画布据此拒绝拖动。
+                      非点对象占一个空位，保持三列网格对齐。 */}
+                  {object.objectType === 'point' ? (
+                    <VariableAction
+                      type="button"
+                      $frozen={Boolean(object.pointFrozen)}
+                      title="冻结后该点在画布上无法拖动（写回 CREATE POINT 的 frozen 属性）"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onTogglePointFrozen(object.name, !object.pointFrozen, object.lineNumber);
+                      }}
+                    >
+                      {object.pointFrozen ? 'Unfreeze' : 'Freeze'}
+                    </VariableAction>
+                  ) : <span />}
                   <VariableValue title={object.expression}>{object.objectType || object.expression}</VariableValue>
                 </ObjectRow>
-                {selectedObjectName === object.name && renderObjectDetails(object)}
+                {selectedObjectName === object.name && renderObjectDetails(object, detailHandlers)}
               </React.Fragment>
             ))}
           </VariableGroup>
@@ -194,7 +228,7 @@ const OutputPanel: React.FC<OutputPanelProps> = ({ title, logs, variables, onTog
                   </VariableAction>
                   <VariableValue>{object.objectType || object.expression}</VariableValue>
                 </ObjectRow>
-                {selectedObjectName === object.name && renderObjectDetails(object)}
+                {selectedObjectName === object.name && renderObjectDetails(object, detailHandlers)}
               </React.Fragment>
             ))}
           </VariableGroup>
@@ -208,7 +242,16 @@ function formatVariableValue(value: VariableInfo['value']): string {
   return typeof value === 'number' ? Number(value.toFixed(6)).toString() : String(value);
 }
 
-function renderObjectDetails(object: VariableInfo): React.ReactElement {
+function renderObjectDetails(
+  object: VariableInfo,
+  handlers: ObjectDetailHandlers,
+): React.ReactElement {
+  const { onObjectPropertyChange, onCutPointsChange, onLabelChange, onPickCutPoint } = handlers;
+  const cutPoints = object.editableCutPoints;
+  const label = object.editableLabel;
+  const hasEditableProperties = Boolean(object.editableProperties && object.editableProperties.length > 0);
+  const lineNumber = object.editableProperties?.[0]?.lineNumber ?? cutPoints?.lineNumber ?? label?.lineNumber;
+
   return (
     <ObjectDetails>
       <ObjectDetailsTitle>{object.name} · {object.objectType}</ObjectDetailsTitle>
@@ -218,6 +261,110 @@ function renderObjectDetails(object: VariableInfo): React.ReactElement {
           <strong>{value}</strong>
         </ObjectDetailRow>
       ))}
+      {(hasEditableProperties || cutPoints || label) && (
+        <EditableProperties>
+          <EditablePropertiesTitle>可编辑属性 · 第 {lineNumber} 行</EditablePropertiesTitle>
+          {object.editableProperties?.map(property => (
+            <EditablePropertyRow key={property.key}>
+              <EditablePropertyLabel title={property.reason}>{property.label}</EditablePropertyLabel>
+              <EditablePropertyInput
+                key={`${property.key}-${property.value}`}
+                type="number"
+                step="any"
+                defaultValue={property.value}
+                disabled={!property.editable}
+                title={property.reason || '修改后同步回 DSL 代码'}
+                onBlur={event => {
+                  const nextValue = Number(event.currentTarget.value);
+                  if (property.editable && Number.isFinite(nextValue)) {
+                    onObjectPropertyChange(
+                      object.name,
+                      { [property.key]: nextValue },
+                      { lineNumber: property.lineNumber },
+                    );
+                  }
+                }}
+                onKeyDown={event => {
+                  if (event.key === 'Enter') event.currentTarget.blur();
+                }}
+              />
+            </EditablePropertyRow>
+          ))}
+          {label && (
+            // 标签是字符串，所以走 onLabelChange 而不是 onObjectPropertyChange（后者只收数值）。
+            // 输入框受控于 defaultValue + key：值变了就重建，避免把用户没提交的输入冲掉。
+            <EditablePropertyRow>
+              <EditablePropertyLabel title={label.reason}>{label.label}</EditablePropertyLabel>
+              <LabelInput
+                key={`label-${label.value}`}
+                type="text"
+                defaultValue={label.value}
+                placeholder="留空 = 不显示"
+                spellCheck={false}
+                disabled={!label.editable}
+                title={label.reason || '修改后同步回 DSL 代码'}
+                onBlur={event => {
+                  if (label.editable) {
+                    onLabelChange(object.name, event.currentTarget.value, label.lineNumber);
+                  }
+                }}
+                onKeyDown={event => {
+                  if (event.key === 'Enter') event.currentTarget.blur();
+                }}
+              />
+            </EditablePropertyRow>
+          )}
+          {cutPoints && (
+            <CutPointRow>
+              <CutPointHeader>
+                <EditablePropertyLabel title={cutPoints.reason}>{cutPoints.label}</EditablePropertyLabel>
+                <CutPointButtons>
+                  {/* 点选后写 `+P`：砍掉 P 正方向那一侧，保留到 P 为止。 */}
+                  <CutPointButton
+                    type="button"
+                    title="在画布上点一个点，写成 +P：隐藏它的正方向一侧"
+                    onClick={() => onPickCutPoint(object.name, '+')}
+                  >
+                    + 点选
+                  </CutPointButton>
+                  {/* 点选后写 `-P`：砍掉 P 负方向那一侧，从 P 开始保留。两个点各选一次就是线段。 */}
+                  <CutPointButton
+                    type="button"
+                    title="在画布上点一个点，写成 -P：隐藏它的负方向一侧"
+                    onClick={() => onPickCutPoint(object.name, '-')}
+                  >
+                    − 点选
+                  </CutPointButton>
+                  <CutPointButton
+                    type="button"
+                    title="清空截止点，恢复成完整的直线 / 射线"
+                    onClick={() => onCutPointsChange(object.name, '', cutPoints.lineNumber)}
+                  >
+                    清空
+                  </CutPointButton>
+                </CutPointButtons>
+              </CutPointHeader>
+              <CutPointInput
+                key={`cutPoints-${cutPoints.value}`}
+                type="text"
+                defaultValue={cutPoints.value}
+                placeholder="例如 -A,+B"
+                spellCheck={false}
+                disabled={!cutPoints.editable}
+                title={cutPoints.reason}
+                onBlur={event => {
+                  if (cutPoints.editable) {
+                    onCutPointsChange(object.name, event.currentTarget.value, cutPoints.lineNumber);
+                  }
+                }}
+                onKeyDown={event => {
+                  if (event.key === 'Enter') event.currentTarget.blur();
+                }}
+              />
+            </CutPointRow>
+          )}
+        </EditableProperties>
+      )}
     </ObjectDetails>
   );
 }
@@ -405,6 +552,135 @@ const ObjectDetailsTitle = styled.div`
   font-size: 0.78rem;
   font-weight: bold;
   margin-bottom: 0.45rem;
+`;
+
+const EditableProperties = styled.div`
+  margin-top: 0.7rem;
+  padding-top: 0.55rem;
+  border-top: 1px solid #4b5563;
+`;
+
+const EditablePropertiesTitle = styled.div`
+  margin-bottom: 0.4rem;
+  color: #a5b4fc;
+  font-size: 0.68rem;
+`;
+
+const EditablePropertyRow = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+`;
+
+const EditablePropertyLabel = styled.span`
+  color: #cbd5e1;
+  font-size: 0.72rem;
+`;
+
+const EditablePropertyInput = styled.input`
+  width: 84px;
+  box-sizing: border-box;
+  padding: 0.2rem 0.3rem;
+  border: 1px solid #64748b;
+  border-radius: 3px;
+  background: #111827;
+  color: #f9fafb;
+  font: inherit;
+  font-size: 0.72rem;
+
+  &:focus {
+    outline: 1px solid #818cf8;
+    border-color: #818cf8;
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+`;
+
+// 标签是自由文本（「点 P」「直线 l」甚至 $LaTeX$），比数值宽一些才够用。
+const LabelInput = styled.input`
+  width: 128px;
+  box-sizing: border-box;
+  padding: 0.2rem 0.3rem;
+  border: 1px solid #64748b;
+  border-radius: 3px;
+  background: #111827;
+  color: #f9fafb;
+  font: inherit;
+  font-size: 0.72rem;
+
+  &:focus {
+    outline: 1px solid #818cf8;
+    border-color: #818cf8;
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+`;
+
+// 截止点是「一串点名 + 方向」，一行放不下标签、输入框和三个按钮，
+// 所以单独排成「标签/按钮在上、输入框占满整行」的两行结构。
+const CutPointRow = styled.div`
+  margin-bottom: 0.35rem;
+`;
+
+const CutPointHeader = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+`;
+
+const CutPointButtons = styled.div`
+  display: flex;
+  gap: 0.25rem;
+  flex-shrink: 0;
+`;
+
+const CutPointButton = styled.button`
+  border: 1px solid #6b7280;
+  background: transparent;
+  color: #d1d5db;
+  border-radius: 4px;
+  padding: 0.12rem 0.3rem;
+  font-family: inherit;
+  font-size: 0.66rem;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover {
+    border-color: #a5b4fc;
+    color: #ffffff;
+  }
+`;
+
+const CutPointInput = styled.input`
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.2rem 0.3rem;
+  border: 1px solid #64748b;
+  border-radius: 3px;
+  background: #111827;
+  color: #f9fafb;
+  font: inherit;
+  font-size: 0.72rem;
+
+  &:focus {
+    outline: 1px solid #818cf8;
+    border-color: #818cf8;
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
 `;
 
 const ObjectDetailRow = styled.div`

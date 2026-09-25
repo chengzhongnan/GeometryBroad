@@ -26,6 +26,9 @@
 * 几何指令以 `CREATE` 关键字作为前缀 (例如 `CREATE POINT ...`)。
 * 数值参数可以使用直接量（如 `100`），也可以引用**插槽(Slot)**中的值。要使用插槽值，请将其名称包含在花括号中，如 `{slot_name}`。支持复杂的数学表达式，例如 `{slot_A * sin(PI()/4)}`。
 * 注释以 `#` 开始，直到行尾。
+* **跨行书写**：带引号的参数值（如 `text="..."`、`message="..."`）允许跨多行书写，解释器会自动拼接成同一条指令（不加分隔符，因此 LaTeX 公式可以被安全地换行）。
+* **续行**：也可以在一行末尾写 `\` 把一条长指令拆成多行。
+* 空行、注释行和上述跨行写法都不会影响错误/日志里报告的行号，报告的行号始终与编辑器里显示的物理行号一致。
 
 ---
 
@@ -45,13 +48,15 @@
 
 #### **1.2 `VIEW`**
 
-* `VIEW [centerX=<num>] [centerY=<num>] [scale=<num>]`
-    * **描述**: 设置画布的视口，实现平移和缩放。
+* `VIEW [centerX=<num>] [centerY=<num>] [scale=<num>] [rotation=<degrees>]`
+    * **描述**: 设置画布的视口，实现平移、缩放和旋转。
     * **参数**:
         * `centerX`: (可选) 视口中心的逻辑X坐标。默认为 `0`。
         * `centerY`: (可选) 视口中心的逻辑Y坐标。默认为 `0`。
         * `scale`: (可选) 缩放级别。`2`代表放大一倍。默认为 `1`。
-    * **示例**: `VIEW centerX=100 centerY=50 scale=2`
+        * `rotation`: (可选, 别名 `rotate`/`angle`) 视图旋转角度，单位是**度**，正值表示屏幕上顺时针，绕画布中心旋转。默认为 `0`。只改变观看角度，不改变任何几何对象本身的坐标 —— `POINT A 1 0` 在 `rotation=90` 下依然是 `(1,0)`，只是看起来转到了下方。想让某个图形本身带角度要用 `CREATE POLYGON` / `CREATE ELLIPSE rotation=` 这类对象级的旋转参数，不要用 `VIEW rotation`。
+    * **说明**: 画布上还有交互式的平移/缩放/旋转（拖动、滚轮、旋转按钮），它们叠加在 `VIEW` 声明的基准量之上；`VIEW` 的值不会因为用户操作而丢失。
+    * **示例**: `VIEW centerX=100 centerY=50 scale=2`、`VIEW rotation=90`
 
 #### **1.3 `DRAW`**
 
@@ -64,13 +69,15 @@
         * `width`: 线性对象的线宽。
         * `fill`: 闭合图形（圆、多边形等）的填充色。
         * `style`: 线条样式 (`solid` 或 `dashed`)。
-        * `label` 或 `l`: 为对象添加文本标签。
+        * `dashed` 或 `dash`: 布尔值，虚线开关。`dashed=true` 与 `style=dashed` 等效，`dashed=false` 强制实线（可覆盖同时写的 `style=dashed`）。注意：**任何带 `draw=true` 的 CREATE 指令（如 `CREATE CIRCUMCIRCLE`、`CREATE CIRCLE`、`CREATE SEGMENT`）都支持 `dashed=true`**，画虚线不必非用 `DRAW`。
+        * `label` 或 `l`: 为对象添加文本标签。**这是标签文字的唯一来源** —— 不写就没有标签，`name` 不会被当成标签画出来。标签文字要带空格时用引号包起来（`label="点 P"`）。
         * `direction` 或 `d`: 标签相对于对象的位置 (`up`, `down`, `left`, `right`)。默认为 `down`。
         * `fontSize` 或 `fs`: 标签的字体大小。
         * `backgroundColor` 或 `bgc`: 标签的背景颜色。
     * **示例**:
         * `DRAW obj=seg_AB width=3 color=blue style=dashed label=线段AB`
         * `DRAW obj=A,B,C color=red radius=5`
+        * `CREATE CIRCUMCIRCLE name=cc p1=A p2=B p3=C draw=true dashed=true`（在 CREATE 上直接画虚线）
 
 #### **1.4 `TEXT`**
 
@@ -85,10 +92,11 @@
     * **描述**: 给一个已创建的封闭对象填充颜色。支持普通 `REGION`、圆弓形 `REGION`、曲线-圆 `REGION`、`POLYGON`、`TRIANGLE`、`RECTANGLE`、`CIRCLE` 和 `ELLIPSE`。
     * `color`: 填充颜色，支持 CSS 颜色名、十六进制颜色和 `{slot}`。
     * `borderColor`: (可选) 边界线颜色，默认使用当前几何图形颜色。
+    * **与 `draw=true` 的关系**: 若目标对象本身写了 `draw=true`（还没绘制），本指令的填充会并入它的待绘样式，等脚本执行完统一绘制；否则在本指令位置立即绘制。无论哪种情况对象都只画一次。
     * **示例**: `FILL obj=R color=lightblue borderColor=blue`
     * **准确性说明**: 区域边界由实际几何坐标组成，Canvas 和 SVG 都直接绘制同一条闭合路径，不使用截图或像素取样。
 
-#### **1.5 `MEASURE`**
+#### **1.6 `MEASURE`**
 
 * `MEASURE type=<type> ... slot=<s>`
     * **描述**: 测量几何对象的属性（如距离、角度、面积）并将结果存入一个插槽 (Slot) 中。
@@ -101,7 +109,7 @@
         * `MEASURE type=distance p1=A p2=B slot=dist_AB`
         * `MEASURE type=area obj=tri_ABC slot=area_ABC`
 
-#### **1.5 `CALCULATE`**
+#### **1.7 `CALCULATE`**
 
 * `CALCULATE expression=<expr> slot=<s>`
     * **描述**: 执行一个数学表达式，并将结果存入指定的插槽中。
@@ -110,7 +118,7 @@
         * `slot` 或 `s`: (可选) 用于存储结果的插槽名称。
     * **示例**: `CALCULATE e={sqrt({dist_AB}^2 + {dist_BC}^2)} s=hypotenuse`
 
-#### **1.6 `GETOBJ`**
+#### **1.8 `GETOBJ`**
 
 * `GETOBJ name=<obj> property=<prop> slot=<s>`
     * **描述**: 从一个对象中获取其某个属性值，并将该值存入一个插槽中。如果属性本身是另一个几何对象，则存入的是该几何对象的名称。
@@ -122,7 +130,7 @@
         * `GETOBJ n=tri_ABC p=p1 s=vertex_name`
         * `GETOBJ o=A p=x s=A_x`
 
-#### **1.7 `PRINT | MESSAGE`**
+#### **1.9 `PRINT | MESSAGE`**
 
 * `PRINT | MESSAGE message=<text>`
     * **描述**: `PRINT` 和 `MESSAGE` 指令效果完全相同，用于在控制台或UI消息区打印一条消息，可以包含插槽中的值。
@@ -131,7 +139,7 @@
     * **示例**: `PRINT message=当前距离是 {dist_AB} 个单位。`
     * **LaTeX**: 消息中的 `$...$`、`$$...$$`、`\\(...\\)` 和 `\\[...\\]` 会在消息面板中渲染为 LaTeX。
 
-#### **1.8 `SET`**
+#### **1.10 `SET`**
 
 * `SET item=<item> value=<value>`
     * **描述**: 修改一个全局默认参数，影响之后创建/绘制的所有对象。
@@ -141,17 +149,17 @@
     * **可用 item**:
         * `backgroundColor`: 画布背景色。
         * `penColor` / `geoColor`: 默认画笔/几何图形颜色。
-        * `penSize`: 默认画笔粗细。
-        * `labelFont` / `labelColor` / `labelSize`: 标签字体、颜色、字号。
-        * `pointRadius` / `pointFill`: 默认点半径、是否填充。
-        * `drawLabelForPoints` / `drawLabelForOthers` / `drawAfterCreate`: 是否自动绘制标签/创建对象后自动绘制。
-        * `centerX` / `centerY` / `scale`: 视图中心与缩放。
+        * `penSize`: 默认线宽，单位**屏幕像素**（缺省 1）。指令里写 `width=<n>` 可单独覆盖。
+        * `labelFont` / `labelColor` / `labelSize`: 标签字体、颜色、字号。指令里写 `fontSize`/`fontFamily` 可单独覆盖。
+        * `pointRadius` / `pointFill`: 默认点半径（**屏幕像素**，缺省 4）；`CREATE POINT` 建的点是否默认实心（缺省 `false`，即空心）。
+        * `drawLabelForPoints` / `drawLabelForOthers`: 是否自动绘制标签（缺省 `true` / `false`）。
+        * `centerX` / `centerY` / `scale` / `rotation`: 视图中心、缩放与旋转（`rotation` 单位为度），等价于 `VIEW centerX/centerY/scale/rotation`。
         * **`lineLength`**: 直线(`LINE`)与射线(`RAY`)的绘制长度，单位为几何坐标。
             * 未设置（或设为 `auto`、`0`）时，直线/射线默认**只画到屏幕边缘就停住**，不会无限延伸；这样导出 SVG 时画布不会被一条超长的直线撑大，几何图形也不会显得很小。
             * 设置为正数 `n` 后：直线以 `p1`、`p2` 的中点为基准向两端各延伸 `n/2`（总长 `n`）；射线从顶点向前延伸 `n`。
             * **示例**: `SET item=lineLength value=200`、`SET item=lineLength value=auto`
 
-#### **1.9 `CODE` / `RUN` / `WITH`**
+#### **1.11 `CODE` / `RUN` / `WITH`**
 
 * **描述**: 用于定义、执行和有条件地执行代码块，以组织和重用指令序列。
 * **`CODE name=<block_name>`**: 开始一个命名代码块的定义。后续行直到 `]` 结束都属于该块。
@@ -188,19 +196,49 @@
 
 所有几何指令都以 `CREATE` 关键字开头。
 
-> **重要提示**: 所有 `CREATE` 指令都支持一个可选的 `draw=true` 参数。当设置此参数时，新创建的对象会**立即被绘制**到画布上。您可以在同一行中附加任何 `DRAW` 指令支持的绘图选项（如 `color`, `width`, `label` 等）来控制其样式，如果是一个点，默认会绘制点的Label，与name属性相同，其他几何对象，默认不绘制Label，如需绘制，需要指定参数。
+> **重要提示**: 所有 `CREATE` 指令都支持一个可选的 `draw=true` 参数。设置此参数的对象**不在 create 时就画**，而是先被收集起来，等**整个脚本执行完**之后自动补一次绘制 —— 相当于脚本末尾有一条隐含的 `DRAW`。绘制顺序 = 创建顺序，所以层级与「逐个立即绘制」时一致。
+>
+> 之所以统一后置：截止点、交点、线上取点这类东西天然是**前向引用**（它们只能建在引用它们的对象之后）。全部后置之后，任何对象都能引用在它后面才创建的东西，不必为每种前向引用各写一套延迟逻辑。只对**几何对象**这么做 —— `TEXT` / `AXIS` 等仍立即绘制。
+>
+> 想控制层级就用 `DRAW obj=<name>`：它按原样**立即**绘制（显式指定 `color` / `width` / `label` 等样式）。若目标对象本身也写了 `draw=true`，`DRAW` 只覆盖它的样式，不会重复画一遍。
+>
+> 您可以在 `CREATE` 同一行中附加任何 `DRAW` 指令支持的绘图选项（如 `color`, `width`, `label` 等）来控制其样式。**标签只认显式写出来的 `label=`**：`name` 是给引用用的标识符，不会自动画到图上。点的标签由 `SET item=drawLabelForPoints` 总控（默认开），其它对象的标签由 `SET item=drawLabelForOthers` 总控（默认关）—— 总开关打开时，也只有写了 `label=` 的对象才会出现文字。
 >
 > **示例**: `CREATE POINT name=A x=50 y=50 draw=true color=green radius=5 label=起始点`
+>
+> **标签的三种改法**（都写回脚本里的 `label=`，改完立刻重画）：
+> 1. 直接在脚本里写 `label=文本`；写 `label=""`（或把 `label=` 整个删掉）表示不显示。
+> 2. 在变量面板里选中对象，展开「可编辑属性」后改 **标签** 那一行；留空即清除。
+> 3. 在画布上右键对象，选「修改标签…」，在弹出的对话框里改（对话框里有「这一行将变成」的实时预览，还有「清除标签」按钮）。
+>
+> 标签文本里带空格时会被自动加引号（`label="点 P"`）；也可以写 `$LaTeX$`。
+>
+> **关于自动生成的名称**：画布上右键作图（连接、垂线、对称点、等分点……）生成的对象名是「短前缀 + 序号」，例如 `seg1`、`perp2`、`foot`、`refl_2`，与嵌套层数无关。派生关系看指令自身的参数即可（`point=P1 line=L`），不必编码进名字里。
+>
+> **多选作图**（ctrl+左键逐个点选）：
+> - 选三个点 → 右键菜单给「作三角形 / 作外接圆 / 作内切圆」；三点共线时置灰并说明原因。
+> - 选两条共端点的线 → 右键菜单给「作角平分线（第一条 → 第二条）/ 以这两条边作平行四边形 / 求两条线的交点」。
+> - 角平分线不区分选中顺序 —— 内部走 `ANGLE + ANGLE_BISECTOR`，`ANGLE` 取的是 |值|≤180° 的有符号角，两条顺序给出同一条内角平分线（DSL 当前行为）。
+> - 平行四边形 = `MIDPOINT + REFLECTED_POINT + POLYGON`：用 BC 的中点 M，把 A 关于 M 中心对称得 D = B+C−A，再用 `POLYGON points=A,B,D,C`。
 
 #### **2.1 基础对象**
 
-* **2.1.1 `CREATE POINT`**: `name=<name> x=<num> y=<num> [radius=<num>] [real=<bool>]`
+* **2.1.1 `CREATE POINT`**: `name=<name> x=<num> y=<num> [radius=<num>] [real=<bool>] [frozen=<bool>]`
     * **描述**: 定义一个点。
-    * **参数**: `name`(必须), `x`(必须), `y`(必须), `radius`(可选), `real`(可选,标记是否为“实”点)。
+    * **参数**: `name`(必须), `x`(必须), `y`(必须), `radius`(可选), `real`(可选,标记是否为“实”点), `frozen`(可选,冻结后该点在画布上无法拖动)。
+    * **关于 `radius`**: 单位是**屏幕像素**，与 `VIEW scale` 无关，也不随画布缩放变化。不写时为 **4 像素**（与解释器自动生成的点——中点、垂足、交点等——保持一致），全局默认可用 `SET item=pointRadius` 改。想画大一点的点直接写 `radius=8`，不要靠调大 `VIEW scale`。
+    * **关于线宽**: 不写 `width=` 时默认 **1 像素**，同样与 `VIEW scale` 无关。全局默认线宽用 `SET item=penSize value=<像素>` 设置（单位屏幕像素），单条指令仍可用 `DRAW ... width=` 覆盖。
+    * **关于 `frozen`**: 冻结的点在画布上无法用鼠标拖动，避免误改关键点。冻结只影响拖动：该点仍然可以在变量面板里直接改坐标，也仍然正常参与求交点等计算。不写时为 `false`。变量面板里每个点后面都有 Freeze / Unfreeze 按钮，点击会把这个属性写回代码。
     * **示例**: `CREATE POINT name=A x=100 y=200 radius=5`
 
-* **2.1.2 `CREATE LINE`**: `name=<name> p1=<point> p2=<point>`
+* **2.1.2 `CREATE LINE`**: `name=<name> p1=<point> p2=<point> [cutPoints=<point1,point2,...>]`
     * **描述**: 定义一条穿过两个已知点的直线。几何意义上它仍然可以向两端无限延伸（求交点等操作不受影响），但**绘制出来的长度是有限的**。
+    * **截止点**: `cutPoints`（也接受 `cutoffPoints` / `cuts`）是一串「点名 + 可选方向」，沿 `p1→p2` 的参数方向排序后逐个**翻转**绘制状态；起点是否绘制由第一个截止点的方向决定（第一个点写 `-A` 就说明 A 之前本来就没画）。三种写法：
+        * `A`（不带方向）：从定义域起点画到 A 后停止；`A,B` 会跳过 A 到 B，两侧都画。
+        * `-A`（「从 A 开始」）：A 的负方向一侧不画，保留参数 ≥ A 的部分。
+        * `+A`（「到 A 为止」）：A 的正方向一侧不画，保留参数 ≤ A 的部分。
+        因此 `cutPoints=-A,+B` 把直线截成线段 [A,B]，`cutPoints=+A,-B` 则是挖掉中间一段。截止点只影响绘制和命中测试，不改变直线的几何定义、求交和点的依赖关系。
+    * **前向引用**: 截止点可以在直线**之后**才定义（线上的点、交点都只能这样写）。这种线会推迟到脚本末尾再画，因此层级排在其它对象之上。
     * **绘制长度**: 由 `SET item=lineLength value=<n>` 控制，以 `p1`、`p2` 的中点为基准向两端各延伸 `n/2`。未设置时默认只画到屏幕边缘。
     * **示例**:
         ```
@@ -208,12 +246,14 @@
         CREATE LINE name=l_AB p1=A p2=B draw=true
         ```
 
-* **2.1.3 `CREATE SEGMENT`**: `name=<name> p1=<point> p2=<point>`
+* **2.1.3 `CREATE SEGMENT`**: `name=<name> p1=<point> p2=<point> [cutPoints=<point1,point2,...>]`
     * **描述**: 定义一条连接两个已知点的线段。
+    * **截止点**: 语义与 `CREATE LINE` 相同（`-A` / `+A` / `A`）。`cutPoints=+A,-B` 可以挖掉线段中间的一段。
     * **示例**: `CREATE SEGMENT name=seg_AB p1=A p2=B`
 
-* **2.1.4 `CREATE RAY`**: `name=<name> vertex=<point> p1=<point>`
+* **2.1.4 `CREATE RAY`**: `name=<name> vertex=<point> p1=<point> [cutPoints=<point1,point2,...>]`
     * **描述**: 定义一条从`vertex`点出发，穿过`p1`点的射线。绘制长度同样受 `SET item=lineLength value=<n>` 控制（从顶点向前延伸 `n`），未设置时只画到屏幕边缘。
+    * **截止点**: 语义与 `CREATE LINE` 相同（`-A` / `+A` / `A`）。`cutPoints=A` 表示只绘制从顶点到 A；`cutPoints=+A` 把射线截成线段 [vertex, A]；`cutPoints=-A` 去掉顶点到 A 的一段。截止点必须是位于射线上的点。
     * **参数**: `name`, `vertex`(或`v`), `p1`。
     * **示例**: `CREATE RAY name=ray_A vertex=A p1=B`
 
@@ -233,7 +273,7 @@
 * **2.2.2 `CREATE INTERSECT`**: `name=<name(s)> obj1=<o1> obj2=<o2>`
     * **描述**: 定义两个几何对象（直线、圆等）的交点。
     * **参数**: `name`(或`n`), `obj1`(或`o1`), `obj2`(或`o2`)。
-    * **注意**: 如果存在多个交点，请在 `name` 参数中使用逗号分隔的名称列表（例如 `name=P,Q`），而如果存在两个交点，其中一个交点是已知命名过的交点，那么只需要另外一个没有命名的交点的名字。
+    * **注意**: 如果存在多个交点，请在 `name` 参数中使用逗号分隔的名称列表（例如 `name=P,Q`）。系统会按坐标去重：某个交点所在位置已经有点存在时，该交点不再重复创建。因此如果两个交点里已经有一个是已知命名过的点，只需要给出「缺少的那个」名字即可（另一个交点不会被新建，已有点的坐标也不会被改动）。两个圆相交且两个交点都缺时，给两个名字一次建出两个；只给一个名字时第二个自动命名为 `<名字>_2`。
     * **示例**: `CREATE INTERSECT name=P,Q obj1=my_line obj2=my_circle`
 
 * **2.2.3 `CREATE POINT_ON_LINE`**: `name=<name> line=<line> point=<p> distance=<d>`
@@ -243,27 +283,28 @@
 
 * **2.2.4 `CREATE PERPENDICULAR_FOOT`**: `name=<name> from=<point> on=<line>`
     * **描述**: 一步到位创建从一个点到一条直线的垂足。
-    * **参数**: `name`(或`n`), `from`(或`f`), `on`(或`o`)。
+    * **参数**: `name`(或`n`), `from`(或`f`/`point`/`p`), `on`(或`o`/`line`/`l`/`obj`)。
     * **示例**: `CREATE PERPENDICULAR_FOOT n=H from=P on=line_AB`
 
 #### **2.3 几何作图 (尺规作图)**
 
-* **2.3.1 `CREATE PERP_BISECTOR`**: `name=<name> p1=<p1> p2=<p2>`
+* **2.3.1 `CREATE PERP_BISECTOR`**: `name=<name> p1=<p1> p2=<p2> [cutPoints=<point1,point2,...>]`
     * **描述**: 创建连接两点 `p1`, `p2` 的线段的**垂直平分线**。
     * **参数**: `name`(必须), `p1`(必须), `p2`(必须)。
-    * **示例**: `CREATE PERP_BISECTOR name=pb_AB p1=A p2=B`
+    * **截止点**: 派生线同样支持 `cutPoints`（见 `CREATE LINE`）。它们的两个定义点是内部合成点，没法靠交换 `p1`/`p2` 表达「删掉某一侧」，所以要用 `-A` / `+A` 这类带方向的写法：`cutPoints=-A,+B` 只画 [A,B] 之间。
+    * **示例**: `CREATE PERP_BISECTOR name=pb_AB p1=A p2=B cutPoints=-M,+N draw=true`
 
-* **2.3.2 `CREATE PERPENDICULAR`**: `name=<name> point=<p> line=<l>`
+* **2.3.2 `CREATE PERPENDICULAR`**: `name=<name> point=<p> line=<l> [cutPoints=<point1,point2,...>]`
     * **描述**: 创建一条通过指定点 `point` 并垂直于指定直线 `line` 的**垂线**。
     * **参数**: `name`(必须), `point`(或`p`, 必须), `line`(或`l`, 必须)。
     * **示例**: `CREATE PERPENDICULAR name=perp_from_C line=l_AB point=C`
 
-* **2.3.3 `CREATE PARALLEL`**: `name=<name> point=<p> line=<l>`
+* **2.3.3 `CREATE PARALLEL`**: `name=<name> point=<p> line=<l> [cutPoints=<point1,point2,...>]`
     * **描述**: 创建一条通过指定点 `point` 并平行于指定直线 `line` 的**平行线**。
     * **参数**: `name`(必须), `point`(或`p`, 必须), `line`(或`l`, 必须)。
     * **示例**: `CREATE PARALLEL name=para_from_C line=l_AB point=C`
 
-* **2.3.4 `CREATE ANGLE_BISECTOR`**: `name=<name> angle=<a>`
+* **2.3.4 `CREATE ANGLE_BISECTOR`**: `name=<name> angle=<a> [cutPoints=<point1,point2,...>]`
     * **描述**: 创建一个已定义的角度 `angle` 的**角平分线**。
     * **参数**: `name`(必须), `angle`(或`a`, 必须)。
     * **示例**:
@@ -293,8 +334,37 @@
     * **参数**: `name`(必须), `points`(或`p`, 必须, 值为逗号分隔的点名列表)。
     * **示例**: `CREATE POLYGON name=my_quad points=A,B,C,D`
 
-* **2.5.2 `CREATE REGION`**:
+* **2.5.2 `CREATE AXIS`**:
+    * **最简用法**: `CREATE AXIS name=axes`
+    * **描述**: 精确绘制一组坐标轴。**不写任何范围/步长参数也能得到好看的默认效果**：
+        * 范围默认**贴合当前可见区域**（由 `VIEW` 的 `centerX/centerY/scale` 与画布平移缩放共同决定），并向外吸附到步长的整数倍，所以换 `scale` 也不用改参数；
+        * 步长默认按 `scale` 自动取 **1/2/5×10ⁿ** 的「整数级」数值，使刻度间距约 **64px**，数字既不会挤在一起也不会稀疏到没有意义；
+        * 刻度总长默认约 **10px**、箭头约 **13px**，都按屏幕像素换算，不再写死逻辑单位。
+    * **参数**: `name=<name> [originX=<x>] [originY=<y>] [xMin=<x>] [xMax=<x>] [yMin=<y>] [yMax=<y>]`。任何显式给出的参数都优先于自动值。
+    * **显示参数**: `numbers`/`showNumbers`、`arrows`/`showArrows`、`bothArrows`、`origin`/`showOrigin`、`labels`/`axisLabels`。
+    * **样式参数**: `xStep`、`yStep`（或用 `step` 同时设置两者）、`tickSize`、`arrowSize`、`color`、`labelColor`、`width`、`dashed`、`fontSize`、`xLabel`、`yLabel`、`originLabel`。
+    * **注意**: `tickSize` 是**从轴向两侧各画这么长**，所以刻度视觉总长度是它的两倍。`originX/originY` 默认 `(0,0)`；刻度数字标的是**相对原点的偏移**（原点处不标 0），因此把原点挪到别处就等于画出第二组坐标系。若原点不在可见范围内，该方向的轴线与刻度不会绘制（网格不受影响）。
+    * **示例**: `CREATE AXIS name=axes`；`CREATE AXIS name=axes step=1 color=#666666 numbers=true`；`CREATE AXIS name=axes xMin=-3 xMax=3 yMin=-2 yMax=2`；上下两组坐标系：`CREATE AXIS name=top originX=0 originY=3 xMin=-1 xMax=4 yMin=2.6 yMax=4.3 xStep=1 yStep=1` + `CREATE AXIS name=bot originX=0 originY=-1 xMin=-1 xMax=4 yMin=-1.5 yMax=1.5 xStep=1 yStep=1`（两组轴上的数字都从 0 开始，不会显示 3、-1 这些绝对坐标）
+
+* **2.5.3 `CREATE GRID`**:
+    * **最简用法**: `CREATE GRID name=grid`
+    * **描述**: 绘制水平和竖直网格线。**范围与步长的默认规则和 `CREATE AXIS` 完全一致**，所以 `CREATE GRID` 与 `CREATE AXIS` 都不写范围时会自动对齐。网格不会无限延伸，适合放在 AXIS 或其他图形指令之前作为背景。
+    * **参数**: `name=<name> [xMin=<x>] [xMax=<x>] [yMin=<y>] [yMax=<y>] [xStep=<dx>] [yStep=<dy>]`，或用 `step` 同时设置 x/y 步长。
+    * **样式参数**: `color`、`width`、`dashed`；可选 `numbers`/`showNumbers` 绘制网格边缘数字。
+    * **示例**: `CREATE GRID name=grid`；`CREATE GRID name=grid step=1 color=#eeeeee`
+
+* **2.5.4 `CREATE POINTSET`**:
+    * 引用已有点：`name=<name> points=<p1,p2,...>`
+    * 按曲线采样：`name=<name> curve=<curve> start=<x> end=<x> step=<dx>`
+    * **描述**: 创建有序点集。点集主要用于把曲线采样点或已有点组合成区域边界，不作为普通几何对象单独显示。
+    * **示例**:
+        ```
+        CREATE POINTSET name=curve_boundary curve=parabola_curve start=1 end=-1 step=0.1
+        CREATE POINTSET name=top_boundary points=L2,L1
+        ```
+* **2.5.3 `CREATE REGION`**:
     * 普通区域：`name=<name> boundary=<p1,p2,...>`
+    * 点集区域：`name=<name> pointSets=<set1,set2,...>`（也支持 `sets` / `set`）
     * 圆弓形区域：`name=<name> circle=<circle> line=<line> side=<left|right>`
     * **普通区域描述**: `boundary` 中的点必须按照沿区域边界行走的顺序给出，系统会自动连接最后一点和第一点。
     * **普通区域约束**: 区域采用简单多边形模型，支持凸多边形和凹多边形；边界不能自交，连续两个点不能重合。若最后再次写出第一点，系统会自动去重。

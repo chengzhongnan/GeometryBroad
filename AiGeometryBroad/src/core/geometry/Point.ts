@@ -1,4 +1,4 @@
-import { GeometricObject, type IPoint, type DrawLabelOptions, toScreenPoint, resolvePointRadius, resolveLineWidth } from './base';
+import { GeometricObject, type DrawTransform, type IPoint, type DrawLabelOptions, toScreenPoint, resolvePointRadius, resolveLineWidth } from './base';
 
 export class PointNativeObject implements IPoint {
     public x: number;
@@ -20,6 +20,9 @@ export class Point extends GeometricObject implements IPoint {
     public radius: number; // 默认半径
     public real: boolean; // 是否为实心点，false表示空心点
     public explicitRadius: boolean; // 用户是否显式指定了半径
+    // 冻结后画布上不允许左键拖动这个点（对应 `CREATE POINT ... frozen=true`）。
+    // 解释器自动生成的点（中点、垂足、交点…）不参与，恒为 false。
+    public frozen: boolean = false;
 
     constructor(name: string, x: number, y: number, radius?: number, real: boolean = true) {
         super(name, 'point');
@@ -87,9 +90,9 @@ export class Point extends GeometricObject implements IPoint {
     }
 
     // 绘制点
-    public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: { color?: string; lineWidth?: number; fillColor?: string; highlight?: boolean }): void {
+    public draw(ctx: CanvasRenderingContext2D, transform: DrawTransform, options?: { color?: string; lineWidth?: number; fillColor?: string; highlight?: boolean; defaultPointRadiusPixels?: number }): void {
         const canvasPt = this.transform(transform.scale, transform.offsetX, transform.offsetY);
-        const screenRadius = resolvePointRadius(this.explicitRadius, this.radius, transform.scale) * (options?.highlight ? 2 : 1);
+        const screenRadius = resolvePointRadius(this.explicitRadius, this.radius, transform, options?.defaultPointRadiusPixels) * (options?.highlight ? 2 : 1);
 
         ctx.beginPath();
         // y方向默认为向下正方向，在这里改成向上正方向
@@ -101,12 +104,12 @@ export class Point extends GeometricObject implements IPoint {
             ctx.fill();
         } else {
             ctx.strokeStyle = options?.color || 'black';
-            ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform.scale) * (options?.highlight ? 2 : 1);
+            ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform) * (options?.highlight ? 2 : 1);
             ctx.stroke();
         }
     }
 
-    getDrawLabelPosition(transform: { scale: number; offsetX: number; offsetY: number; }, options: DrawLabelOptions, textWidth: number, textHeight: number): IPoint {
+    getDrawLabelPosition(transform: DrawTransform, options: DrawLabelOptions, textWidth: number, textHeight: number): IPoint {
         // 获取标签的实际尺寸（考虑padding）
         const padding = options.padding || 0;
         const actualTextWidth = textWidth + padding * 2;
@@ -116,7 +119,7 @@ export class Point extends GeometricObject implements IPoint {
         let labelY = this.y;
         
         // 计算点的实际显示半径
-        const actualRadius = resolvePointRadius(this.explicitRadius, this.radius, transform.scale);
+        const actualRadius = resolvePointRadius(this.explicitRadius, this.radius, transform, options.defaultPointRadiusPixels);
         
         // 根据drawDirection确定标签位置
         if (options.drawDirection) {

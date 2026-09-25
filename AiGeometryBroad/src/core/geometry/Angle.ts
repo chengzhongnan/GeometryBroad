@@ -1,4 +1,4 @@
-import { GeometricObject, type IPoint, type DrawOptions, type DrawLabelOptions, toScreenPoint } from './base';
+import { GeometricObject, type DrawTransform, type IPoint, type DrawOptions, type DrawLabelOptions, toScreenPoint, resolveLineWidth } from './base';
 import { Point, PointNativeObject } from './Point';
 import { Ray } from './LinearObject';
 
@@ -109,20 +109,22 @@ export class Angle extends GeometricObject {
         return this._value;
     }
 
-    public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
+    public draw(ctx: CanvasRenderingContext2D, transform: DrawTransform, options?: DrawOptions): void {
         if (!this._vertex || !this._point1 || !this._point2) {
 
             return;
         }
 
         const { scale, offsetX, offsetY } = transform;
-        const defaultOptions: DrawOptions = { color: 'black', lineWidth: 1, fillColor: 'rgba(0,0,0,0)' };
+        // 不在这里塞 lineWidth 默认值：塞了就分不清「用户没写」和「用户写了 1」，
+        // 默认粗细交给 resolveLineWidth 按屏幕像素折算。
+        const defaultOptions: DrawOptions = { color: 'black', fillColor: 'rgba(0,0,0,0)' };
         const drawOptions = { ...defaultOptions, ...options };
 
         ctx.save();
         ctx.beginPath();
         ctx.strokeStyle = drawOptions.color!;
-        ctx.lineWidth = drawOptions.lineWidth!;
+        ctx.lineWidth = resolveLineWidth(drawOptions.lineWidth, transform);
         if (drawOptions.dashed) {
             ctx.setLineDash([5, 5]);
         }

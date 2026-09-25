@@ -1,6 +1,6 @@
 import { Point } from './Point';
 import { Line } from './LinearObject';
-import { GeometricObject, type DrawLabelOptions, type DrawOptions, type IPoint, toScreenPoint } from './base';
+import { GeometricObject, type DrawTransform, type DrawLabelOptions, type DrawOptions, type IPoint, toScreenPoint, resolveLineWidth } from './base';
 
 type ParabolaDirection = 'up' | 'down' | 'left' | 'right';
 
@@ -49,14 +49,14 @@ export class Parabola extends GeometricObject {
          * @param transform - 视口变换信息。
          * @param options - 绘制选项。
          */
-    public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
+    public draw(ctx: CanvasRenderingContext2D, transform: DrawTransform, options?: DrawOptions): void {
         if (this.pValue === 0) {
             // p=0 时抛物线退化为一条射线，此处为避免除以0，直接不绘制
             return;
         }
 
         ctx.strokeStyle = options?.color || 'black';
-        ctx.lineWidth = (options?.lineWidth || 1) * (options?.highlight ? 2 : 1);
+        ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform) * (options?.highlight ? 2 : 1);
         ctx.setLineDash(options?.dashed ? [5, 5] : []);
         ctx.beginPath();
 

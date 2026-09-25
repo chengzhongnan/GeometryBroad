@@ -1,6 +1,6 @@
 import { Point } from './Point';
 import { Line } from './LinearObject';
-import { GeometricObject, type DrawLabelOptions, type DrawOptions, type IPoint, toScreenPoint } from './base';
+import { GeometricObject, type DrawTransform, type DrawLabelOptions, type DrawOptions, type IPoint, toScreenPoint, resolveLineWidth } from './base';
 
 export class Hyperbola extends GeometricObject {
     // 双曲线中心
@@ -51,13 +51,13 @@ export class Hyperbola extends GeometricObject {
      * @param transform - 视口变换信息。
      * @param options - 绘制选项。
      */
-    public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
+    public draw(ctx: CanvasRenderingContext2D, transform: DrawTransform, options?: DrawOptions): void {
         if (this.aValue === 0 || this.bValue === 0) {
             return; // a或b为0时双曲线退化，不进行绘制
         }
 
         ctx.strokeStyle = options?.color || 'black';
-        ctx.lineWidth = (options?.lineWidth || 1) * (options?.highlight ? 2 : 1);
+        ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform) * (options?.highlight ? 2 : 1);
         ctx.setLineDash(options?.dashed ? [5, 5] : []);
 
         const angleRad = this.rotateAngle * (Math.PI / 180);

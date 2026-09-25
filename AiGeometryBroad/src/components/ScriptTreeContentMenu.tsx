@@ -35,7 +35,7 @@ const ContextMenu: React.FC<ContextMenuProps> = ({ x, y, node, onClose, onNewFil
 
       {/* Actions for any Node (File or Folder) */}
       {(isFile || isFolder) && <MenuItem onClick={handleAction(() => onRename(node!))}>Rename</MenuItem>}
-      {(isFile || isFolder) && <MenuItem onClick={handleAction(() => onDelete(node!))} isDestructive>Delete</MenuItem>}
+      {(isFile || isFolder) && <MenuItem onClick={handleAction(() => onDelete(node!))} $isDestructive>Delete</MenuItem>}
     </MenuWrapper>
   );
 };
@@ -51,15 +51,16 @@ const MenuWrapper = styled.div`
   padding: 5px 0;
 `;
 
-const MenuItem = styled.div<{ isDestructive?: boolean }>`
+// 同 TreeNode：传给 styled.div 的非 HTML 属性必须加 `$`，否则会透传到 DOM。
+const MenuItem = styled.div<{ $isDestructive?: boolean }>`
   padding: 8px 16px;
   font-size: 14px;
-  color: ${props => props.isDestructive ? '#f44336' : '#cccccc'};
+  color: ${props => props.$isDestructive ? '#f44336' : '#cccccc'};
   cursor: pointer;
 
   &:hover {
     background-color: #3e3e3e;
-    color: ${props => props.isDestructive ? '#ff6f61' : '#ffffff'};
+    color: ${props => props.$isDestructive ? '#ff6f61' : '#ffffff'};
   }
 `;
 

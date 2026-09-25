@@ -1,4 +1,4 @@
-import { GeometricObject, type DrawOptions, type DrawLabelOptions, type IPoint, toScreenPoint, resolveLineWidth } from './base';
+import { GeometricObject, type DrawTransform, type DrawOptions, type DrawLabelOptions, type IPoint, toScreenPoint, resolveLineWidth } from './base';
 import { Point, PointNativeObject } from './Point';
 import { LinearNativeObject } from './LinearObject';
 
@@ -16,7 +16,7 @@ export class Ellipse extends GeometricObject {
     this.rotation = rotationDegrees * (Math.PI / 180); // 内部存储为弧度
   }
 
-  public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
+  public draw(ctx: CanvasRenderingContext2D, transform: DrawTransform, options?: DrawOptions): void {
     ctx.save();
     ctx.beginPath();
 
@@ -34,7 +34,7 @@ export class Ellipse extends GeometricObject {
     }
 
     ctx.strokeStyle = options?.color || 'black';
-    ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform.scale) * (options?.highlight ? 2 : 1);
+    ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform) * (options?.highlight ? 2 : 1);
 
     if (options?.dashed) {
       ctx.setLineDash([5, 5]);

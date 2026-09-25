@@ -1,4 +1,4 @@
-import { GeometricObject, type DrawLabelOptions, type DrawOptions, type IPoint, toScreenPoint, resolveLineWidth } from './base';
+import { GeometricObject, type DrawTransform, type DrawLabelOptions, type DrawOptions, type IPoint, toScreenPoint, resolveLineWidth } from './base';
 import { Point } from './Point';
 import { Circle } from './Circle';
 import { Curve } from './Curve';
@@ -38,7 +38,7 @@ export class Polygon extends GeometricObject {
         return Math.abs(area / 2.0);
     }
 
-    public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
+    public draw(ctx: CanvasRenderingContext2D, transform: DrawTransform, options?: DrawOptions): void {
         ctx.beginPath();
         if (this.vertices.length > 0) {
             const firstPoint = this.vertices[0].transform(transform.scale, transform.offsetX, transform.offsetY);
@@ -56,7 +56,7 @@ export class Polygon extends GeometricObject {
             }
 
             ctx.strokeStyle = options?.color || 'black';
-            ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform.scale) * (options?.highlight ? 2 : 1);
+            ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform) * (options?.highlight ? 2 : 1);
             if (options?.dashed) {
                 ctx.setLineDash([5, 5]);
             } else {
@@ -66,7 +66,7 @@ export class Polygon extends GeometricObject {
         }
     }
 
-    getDrawLabelPosition(transform: { scale: number; offsetX: number; offsetY: number; }, options: DrawLabelOptions, textWidth: number, textHeight: number): IPoint {
+    getDrawLabelPosition(transform: DrawTransform, options: DrawLabelOptions, textWidth: number, textHeight: number): IPoint {
         // 标签放在多边形的几何中心（顶点平均值）附近
         const centerX = this.vertices.reduce((sum, v) => sum + v.x, 0) / this.vertices.length;
         const centerY = this.vertices.reduce((sum, v) => sum + v.y, 0) / this.vertices.length;
@@ -118,7 +118,7 @@ export class CircularRegion extends GeometricObject {
         this.side = side;
     }
 
-    public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
+    public draw(ctx: CanvasRenderingContext2D, transform: DrawTransform, options?: DrawOptions): void {
         const center = toScreenPoint(this.circle.center.x, this.circle.center.y, transform);
         const start = toScreenPoint(this.startPoint.x, this.startPoint.y, transform);
         const end = toScreenPoint(this.endPoint.x, this.endPoint.y, transform);
@@ -137,13 +137,13 @@ export class CircularRegion extends GeometricObject {
         }
 
         ctx.strokeStyle = options?.color || 'black';
-        ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform.scale) * (options?.highlight ? 2 : 1);
+        ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform) * (options?.highlight ? 2 : 1);
         ctx.setLineDash(options?.dashed ? [5, 5] : []);
         ctx.stroke();
         ctx.restore();
     }
 
-    getDrawLabelPosition(transform: { scale: number; offsetX: number; offsetY: number }, _options: DrawLabelOptions, _textWidth: number, _textHeight: number): IPoint {
+    getDrawLabelPosition(transform: DrawTransform, _options: DrawLabelOptions, _textWidth: number, _textHeight: number): IPoint {
         return toScreenPoint(this.circle.center.x, this.circle.center.y, transform);
     }
 }
@@ -181,7 +181,7 @@ export class CurveCircleRegion extends GeometricObject {
         this.side = side;
     }
 
-    public draw(ctx: CanvasRenderingContext2D, transform: { scale: number; offsetX: number; offsetY: number }, options?: DrawOptions): void {
+    public draw(ctx: CanvasRenderingContext2D, transform: DrawTransform, options?: DrawOptions): void {
         if (this.curvePoints.length < 2) return;
 
         const center = toScreenPoint(this.circle.center.x, this.circle.center.y, transform);
@@ -204,13 +204,13 @@ export class CurveCircleRegion extends GeometricObject {
         }
 
         ctx.strokeStyle = options?.color || 'black';
-        ctx.lineWidth = (options?.lineWidth || 1) * (options?.highlight ? 2 : 1);
+        ctx.lineWidth = resolveLineWidth(options?.lineWidth, transform) * (options?.highlight ? 2 : 1);
         ctx.setLineDash(options?.dashed ? [5, 5] : []);
         ctx.stroke();
         ctx.restore();
     }
 
-    getDrawLabelPosition(transform: { scale: number; offsetX: number; offsetY: number }, _options: DrawLabelOptions, _textWidth: number, _textHeight: number): IPoint {
+    getDrawLabelPosition(transform: DrawTransform, _options: DrawLabelOptions, _textWidth: number, _textHeight: number): IPoint {
         const middle = this.curvePoints[Math.floor(this.curvePoints.length / 2)];
         return toScreenPoint(middle.x, middle.y, transform);
     }

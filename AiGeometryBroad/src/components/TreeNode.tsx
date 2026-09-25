@@ -40,7 +40,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({ node, onSelectFile, activeFileId, l
 
   return (
     <>
-      <NodeWrapper onClick={handleToggle} level={level} isActive={isActive}>
+      <NodeWrapper onClick={handleToggle} $level={level} $isActive={isActive}>
         {isFolder ? (
           isOpen ? <FaFolderOpen /> : <FaFolder />
         ) : (
@@ -67,15 +67,18 @@ const TreeNode: React.FC<TreeNodeProps> = ({ node, onSelectFile, activeFileId, l
 };
 
 // --- Styles ---
-const NodeWrapper = styled.div<{ level: number; isActive: boolean }>`
+// 注意：传给 styled.div 的 props 只要不是合法 HTML 属性，就必须加 `$` 前缀，
+// 否则 styled-components 会把它透传到 DOM 上（React 会对 isActive 这类驼峰名报
+// "React does not recognize the `isActive` prop on a DOM element"）。
+const NodeWrapper = styled.div<{ $level: number; $isActive: boolean }>`
   display: flex;
   align-items: center;
   padding: 4px 8px;
-  padding-left: ${props => props.level * 20 + 8}px; /* 核心：实现缩进 */
+  padding-left: ${props => props.$level * 20 + 8}px; /* 核心：实现缩进 */
   cursor: pointer;
   font-size: 15px;
   color: #cccccc;
-  background-color: ${props => props.isActive ? 'rgba(144, 202, 249, 0.2)' : 'transparent'};
+  background-color: ${props => props.$isActive ? 'rgba(144, 202, 249, 0.2)' : 'transparent'};
   
   &:hover {
     background-color: rgba(255, 255, 255, 0.1);
