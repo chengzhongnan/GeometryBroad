@@ -15,6 +15,7 @@
 
 import type { TopLevelCommandInfo } from './DSLInterpreter';
 import { isInsideQuotes } from './dslPropertySync';
+import { collectMemberReferences } from './expression';
 
 /**
  * 「这个参数的值一定是对象名」的参数白名单。
@@ -35,6 +36,8 @@ const REFERENCE_PARAM_KEYS = new Set([
     // 其余引用型参数
     'boundary', 'axis', 'from', 'on', 'center', 'vertex', 'start', 'end',
     'chord', 'chordpt1', 'chordpt2', 'region',
+    // 三角形的「心」/ 内切外接旁切圆：`tri=<三角形名>` 也是引用
+    'tri', 'triangle',
     // 直线/射线的截止点数组
     'cutpoints', 'cutoffpoints', 'cuts',
 ]);
@@ -47,6 +50,9 @@ const OBJECT_DEFINING_COMMANDS = new Set([
     'ANGLE_BISECTOR', 'CIRCUMCIRCLE', 'INCIRCLE', 'TANGENT', 'POLYGON', 'CIRCLE_CENTER',
     'POINTSET', 'REGION', 'TRIANGLE', 'RECTANGLE', 'CIRCLE', 'ELLIPSE',
     'PARABOLA', 'HYPERBOLA', 'ANGLE', 'FOCIS', 'CURVE', 'RANDOMPOINT', 'TEXT',
+    // 三角形的「心」与旁切圆。注意 EXCENTER / EXCIRCLE 的 `name=` 是逗号分隔的多个名字，
+    // 删除逻辑那边会按逗号拆开逐个登记。
+    'CENTROID', 'ORTHOCENTER', 'INCENTER', 'CIRCUMCENTER', 'FERMAT_POINT', 'EXCENTER', 'EXCIRCLE',
 ]);
 
 /**
@@ -74,7 +80,24 @@ export function definedNamesOf(command: TopLevelCommandInfo): string[] {
     return raw.split(',').map(part => part.trim()).filter(Boolean);
 }
 
-/** 这条指令引用了哪些对象名（只看白名单参数，且排除它自己定义的名字）。 */
+/**
+ * 值只是「显示用的文字」的参数。
+ *
+ * 里面的 `{...}` 是排版/槽位替换用的，不构成拓扑依赖 —— 一个 `label={A.x}` 的标签
+ * 在 A 被删掉之后只是显示成原样的文本，不会让这一行执行失败。
+ */
+const TEXT_PARAM_KEYS = new Set(['label', 'l', 'text', 't', 'message', 'm', 'title']);
+
+/**
+ * 这条指令引用了哪些对象名（白名单参数 + 数值参数里的属性穿透，排除它自己定义的名字）。
+ *
+ * 除了 `p1=A` 这种「值就是对象名」的引用，`x={A.x + 50}` 也是一种引用 ——
+ * A 被删掉之后这一行必然报错，所以必须一起算进依赖里。
+ *
+ * 属性穿透只认**点号**写法：下划线写法（`A_x`）在纯字符串层面和对象名/槽位名里的
+ * 下划线分不开（`seg_len` 会被误判成 `seg` 的 `len`），静态硬猜会把依赖算多、
+ * 进而删掉无关对象 —— 比「依赖漏算、重跑时报一条错」危险得多。
+ */
 export function referencedNamesOf(command: TopLevelCommandInfo): string[] {
     const own = new Set(definedNamesOf(command));
     const found = new Set<string>();
@@ -90,6 +113,17 @@ export function referencedNamesOf(command: TopLevelCommandInfo): string[] {
             found.add(name);
         }
     });
+
+    // 数值参数里的属性穿透。`getNumberValue` 只把「整块被花括号包住」的值当表达式，
+    // 所以这里也只看这种形状 —— 扫描范围小、也不会把注释里的花括号算进来。
+    command.params.forEach((value, key) => {
+        if (TEXT_PARAM_KEYS.has(key.toLowerCase())) return;
+        if (!value.startsWith('{') || !value.endsWith('}')) return;
+        for (const reference of collectMemberReferences(value.slice(1, -1))) {
+            if (!own.has(reference.root)) found.add(reference.root);
+        }
+    });
+
     return Array.from(found);
 }
 

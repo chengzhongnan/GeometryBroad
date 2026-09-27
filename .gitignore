@@ -52,3 +52,5 @@ outputs/
 *.bundle.mjs
 *.bundle.css
 AiGeometryBroad/scripts/
+AiGeometryBroad/tools/
+AiGeometryBroad/tmp/

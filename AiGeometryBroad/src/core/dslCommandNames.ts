@@ -22,6 +22,9 @@ export const GEOMETRIC_COMMANDS = [
     'GRID', 'REGION', 'TRIANGLE', 'RECTANGLE', 'CIRCLE', 'ELLIPSE',
     'PARABOLA', 'HYPERBOLA', 'ANGLE', 'FOCIS', 'RANDOMPOINT',
     'POINT_ON_CIRCLE', 'CIRCLE_CENTER',
+    // 三角形的「心」与旁切圆。都接受 `p1= p2= p3=` 或 `tri=<三角形名>`。
+    'CENTROID', 'ORTHOCENTER', 'INCENTER', 'CIRCUMCENTER', 'FERMAT_POINT',
+    'EXCENTER', 'EXCIRCLE',
     'SLOT', 'FUNCTION', 'ANIMATION', 'CURVE',
 ] as const;
 
@@ -40,7 +43,7 @@ export function isGeometricCommandName(name: string): boolean {
  * （`PRINT` 的别名），却不在名单里。
  */
 export const META_COMMANDS = [
-    'CLEAR', 'SET', 'SETLABEL', 'HELP', 'VIEW', 'DRAW', 'TEXT', 'FILL', 'MEASURE',
+    'CLEAR', 'SET', 'SETLABEL', 'HELP', 'VIEW', 'ANIMATE', 'DRAW', 'TEXT', 'FILL', 'MEASURE',
     'RUN', 'CODE', 'WITH', 'CALCULATE', 'GETOBJ', 'PRINT', 'CREATE',
 ] as const;
 

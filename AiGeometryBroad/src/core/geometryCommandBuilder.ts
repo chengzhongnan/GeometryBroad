@@ -9,6 +9,8 @@
 //
 // 这里不碰任何 DOM / React，只做「描述操作 + 拼指令」。
 
+import { formatLabelValue } from './dslPropertySync';
+
 /**
  * 右键菜单里「在已选中的对象之间作图」的操作。
  *
@@ -28,18 +30,78 @@ export type SelectionOperation =
     | 'triangle'
     | 'circumcircle'
     | 'incircle'
+    // 三角形的「心」与旁切圆。既能作用在三个点上，也能作用在一个三角形对象上。
+    | 'centroid'
+    | 'orthocenter'
+    | 'incenter'
+    | 'circumcenter'
+    | 'fermatPoint'
+    | 'excenter'
+    | 'excircle'
     | 'angleBisector'
     | 'parallelogram'
-    | 'circleWithDiameter';
+    // 两条共端点的线之间作角。四个角里作哪一个由鼠标位置决定，
+    // 所以它走独立的交互会话（见 GeometryCanvas），菜单项只负责置灰与进入。
+    | 'createAngle'
+    | 'circleWithDiameter'
+    | 'commonExternalTangent'
+    | 'commonInternalTangent';
+
+/** 三角形相关操作。既能对**三个点**做，也能对一个**三角形对象**做（走 `tri=`）。 */
+export type TriangleOperation =
+    | 'triangle'
+    | 'circumcircle'
+    | 'incircle'
+    | 'centroid'
+    | 'orthocenter'
+    | 'incenter'
+    | 'circumcenter'
+    | 'fermatPoint'
+    | 'excenter'
+    | 'excircle';
+
+/**
+ * 三角形操作的「指令名 + 新对象名字前缀」，以及**能不能直接作用在一个三角形对象上**。
+ *
+ * 「作三角形」标了 false：对一个三角形再作三角形没有意义，菜单据此不给这一项。
+ */
+const TRIANGLE_OPERATION_SPECS: Record<
+    TriangleOperation,
+    { command: string; prefix: string; onTriangle: boolean }
+> = {
+    triangle: { command: 'TRIANGLE', prefix: 'tri', onTriangle: false },
+    circumcircle: { command: 'CIRCUMCIRCLE', prefix: 'cc', onTriangle: true },
+    incircle: { command: 'INCIRCLE', prefix: 'ic', onTriangle: true },
+    centroid: { command: 'CENTROID', prefix: 'G', onTriangle: true },
+    orthocenter: { command: 'ORTHOCENTER', prefix: 'H', onTriangle: true },
+    incenter: { command: 'INCENTER', prefix: 'I', onTriangle: true },
+    circumcenter: { command: 'CIRCUMCENTER', prefix: 'O', onTriangle: true },
+    fermatPoint: { command: 'FERMAT_POINT', prefix: 'F', onTriangle: true },
+    excenter: { command: 'EXCENTER', prefix: 'exI', onTriangle: true },
+    excircle: { command: 'EXCIRCLE', prefix: 'exC', onTriangle: true },
+};
 
 /** 需要三个点才能做的操作。菜单按这个集合决定要不要给「三点作图」那一组。 */
-export const THREE_POINT_OPERATIONS: readonly SelectionOperation[] = ['triangle', 'circumcircle', 'incircle'];
+export const THREE_POINT_OPERATIONS: readonly SelectionOperation[] = [
+    'triangle', 'circumcircle', 'incircle',
+    'centroid', 'orthocenter', 'incenter', 'circumcenter', 'fermatPoint', 'excenter', 'excircle',
+];
+
+/** 能直接作用在**一个三角形对象**上的操作（「作三角形」不在其中）。 */
+export const TRIANGLE_OBJECT_OPERATIONS: readonly SelectionOperation[] =
+    THREE_POINT_OPERATIONS.filter(
+        operation => TRIANGLE_OPERATION_SPECS[operation as TriangleOperation].onTriangle,
+    );
 
 /** 需要两条共端点直线的操作。 */
-export const TWO_LINEAR_OPERATIONS: readonly SelectionOperation[] = ['angleBisector', 'parallelogram'];
+export const TWO_LINEAR_OPERATIONS: readonly SelectionOperation[] = ['angleBisector', 'parallelogram', 'createAngle'];
 
 /** 需要两个圆的操作。 */
-export const TWO_CIRCLE_OPERATIONS: readonly SelectionOperation[] = ['circleIntersect'];
+export const TWO_CIRCLE_OPERATIONS: readonly SelectionOperation[] = [
+    'circleIntersect',
+    'commonExternalTangent',
+    'commonInternalTangent',
+];
 
 /** 需要两个点、以这两点连线为直径作圆的操作。 */
 export const TWO_POINT_DIAMETER_OPERATIONS: readonly SelectionOperation[] = ['circleWithDiameter'];
@@ -88,7 +150,9 @@ export type PickOperation =
     | 'divide'
     | 'extend'
     | 'intersect'
-    | 'perpBisector';
+    | 'perpBisector'
+    // 作一条与原线成指定角的直线：角度可以手填，也可以取一个已创建的角。
+    | 'lineAtAngle';
 
 /** 对话框里允许用户点选的目标类型；null 表示这个操作不需要点选。 */
 export type PickKind = 'point' | 'linear' | 'circle';
@@ -137,6 +201,14 @@ export type PickOptionField =
         label: string;
         options: ReadonlyArray<{ value: string; label: string }>;
         visibleWhen?: (values: OptionValues) => boolean;
+        /**
+         * 这一项的候选项是**画布上的对象**，所以除了下拉框还能直接在图形上点选。
+         *
+         * 候选名就是 `options` 的 value（目前只有「延长」的参照线段用它）。
+         * 名字形如 `seg_3` / `tri_2_e1`，光看名字很难知道是哪条线 ——
+         * 能在图上点、而且点到的会变红，才选得准。
+         */
+        canvasPick?: boolean;
     }
     | {
         kind: 'checkbox';
@@ -148,11 +220,39 @@ export type PickOptionField =
 export interface PickOperationDescriptor {
     title: string;
     hint: string;
+    /**
+     * 这个作图用不用「落点」（`anchorPoint`）。
+     *
+     * 只有「在线上取点」用得到。对话框据此决定图形上按住拖动是「移动那个点」
+     * 还是「什么也不做」—— 不用落点的作图里，拖动只该是误操作。
+     */
+    usesAnchorPoint?: boolean;
     /** 需要在图形上点选的目标类型；null 表示只用参数，不用点选。 */
     pick: PickKind | null;
     fields: PickOptionField[];
     /** 所有字段的初始值。**即使字段被隐藏也要给出**，否则生成代码时会读到 undefined。 */
     defaults: OptionValues;
+}
+
+/**
+ * 描述对话框时要用到的「当前画布状态」。
+ *
+ * 描述符要能给出**真实的名字**（顶点下拉框里写 `起点 A` 而不是 `起点 p1`、
+ * 参照角下拉框里列出脚本里已有的角），而这些只有画布上的解释器知道，
+ * 所以和生成代码用的 `CommandBuildContext` 分开单独传一份。
+ */
+export interface PickDescriptorContext {
+    /** 主体（线性对象）的两个定义点名；主体不是线、或拿不到时为 null。 */
+    linearEndpoints?: { p1: string; p2: string } | null;
+    /** 脚本里已经创建出来的角对象名。按创建顺序给，「取已创建的角」下拉框直接用。 */
+    angleNames?: readonly string[];
+    /**
+     * 脚本里已经创建出来的线性对象名（直线 / 线段 / 射线）。
+     *
+     * 「延长」要能「延长到某条已有线段的长度」，下拉框就靠它 ——
+     * 可选的线段每跑一次脚本都可能变，所以和 `angleNames` 一样由调用方取快照传进来。
+     */
+    linearNames?: readonly string[];
 }
 
 export interface CommandBuildContext {
@@ -231,7 +331,91 @@ export interface PickOperationSpec {
     anchorPoint?: Point2D | null;
     /** 对话框里的参数值。 */
     options: OptionValues;
+    /** 对话框里的样式覆盖；没填的项**不会**出现在生成的指令里。 */
+    style?: PickStyleOptions;
 }
+
+/**
+ * 作图对话框里可以覆盖的样式。
+ *
+ * **没填的项一律不写进代码** —— 默认样式不该出现在生成的指令里，只有用户真的改过的
+ * 那几项才追加成参数。所以每个字段的空值语义是「用默认」，而不是「用我们挑的某个默认值」。
+ * 这一点很重要：写死 `color=black width=1` 会让生成的代码和手写的风格完全不一样，
+ * 而且以后改默认色时这些脚本不会跟着变。
+ */
+export interface PickStyleOptions {
+    /** 颜色，`#rrggbb` 或颜色名。 */
+    color?: string;
+    /** 线宽（逻辑单位）。 */
+    lineWidth?: number;
+    /** 只支持「虚线」一种覆盖：实线就是默认，不需要写参数。 */
+    lineStyle?: 'dashed';
+    /** 显示标签文本。 */
+    label?: string;
+    /** 线性对象的截止点，形如 `+A,-B`。只对线性产物有意义，其它产物上会被忽略。 */
+    cutPoints?: string;
+}
+
+/** 一次作图产出的**主体**是什么。决定样式面板里哪些项有意义。 */
+export type PickProductKind = 'point' | 'linear' | 'circle' | 'none';
+
+/**
+ * 查一次作图的主产物类型。
+ *
+ * 「截止点」这类参数只对线性对象成立（`CREATE POINT ... cutPoints=...` 是没意义的），
+ * 所以对话框要靠它决定要不要把那一项显示出来 —— 与其让用户填一个不起作用的框，
+ * 不如根本不显示。
+ *
+ * 注意这是**主产物**：`tangentToCircle` 顺带画的切点、`divide` 的等分点都不算，
+ * 用户说的「这条线」永远是切线本身。
+ */
+export function getPickProductKind(kind: PickOperation): PickProductKind {
+    switch (kind) {
+        case 'connect':
+        case 'parallel':
+        case 'perpendicular':
+        case 'perpBisector':
+        case 'lineAtAngle':
+        case 'extend':
+        case 'tangentToCircle':
+            return 'linear';
+        case 'circleWithCenter':
+            return 'circle';
+        case 'intersect':
+        case 'pointOnLine':
+        case 'divide':
+        case 'reflectPoint':
+            return 'point';
+        default:
+            return 'none';
+    }
+}
+
+/**
+ * 把样式覆盖拼成一段「追加在绘制指令末尾」的参数串。
+ *
+ * 返回空串表示一项都没改 —— 调用方直接拼上去，不会多出一个多余空格。
+ * 键名沿用 DSL 里一贯的写法：`color=` / `width=` / `style=dashed` / `label=` / `cutPoints=`，
+ * 都是 `drawObject` 与线性对象创建时真正会读的那几个（见解释器的 drawObject）。
+ *
+ * `cutPoints` 只在 `product === 'linear'` 时才写：写到点或圆上是无效参数，
+ * 留着只会让生成的代码看起来像坏了。
+ */
+function buildStyleSuffix(style: PickStyleOptions | undefined, product: PickProductKind): string {
+    if (!style) return '';
+    const params: string[] = [];
+
+    if (style.color) params.push(`color=${style.color}`);
+    if (style.lineWidth !== undefined && Number.isFinite(style.lineWidth)) {
+        params.push(`width=${formatNumber(style.lineWidth)}`);
+    }
+    if (style.lineStyle === 'dashed') params.push('style=dashed');
+    if (style.label) params.push(`label=${formatLabelValue(style.label)}`);
+    if (style.cutPoints && product === 'linear') params.push(`cutPoints=${style.cutPoints}`);
+
+    return params.length > 0 ? ` ${params.join(' ')}` : '';
+}
+
 
 export interface PickValidation {
     ok: boolean;
@@ -335,17 +519,18 @@ function optionBoolean(values: OptionValues, key: string, fallback: boolean): bo
 
 /** 右键菜单里各项的显示文案。结尾的 `…` 表示点下去会打开对话框。 */
 export const PICK_OPERATION_LABELS: Record<PickOperation, string> = {
-    connect: '连接另一个点…',
-    parallel: '过该点作平行线…',
-    perpendicular: '过该点作垂线…',
-    reflectPoint: '关于直线作对称点…',
-    tangentToCircle: '过该点作圆的切线…',
-    circleWithCenter: '以该点为圆心作圆…',
-    pointOnLine: '在线上取点…',
-    divide: '取 N 等分点…',
+    connect: '连接（选点）',
+    parallel: '平行线（选直线）',
+    perpendicular: '垂线（选直线）',
+    reflectPoint: '对称点（选直线）',
+    tangentToCircle: '切线（选圆）',
+    circleWithCenter: '作圆（选点）',
+    pointOnLine: '取点（右键处）',
+    divide: '等分点…',
     extend: '延长…',
-    perpBisector: '作中垂线',
-    intersect: '与另一条线求交点…',
+    perpBisector: '中垂线',
+    intersect: '交点（选线）',
+    lineAtAngle: '定角直线…',
 };
 
 // 不同主体类型能做什么。放在这里而不是散在菜单代码里，
@@ -358,12 +543,15 @@ const PICK_OPERATIONS_BY_TYPE: Record<string, PickOperation[]> = {
     // 「在线上取点」排在最前：它是线上最基础的操作，其余都是在它的基础上派生的。
     // 「截取」不在这张表里：它走右键菜单里独立的 `trimMode` 会话（见 GeometryCanvas），
     // 只改写原对象的 cutPoints、不生成任何新点/新对象，三种线性对象共用同一条路径。
-    segment: ['pointOnLine', 'divide', 'extend', 'perpBisector', 'intersect'],
-    ray: ['pointOnLine', 'divide', 'extend', 'perpBisector', 'intersect'],
-    // 直线是无限长的，「等分」「延长」都没有意义，只留取点、中垂线与求交点。
-    line: ['pointOnLine', 'perpBisector', 'intersect'],
-    // 圆：过某点作圆的切线（切点 + 切线）。点和圆一起选中时也有同样的菜单。
-    circle: ['tangentToCircle'],
+    segment: ['pointOnLine', 'lineAtAngle', 'divide', 'extend', 'perpBisector', 'intersect'],
+    ray: ['pointOnLine', 'lineAtAngle', 'divide', 'extend', 'perpBisector', 'intersect'],
+    // 直线是无限长的，「等分」「延长」都没有意义，只留取点、中垂线、求交点与作定角直线。
+    line: ['pointOnLine', 'lineAtAngle', 'perpBisector', 'intersect'],
+    // 圆这里**故意留空**：它唯一能作的图是「过某个已有点作切线」，而那个入口在菜单里
+    // 有自己的一条（标签写得更具体：要点的是一个点）。放进这张表会生成**第二条一模一样的项** ——
+    // 以前右键一个圆会看到「过该点作圆的切线…」和「过某个已有点作切线…」两条，
+    // 说的其实是同一件事。
+    circle: [],
 };
 
 /** 某个类型的主体支持哪些需要对话框的操作。 */
@@ -400,7 +588,9 @@ const EXTEND_LENGTH_FIELD: PickOptionField = {
     min: 0.1,
     max: 10000,
     step: 0.5,
-    visibleWhen: values => optionString(values, 'mode', 'length') === 'length',
+    // 「取已有线段」时这一项不显示 —— 长度来自那条线段，自己填的数没有意义。
+    visibleWhen: values => optionString(values, 'mode', 'length') === 'length'
+        && optionString(values, 'lengthSource', 'number') === 'number',
 };
 
 const EXTEND_SIDE_FIELD: PickOptionField = {
@@ -420,8 +610,39 @@ export function describePickOperation(
     kind: PickOperation,
     anchorName: string,
     anchorType: string,
+    context: PickDescriptorContext = {},
 ): PickOperationDescriptor {
     const isRay = anchorType === 'ray';
+
+    /**
+     * 「延长多少」的来源。只在真的存在别的线段时才给「取已有线段」这一项 ——
+     * 一个候选都没有还给选项，用户选了只会得到一条「确定」永远灰着的死路。
+     */
+    const extendLengthSourceField: PickOptionField = {
+        kind: 'select',
+        key: 'lengthSource',
+        label: '长度来源',
+        options: [
+            { value: 'number', label: '指定数值' },
+            ...(context.linearNames && context.linearNames.length > 0
+                ? [{ value: 'segment', label: '取已有线段' }]
+                : []),
+        ],
+        visibleWhen: values => optionString(values, 'mode', 'length') === 'length',
+    };
+
+    /** 参照线段的下拉框。候选来自调用方在打开对话框那一刻取的快照。 */
+    const extendLengthObjectField: PickOptionField = {
+        kind: 'select',
+        key: 'lengthObject',
+        label: '参照线段',
+        options: (context.linearNames ?? []).map(name => ({ value: name, label: name })),
+        // 候选是一堆 `seg_3` / `tri_2_e1` 这种名字，光看下拉框认不出是哪条线，
+        // 所以允许直接在图上点选（点到的会变红）。
+        canvasPick: true,
+        visibleWhen: values => optionString(values, 'mode', 'length') === 'length'
+            && optionString(values, 'lengthSource', 'number') === 'segment',
+    };
 
     switch (kind) {
         case 'connect':
@@ -487,8 +708,11 @@ export function describePickOperation(
         case 'pointOnLine':
             return {
                 title: '在线上取点',
-                hint: `在 ${anchorName} 上离刚才右键处最近的位置生成一个点`,
+                // 位置是可以改的：对话框里能按住拖动（见 GeometryPickDialog 的 anchorPoint 拖动）。
+                // 文案不能写「离刚才右键处最近」—— 拖过之后那句话就不成立了。
+                hint: `在 ${anchorName} 上生成一个点；在图形上按住拖动可以调整它的位置`,
                 pick: null,
+                usesAnchorPoint: true,
                 fields: [],
                 defaults: {},
             };
@@ -520,9 +744,16 @@ export function describePickOperation(
                 // 射线的 pointAtDistance 只会沿「顶点 -> 方向点」一个方向走，
                 // 给它「起点端 / 两端」会得到方向错误的结果，所以干脆不给这两个选项。
                 fields: isRay
-                    ? [EXTEND_MODE_FIELD, EXTEND_LENGTH_FIELD]
-                    : [EXTEND_MODE_FIELD, EXTEND_LENGTH_FIELD, EXTEND_SIDE_FIELD],
-                defaults: { mode: 'length', length: 2, side: 'end' },
+                    ? [EXTEND_MODE_FIELD, extendLengthSourceField, EXTEND_LENGTH_FIELD, extendLengthObjectField]
+                    : [EXTEND_MODE_FIELD, extendLengthSourceField, EXTEND_LENGTH_FIELD, extendLengthObjectField, EXTEND_SIDE_FIELD],
+                defaults: {
+                    mode: 'length',
+                    lengthSource: 'number',
+                    length: 2,
+                    // 默认选第一条候选，省得用户还要自己挑一下；候选为空时留空串。
+                    lengthObject: context.linearNames?.[0] ?? '',
+                    side: 'end',
+                },
             };
         case 'perpBisector':
             return {
@@ -532,6 +763,80 @@ export function describePickOperation(
                 fields: [],
                 defaults: {},
             };
+        case 'lineAtAngle': {
+            // 顶点只能是这条线自己的两个定义点 —— 用真实名字展示，
+            // 用户才知道选的是哪一头。拿不到名字时退回「起点 / 终点」两个通名。
+            const endpoints = context.linearEndpoints ?? null;
+            const angleNames = context.angleNames ?? [];
+            const hasAngle = angleNames.length > 0;
+            return {
+                title: '作指定角的直线',
+                hint: `以 ${anchorName} 的一个端点为顶点，作一条与它成指定角的直线`,
+                pick: null,
+                fields: [
+                    {
+                        kind: 'select',
+                        key: 'vertex',
+                        label: '角的顶点',
+                        options: [
+                            { value: 'p1', label: endpoints ? `起点 ${endpoints.p1}` : '起点' },
+                            { value: 'p2', label: endpoints ? `终点 ${endpoints.p2}` : '终点' },
+                        ],
+                    },
+                    {
+                        kind: 'select',
+                        key: 'angleSource',
+                        label: '角度来源',
+                        options: [
+                            { value: 'number', label: '输入角度值' },
+                            { value: 'angle', label: '取已创建的角' },
+                        ],
+                    },
+                    {
+                        kind: 'number',
+                        key: 'degrees',
+                        label: '角度（度）',
+                        min: 0,
+                        max: 360,
+                        step: 1,
+                        visibleWhen: values => optionString(values, 'angleSource', 'number') === 'number',
+                    },
+                    {
+                        kind: 'select',
+                        key: 'angleObject',
+                        label: '参照的角',
+                        options: hasAngle
+                            ? angleNames.map(name => ({ value: name, label: name }))
+                            : [{ value: '', label: '（画布上还没有角）' }],
+                        visibleWhen: values => optionString(values, 'angleSource', 'number') === 'angle',
+                    },
+                    {
+                        kind: 'select',
+                        key: 'direction',
+                        label: '旋转方向',
+                        options: [
+                            { value: 'ccw', label: '逆时针' },
+                            { value: 'cw', label: '顺时针' },
+                        ],
+                    },
+                    {
+                        kind: 'checkbox',
+                        key: 'showTipPoint',
+                        label: '标出旋转得到的点',
+                    },
+                ],
+                defaults: {
+                    vertex: 'p1',
+                    // 画布上已经有角时默认「取已创建的角」——这才是这个操作的主打用法；
+                    // 一个角都没有时退回手填角度，免得下拉框里只有一个空选项。
+                    angleSource: hasAngle ? 'angle' : 'number',
+                    degrees: 60,
+                    angleObject: hasAngle ? angleNames[0] : '',
+                    direction: 'ccw',
+                    showTipPoint: false,
+                },
+            };
+        }
         case 'intersect':
             return {
                 title: '与另一条线求交点',
@@ -941,6 +1246,203 @@ function resolveSharedVertex(
     return { vertex, farOfFirst, farOfSecond };
 }
 
+// ---------------------------------------------------------------- 两线成角（鼠标选角）
+
+/**
+ * 两条共端点的线在顶点处划出的四条射线里的**一条**。
+ *
+ * 每条线在顶点两侧各贡献一条射线：
+ * - `forward` 那一侧通向它自己的另一个定义点 —— 有现成的点名可以直接写进 DSL；
+ * - 另一侧是反向延长线 —— 线上没有现成的点，只能拿 `farName` 转 180° 现造一个。
+ */
+export interface AngleRay {
+    /** 这条射线所属的线。 */
+    line: string;
+    /** 方位角（度，(−180°, 180°]）：从顶点看向这一侧的方向。 */
+    bearing: number;
+    /** true = 通向该线另一个定义点的那一侧；false = 反向延长那一侧。 */
+    forward: boolean;
+    /** 该线除顶点外的另一个定义点名。反向侧要拿它转 180° 造点，所以两种都记着。 */
+    farName: string;
+    /** 落在这一侧、能直接写进 DSL 的点名；反向侧为 null。 */
+    pointName: string | null;
+    /**
+     * 这条射线在该线参数空间里的区间，供高亮用。
+     * 无界的那一端用 ±Infinity —— `drawLinearPortionHighlight` 会替我们裁到可见区域。
+     */
+    startT: number;
+    endT: number;
+}
+
+/** 相邻两条射线夹出来的一个角。`sectors[i]` = `rays[i]` 逆时针转到 `rays[(i + 1) % 4]`。 */
+export interface AngleSector {
+    startRay: number;
+    /** 夹角大小（度）。两条不重合的线划出的四个角都严格落在 (0°, 180°)。 */
+    span: number;
+}
+
+export interface AnglePickGeometry {
+    vertex: string;
+    vertexCoord: Point2D;
+    /** 四条射线，按方位角升序排列。 */
+    rays: AngleRay[];
+    /** 四个角，与 rays 一一对应。 */
+    sectors: AngleSector[];
+}
+
+/** 算不出来时给一句原因，菜单据此置灰。 */
+export type AnglePickPlan = AnglePickGeometry | { blocked: string };
+
+/** 把角度归一化到 (0°, 360°]。 */
+function wrapDegrees(deg: number): number {
+    const value = deg % 360;
+    return value <= 0 ? value + 360 : value;
+}
+
+/** 把角度归一化到 (−180°, 180°]。 */
+function normalizeDegrees(deg: number): number {
+    const value = wrapDegrees(deg);
+    return value > 180 ? value - 360 : value;
+}
+
+/**
+ * 两条共端点的线在公共端点处划出的四条射线与四个角。
+ *
+ * 拿到它之后：鼠标落在哪个角里用 `resolveAngleSector` 判，
+ * 高亮哪两条射线用 `ray.startT / ray.endT`，确认后出指令用 `buildTwoLineAngleCommands`。
+ */
+export function describeTwoLineAngles(
+    first: ObjectRef,
+    second: ObjectRef,
+    context: CommandBuildContext,
+): AnglePickPlan {
+    const resolved = resolveSharedVertex(first, second, context);
+    if ('blocked' in resolved) return { blocked: resolved.blocked };
+    const { vertex, farOfFirst, farOfSecond } = resolved;
+
+    const vertexCoord = context.getPointCoords?.(vertex);
+    const farCoords = [farOfFirst, farOfSecond].map(name => context.getPointCoords?.(name) ?? null);
+    if (!vertexCoord || !farCoords[0] || !farCoords[1]) {
+        return { blocked: `取不到 ${vertex} / ${farOfFirst} / ${farOfSecond} 的坐标` };
+    }
+
+    const rays: AngleRay[] = [];
+
+    // 一条线贡献两条射线。顶点在参数空间里的位置决定了「哪一侧」对应哪个区间：
+    // t = 0 落在 p1、t = 1 落在 p2，所以顶点是 p1 时「通向另一个定义点」是 t ≥ 0，
+    // 顶点是 p2 时是 t ≤ 1。
+    const pushRays = (line: ObjectRef, farName: string, farCoord: Point2D): string | null => {
+        const dx = farCoord.x - vertexCoord.x;
+        const dy = farCoord.y - vertexCoord.y;
+        if (!(dx * dx + dy * dy > 0)) return `${line.name} 的两个端点重合，定不出方向`;
+
+        const endpoints = context.getLinearEndpoints?.(line.name);
+        const vertexIsP1 = endpoints?.p1 === vertex;
+        const bearing = Math.atan2(dy, dx) * 180 / Math.PI;
+
+        rays.push(
+            {
+                line: line.name,
+                bearing,
+                forward: true,
+                farName,
+                pointName: farName,
+                startT: vertexIsP1 ? 0 : -Infinity,
+                endT: vertexIsP1 ? Infinity : 1,
+            },
+            {
+                line: line.name,
+                bearing: normalizeDegrees(bearing + 180),
+                forward: false,
+                farName,
+                pointName: null,
+                startT: vertexIsP1 ? -Infinity : 1,
+                endT: vertexIsP1 ? 0 : Infinity,
+            },
+        );
+        return null;
+    };
+
+    const blocked = pushRays(first, farOfFirst, farCoords[0])
+        ?? pushRays(second, farOfSecond, farCoords[1]);
+    if (blocked) return { blocked };
+
+    rays.sort((a, b) => a.bearing - b.bearing);
+
+    // 两条线重合时同一个方位角上会挤着两条射线，四个角退化成两个 —— 选不出唯一的角。
+    for (let i = 1; i < rays.length; i++) {
+        if (Math.abs(rays[i].bearing - rays[i - 1].bearing) < 1e-6) {
+            return { blocked: '两条线重合，分不出四个角' };
+        }
+    }
+
+    // 四条射线按方位角升序排好后，第 i 个角就是 rays[i] 逆时针转到 rays[i+1]。
+    // 两条线各自的反向射线相差 180°，所以四个角两两互补，跨度都严格小于 180° ——
+    // 正好都能用一个 ANGLE 对象表示（ANGLE 的度数是有符号的，只覆盖 (−180°, 180°]）。
+    const sectors: AngleSector[] = rays.map((_, index) => ({
+        startRay: index,
+        span: wrapDegrees(rays[(index + 1) % rays.length].bearing - rays[index].bearing),
+    }));
+
+    return { vertex, vertexCoord, rays, sectors };
+}
+
+/**
+ * 鼠标落在四个角中的哪一个里。返回 sectors 的下标；鼠标正压在顶点上时拿不到方向，返回 null。
+ */
+export function resolveAngleSector(geometry: AnglePickGeometry, mouse: Point2D): number | null {
+    const dx = mouse.x - geometry.vertexCoord.x;
+    const dy = mouse.y - geometry.vertexCoord.y;
+    if (!(dx * dx + dy * dy > 0)) return null;
+
+    const bearing = Math.atan2(dy, dx) * 180 / Math.PI;
+    for (let i = 0; i < geometry.sectors.length; i++) {
+        const start = geometry.rays[geometry.sectors[i].startRay].bearing;
+        if (wrapDegrees(bearing - start) <= geometry.sectors[i].span) return i;
+    }
+    return null;
+}
+
+/**
+ * 作出第 `sectorIndex` 个角的指令。
+ *
+ * 落在「反向延长」那一侧的射线在线上没有现成的点，用现有点绕顶点转 180° 补一个
+ * （`draw=false`，它只是角的一条边），角本身再由 `CREATE ANGLE` 定点。
+ * 全程只引用已存在的点名，不写死坐标 —— 拖动原线之后这个角跟着变。
+ */
+export function buildTwoLineAngleCommands(
+    geometry: AnglePickGeometry,
+    sectorIndex: number,
+    context: CommandBuildContext,
+): string[] {
+    const sector = geometry.sectors[sectorIndex];
+    if (!sector) return [];
+    const startRay = geometry.rays[sector.startRay];
+    const endRay = geometry.rays[(sector.startRay + 1) % geometry.rays.length];
+
+    const allocate = createNameAllocator(context);
+    const commands: string[] = [];
+
+    const resolvePoint = (ray: AngleRay): string => {
+        if (ray.pointName) return ray.pointName;
+        const name = allocate('oppPt');
+        commands.push(
+            `CREATE ROTATED_POINT name=${name} obj=${ray.farName} center=${geometry.vertex} angle=180 draw=false`,
+        );
+        return name;
+    };
+
+    // p1 → p2 就是逆时针方向：射线按方位角升序排过，跨度又小于 180°，
+    // 所以 ANGLE 自己算出来的有符号度数正好等于这个角的跨度。
+    const p1 = resolvePoint(startRay);
+    const p2 = resolvePoint(endRay);
+    const angleName = allocate('ang');
+    commands.push(
+        `CREATE ANGLE name=${angleName} vertex=${geometry.vertex} p1=${p1} p2=${p2} showArc=true draw=true`,
+    );
+    return commands;
+}
+
 /** 圆-圆求交点用到的圆信息（与 CommandBuildContext.getCircleInfo 返回同构）。 */
 interface CircleGeometry {
     centerName: string;
@@ -1048,6 +1550,46 @@ function computeLineCircleIntersection(
     return points;
 }
 
+/**
+ * 两圆公切线的**可行性**判定。
+ *
+ * 只回答「内 / 外公切线各有几条」，用来在菜单里置灰并说明原因 ——
+ * 不在这里算切点坐标，因为真正写进脚本的切点是靠 `MEASURE` + `POINT_ON_CIRCLE`
+ * 表达式动态算的（拖动圆会自动跟随），这里算坐标只用于判断退化成什么样。
+ *
+ * 判定（d = 圆心距，r1 / r2 = 半径）：
+ * - 外公切线：d = 0 且 r1 = r2（同心同半径，两圆重合）→ 无穷多条，不给；
+ *   d = 0 且 r1 ≠ r2（同心不同半径）→ 没有；d = |r1 − r2|（内切）→ 1 条；d > |r1 − r2| → 2 条；
+ *   d < |r1 − r2|（一个圆严格含在另一个里）→ 0 条。
+ * - 内公切线：d > r1 + r2（外离）→ 2 条；d = r1 + r2（外切）→ 1 条；d < r1 + r2 → 0 条。
+ */
+function countCommonTangents(
+    a: CircleGeometry,
+    b: CircleGeometry,
+    kind: 'external' | 'internal',
+): number {
+    const d = Math.hypot(b.center.x - a.center.x, b.center.y - a.center.y);
+    const r1 = a.radius;
+    const r2 = b.radius;
+    // 容差跟着尺度走：半径 1000 和半径 1 的两圆，绝对容差没法共用一个数。
+    const tolerance = 1e-9 * Math.max(1, d, r1, r2);
+
+    if (kind === 'internal') {
+        if (d > r1 + r2 + tolerance) return 2;
+        if (Math.abs(d - (r1 + r2)) <= tolerance) return 1;
+        return 0;
+    }
+
+    const diff = Math.abs(r1 - r2);
+    if (d <= tolerance) {
+        // 同心：同半径时两个圆重合（公切线无穷多条），不同半径时大圆套小圆（没有公切线）。
+        return 0;
+    }
+    if (d > diff + tolerance) return 2;
+    if (Math.abs(d - diff) <= tolerance) return 1;
+    return 0;
+}
+
 /** 「在选中的对象之间作图」的结果：指令，外加做不了时的原因。 */
 export interface SelectionOperationPlan {
     commands: string[];
@@ -1065,6 +1607,23 @@ export interface SelectionOperationPlan {
 }
 
 /**
+ * 拼一条三角形指令。
+ *
+ * `EXCENTER` / `EXCIRCLE` 一次建三个对象，`name=` 要三个名字（逗号分隔），
+ * 其余只要一个 —— 把这个差异收在这里，调用点不用各写一遍。
+ */
+function buildTriangleCommand(
+    spec: { command: string; prefix: string },
+    allocate: (prefix: string) => string,
+    vertices: string,
+): string {
+    const name = spec.command === 'EXCENTER' || spec.command === 'EXCIRCLE'
+        ? [1, 2, 3].map(index => allocate(`${spec.prefix}${index}`)).join(',')
+        : allocate(spec.prefix);
+    return `CREATE ${spec.command} name=${name} ${vertices} draw=true`;
+}
+
+/**
  * 把「在选中的对象之间作图」翻译成 DSL 指令。
  *
  * 单个对象、或对象类型不符合操作要求时返回空指令数组 —— 菜单据此不放这一项。
@@ -1076,9 +1635,20 @@ export function planSelectionOperation(
 ): SelectionOperationPlan {
     const allocate = createNameAllocator(context);
 
-    // ---- 三个点：三角形 / 外接圆 / 内切圆
+    // ---- 三角形：三个点，或者一个已有的三角形对象
     if (THREE_POINT_OPERATIONS.includes(operation)) {
-        if (objects.length !== 3) return { commands: [], blocked: '需要选中三个点' };
+        const spec = TRIANGLE_OPERATION_SPECS[operation as TriangleOperation];
+
+        // 一个三角形对象 → 直接 `tri=<名字>`，不用让用户把三个顶点再点一遍。
+        // 这条路的产物和三点那条完全一样（解释器里两条输入形式归约到同一段实现）。
+        if (objects.length === 1 && objects[0].type === 'triangle') {
+            if (!spec.onTriangle) {
+                return { commands: [], blocked: '这个操作需要三个点（对三角形再作三角形没有意义）' };
+            }
+            return { commands: [buildTriangleCommand(spec, allocate, `tri=${objects[0].name}`)] };
+        }
+
+        if (objects.length !== 3) return { commands: [], blocked: '需要选中三个点，或一个三角形' };
         if (!objects.every(item => isPointType(item.type))) {
             return { commands: [], blocked: '这个操作需要三个点' };
         }
@@ -1086,14 +1656,13 @@ export function planSelectionOperation(
         if (new Set(names).size !== 3) {
             return { commands: [], blocked: '三个点里有重复的' };
         }
+        // 共线时除了重心（就是那条线的中点）之外全部退化，所以统一挡掉 ——
+        // 在菜单上写明原因，比让用户点下去得到一个看不见的结果好。
         if (arePointsCollinear(names, context)) {
-            return { commands: [], blocked: '三点共线，做不出三角形 / 外接圆 / 内切圆' };
+            return { commands: [], blocked: '三点共线，做不出三角形 / 圆 / 各个心' };
         }
-        const prefix = operation === 'triangle' ? 'tri' : operation === 'circumcircle' ? 'cc' : 'ic';
-        const commandType = operation === 'triangle' ? 'TRIANGLE' : operation === 'circumcircle' ? 'CIRCUMCIRCLE' : 'INCIRCLE';
-        const name = allocate(prefix);
         return {
-            commands: [`CREATE ${commandType} name=${name} p1=${names[0]} p2=${names[1]} p3=${names[2]} draw=true`],
+            commands: [buildTriangleCommand(spec, allocate, `p1=${names[0]} p2=${names[1]} p3=${names[2]}`)],
         };
     }
 
@@ -1107,6 +1676,15 @@ export function planSelectionOperation(
         const resolved = resolveSharedVertex(first, second, context);
         if ('blocked' in resolved) return { commands: [], blocked: resolved.blocked };
         const { vertex, farOfFirst, farOfSecond } = resolved;
+
+        // 「作角」在这里**不出指令**：四个角里作哪一个要等鼠标选，
+        // 指令由 buildTwoLineAngleCommands 在用户单击确认时才生成。
+        // 这里只把「能不能作」判一遍，菜单据此置灰并写明原因。
+        if (operation === 'createAngle') {
+            const plan = describeTwoLineAngles(first, second, context);
+            if ('blocked' in plan) return { commands: [], blocked: plan.blocked };
+            return { commands: [] };
+        }
 
         if (operation === 'angleBisector') {
             // ANGLE 的角度是**有符号**的（从 p1 转到 p2），所以 p1 必须放第一条线的另一端、
@@ -1231,6 +1809,108 @@ export function planSelectionOperation(
             ],
             newPointCount: missing.length,
         };
+    }
+
+    // 两个圆的公切线（内 / 外）。
+    //
+    // DSL 没有「公切线」原语，但整条构造可以完全**动态**地表达出来，不需要把算好的
+    // 坐标写死 —— 写死了拖动圆之后切线就脱钩了。做法是：
+    //
+    //   1. `GETOBJ` 把两个圆心坐标、两个半径读进 slot（Circle 的 `radius` 是公开 getter）；
+    //   2. `MEASURE type=distance` 量出圆心距 d；
+    //   3. `CALCULATE` 用表达式引擎（支持 atan2 / acos / sqrt / PI）算两个角度槽位：
+    //        φ = atan2(o2y − o1y, o2x − o1x)   —— 圆心连线方向（度）
+    //        θ = acos(δ / d)                   —— 切点相对连线的偏移角（度）
+    //        其中 δ 对外公切线是 |r1 − r2|、对内公切线是 r1 + r2；
+    //   4. `CREATE POINT_ON_CIRCLE angle={φ ± θ}` 在圆周上定出切点（这个指令本来就吃表达式）；
+    //   5. 两个切点连成直线。
+    //
+    // 每步都只是「引用对象 + 表达式」，所以圆被拖动时 φ / θ / 切点会全部重算，
+    // 切线与切点自动跟着走。
+    //
+    // 几何依据（n̂ = 单位法向，d⃗ = O1→O2）：
+    //   T1 = O1 + r1·n̂，T2 = O2 + r2·n̂（外公切，同侧）→ 要求 T1T2 ⊥ n̂
+    //     ⇒ d⃗·n̂ = r1 − r2 ⇒ cos(ψ − φ) = (r1 − r2)/d ⇒ ψ = φ ± acos((r1 − r2)/d)；
+    //   T1 = O1 + r1·n̂，T2 = O2 − r2·n̂（内公切，异侧）→ 要求 d⃗·n̂ = r1 + r2
+    //     ⇒ ψ = φ ± acos((r1 + r2)/d)，且 T2 落在 ψ + 180°。
+    if (operation === 'commonExternalTangent' || operation === 'commonInternalTangent') {
+        const isExternal = operation === 'commonExternalTangent';
+        const label = isExternal ? '外公切线' : '内公切线';
+
+        if (objects.length !== 2) return { commands: [], blocked: `需要选中两个圆才能作${label}` };
+        const [first, second] = objects;
+        if (first.type !== 'circle' || second.type !== 'circle') {
+            return { commands: [], blocked: `这个操作需要两个圆` };
+        }
+        if (first.name === second.name) {
+            return { commands: [], blocked: '两个圆是同一个圆' };
+        }
+
+        const info1 = context.getCircleInfo?.(first.name);
+        const info2 = context.getCircleInfo?.(second.name);
+        if (!info1 || !info2) return { commands: [], blocked: '取不到圆的圆心和半径' };
+
+        const count = countCommonTangents(info1, info2, isExternal ? 'external' : 'internal');
+        if (count === 0) {
+            return {
+                commands: [],
+                blocked: isExternal
+                    ? '一个圆在另一个圆内部（或两圆重合），没有外公切线'
+                    : '两圆相交或内含，没有内公切线',
+            };
+        }
+
+        // slot 前缀带两个圆名，避免连续作多条公切线时槽位互相覆盖。
+        const prefix = `${sanitizeIdentifier(first.name)}_${sanitizeIdentifier(second.name)}`;
+        // 半径差 / 半径和：外公切线用差分（两侧同向），内公切线用求和（两侧反向）。
+        const deltaExpression = isExternal
+            ? `{${prefix}_r1}-{${prefix}_r2}`
+            : `{${prefix}_r1}+{${prefix}_r2}`;
+
+        const commands: string[] = [
+            // 圆心坐标与半径读进 slot —— 后面算角度全靠它们。
+            `GETOBJ name=${info1.centerName} property=x slot=${prefix}_o1x`,
+            `GETOBJ name=${info1.centerName} property=y slot=${prefix}_o1y`,
+            `GETOBJ name=${info2.centerName} property=x slot=${prefix}_o2x`,
+            `GETOBJ name=${info2.centerName} property=y slot=${prefix}_o2y`,
+            `GETOBJ name=${first.name} property=radius slot=${prefix}_r1`,
+            `GETOBJ name=${second.name} property=radius slot=${prefix}_r2`,
+            `MEASURE type=distance slot=${prefix}_d p1=${info1.centerName} p2=${info2.centerName}`,
+            // φ：圆心连线方向（度）。
+            `CALCULATE slot=${prefix}_phi expression=atan2({${prefix}_o2y}-{${prefix}_o1y}, {${prefix}_o2x}-{${prefix}_o1x})*180/PI`,
+        ];
+
+        // 相切（只有 1 条）时只作那一条；其余作对称的两条。
+        // 对称两条取 φ + θ 与 φ − θ；θ 用 acos 算，相切时 θ = 0，两条会重合，
+        // 所以相切情形只保留一条，不在图上叠出两条几乎重合的线。
+        const offsets = [1].concat(count === 2 ? [-1] : []);
+        // 相切退化成 1 条时，θ 恒为 0（acos(±1)），单独算一次就够；
+        // 两条的情形一次性把 θ 算进同一个 slot 复用。
+        commands.push(
+            `CALCULATE slot=${prefix}_theta expression=acos((${deltaExpression})/{${prefix}_d})*180/PI`,
+        );
+
+        offsets.forEach((sign, index) => {
+            const signToken = sign > 0 ? '+' : '-';
+            // 整个角度必须**只包一层花括号**：`getNumberValue` 只在「以 { 开头且以 } 结尾」时
+            // 才把它当表达式求值，形如 `{a}+{b}` 会被当成字面量、parseFloat 直接失败。
+            // 表达式引擎内部会把 `{}` 当普通字符跳过，所以槽位照旧按名字解析。
+            const baseAngle = `{${prefix}_phi}${signToken}{${prefix}_theta}`;
+            // 内公切线的第二个切点落在法向的**反面**（n̂ 与 −n̂），所以多转 180°。
+            const wrap = (expr: string) => `{${expr}}`;
+            const t1 = allocate('T');
+            const t2 = allocate('T');
+            const lineName = allocate('tan');
+            commands.push(
+                `CREATE POINT_ON_CIRCLE name=${t1} circle=${first.name} angle=${wrap(baseAngle)} draw=true`,
+                `CREATE POINT_ON_CIRCLE name=${t2} circle=${second.name} angle=${wrap(isExternal
+                    ? baseAngle
+                    : `${baseAngle}+180`)} draw=true`,
+                `CREATE LINE name=${lineName} p1=${t1} p2=${t2} draw=true`,
+            );
+        });
+
+        return { commands };
     }
 
     // 直线（线段 / 射线）与圆求交点：最多两个交点，可能已经有点落在上面了。
@@ -1400,6 +2080,10 @@ export function buildPickOperationCommands(
     const { kind, anchorName, anchorType, targetName, anchorPoint, options } = spec;
     if (!anchorName) return [];
     const allocate = createNameAllocator(context);
+    // 样式只追加到**主产物**那条指令上；辅助指令（MEASURE、旋转出来的参考点、
+    // 对称点顺带画的垂足与虚线）保持默认样式 —— 用户说的「这条线 / 这个点」
+    // 永远指产物本身，不会指那些为了画出来而顺手建的中间对象。
+    const style = buildStyleSuffix(spec.style, getPickProductKind(kind));
 
     // ---- 需要点选目标的点操作
     if (
@@ -1418,7 +2102,7 @@ export function buildPickOperationCommands(
             const slot = `${sanitizeIdentifier(anchorName)}_${sanitizeIdentifier(targetName)}_r`;
             return [
                 `MEASURE type=distance slot=${slot} p1=${anchorName} p2=${targetName}`,
-                `CREATE CIRCLE name=${circleName} center=${anchorName} radius={${slot}} draw=true`,
+                `CREATE CIRCLE name=${circleName} center=${anchorName} radius={${slot}} draw=true${style}`,
             ];
         }
         if (kind === 'connect') {
@@ -1428,15 +2112,15 @@ export function buildPickOperationCommands(
             const prefix = connectType === 'line' ? 'line' : 'seg';
             const name = allocate(prefix);
             const commandType = connectType === 'line' ? 'LINE' : 'SEGMENT';
-            return [`CREATE ${commandType} name=${name} p1=${anchorName} p2=${targetName} draw=true`];
+            return [`CREATE ${commandType} name=${name} p1=${anchorName} p2=${targetName} draw=true${style}`];
         }
         if (kind === 'parallel') {
             const name = allocate('para');
-            return [`CREATE PARALLEL name=${name} line=${targetName} point=${anchorName} draw=true`];
+            return [`CREATE PARALLEL name=${name} line=${targetName} point=${anchorName} draw=true${style}`];
         }
         if (kind === 'perpendicular') {
             const name = allocate('perp');
-            return [`CREATE PERPENDICULAR name=${name} line=${targetName} point=${anchorName} draw=true`];
+            return [`CREATE PERPENDICULAR name=${name} line=${targetName} point=${anchorName} draw=true${style}`];
         }
         if (kind === 'tangentToCircle') {
             // 这两个入口都能发起「过点作切线」：
@@ -1452,12 +2136,13 @@ export function buildPickOperationCommands(
             const t2 = allocate('T');
             const showPoints = optionBoolean(options, 'showTangentPoints', true);
             const showPointsParam = showPoints ? '' : ' showPoints=false';
-            return [`CREATE TANGENT name=${t1},${t2} circle=${circleName} point=${pointName} draw=true${showPointsParam}`];
+            return [`CREATE TANGENT name=${t1},${t2} circle=${circleName} point=${pointName} draw=true${showPointsParam}${style}`];
         }
         // 轴对称点。可选地把垂足和「点 — 对称点」的虚线也画出来，
         // 否则图上只有一个孤零零的对称点，看不出对称关系。
+        // 样式只加在对称点上：垂足和辅助虚线只是参照物，跟着变色反而看不清主次。
         const name = allocate('refl');
-        const commands = [`CREATE REFLECTED_POINT name=${name} obj=${anchorName} axis=${targetName} draw=true`];
+        const commands = [`CREATE REFLECTED_POINT name=${name} obj=${anchorName} axis=${targetName} draw=true${style}`];
         if (optionBoolean(options, 'includeFoot', false)) {
             const footName = allocate('foot');
             const linkName = allocate('link');
@@ -1475,12 +2160,53 @@ export function buildPickOperationCommands(
     if (kind === 'intersect') {
         if (!targetName) return [];
         const name = allocate('P');
-        return [`CREATE INTERSECT name=${name} obj1=${anchorName} obj2=${targetName} draw=true`];
+        return [`CREATE INTERSECT name=${name} obj1=${anchorName} obj2=${targetName} draw=true${style}`];
     }
 
     if (kind === 'perpBisector') {
         const name = allocate('pb');
-        return [`CREATE PERP_BISECTOR name=${name} p1=${p1} p2=${p2} draw=true`];
+        return [`CREATE PERP_BISECTOR name=${name} p1=${p1} p2=${p2} draw=true${style}`];
+    }
+
+    if (kind === 'lineAtAngle') {
+        // 顶点取这条线自己的一个定义点，另一个定义点绕它转指定角度，
+        // 转出来的点 + 顶点就是新直线。全程只引用已存在的点名，不写死坐标，
+        // 所以拖动原线之后这条直线会跟着转。
+        const vertexIsP2 = optionString(options, 'vertex', 'p1') === 'p2';
+        const vertex = vertexIsP2 ? p2 : p1;
+        const other = vertexIsP2 ? p1 : p2;
+        const counterClockwise = optionString(options, 'direction', 'ccw') !== 'cw';
+
+        const tipName = allocate('angPt');
+        const lineName = allocate('angLine');
+        // 旋转出来的点只是新直线的第二个定义点，默认不画（画了图上会多一个孤立的点）；
+        // 想留着它当参照就勾上。
+        const tipDraw = optionBoolean(options, 'showTipPoint', false) ? ' draw=true' : '';
+
+        if (optionString(options, 'angleSource', 'number') === 'angle') {
+            const angleName = optionString(options, 'angleObject', '');
+            if (!angleName) return [];
+            // 角度经 MEASURE 存进槽位，写进脚本的是 `{槽位}` 而不是当时的数值 ——
+            // 参照角被改动之后这条直线会跟着变。
+            //
+            // Angle 的度数是**有符号**的（∈ (−180°, 180°]），先取绝对值再按面板里
+            // 选的方向定符号，「顺时针 / 逆时针」的含义才不会随参照角自身的正负翻转。
+            // 顺时针写成 `0-abs(…)` 而不是 `-abs(…)`：表达式求值器只认二元减号。
+            const slot = `${sanitizeIdentifier(anchorName)}_${sanitizeIdentifier(angleName)}_deg`;
+            const degrees = counterClockwise ? `abs({${slot}})` : `0-abs({${slot}})`;
+            return [
+                `MEASURE type=angle slot=${slot} obj=${angleName}`,
+                `CREATE ROTATED_POINT name=${tipName} obj=${other} center=${vertex} angle={${degrees}}${tipDraw}`,
+                `CREATE LINE name=${lineName} p1=${vertex} p2=${tipName} draw=true${style}`,
+            ];
+        }
+
+        const degrees = optionNumber(options, 'degrees', 60);
+        const signed = counterClockwise ? degrees : -degrees;
+        return [
+            `CREATE ROTATED_POINT name=${tipName} obj=${other} center=${vertex} angle=${formatNumber(signed)}${tipDraw}`,
+            `CREATE LINE name=${lineName} p1=${vertex} p2=${tipName} draw=true${style}`,
+        ];
     }
 
     if (kind === 'pointOnLine') {
@@ -1501,7 +2227,7 @@ export function buildPickOperationCommands(
         const name = allocate('pt');
         return [
             `MEASURE type=distance slot=${slot} p1=${p1} p2=${p2}`,
-            `CREATE POINT_ON_LINE name=${name} line=${anchorName} point=${reference} distance={${slot} * ${formatNumber(ratio)}} draw=true`,
+            `CREATE POINT_ON_LINE name=${name} line=${anchorName} point=${reference} distance={${slot} * ${formatNumber(ratio)}} draw=true${style}`,
         ];
     }
 
@@ -1511,10 +2237,11 @@ export function buildPickOperationCommands(
         const commands = [`MEASURE type=distance slot=${slot} p1=${p1} p2=${p2}`];
         // 内部等分点：i = 1 .. N-1。距离用槽位表达式而不是算好的数字，
         // 这样拖动端点之后等分点会跟着走。
+        // 等分点整体就是这次作图的产物，所以每一个都带上样式。
         for (let i = 1; i < count; i++) {
             const name = allocate(`D${i}`);
             commands.push(
-                `CREATE POINT_ON_LINE name=${name} line=${anchorName} point=${p1} distance={${slot} * ${i} / ${count}} draw=true`,
+                `CREATE POINT_ON_LINE name=${name} line=${anchorName} point=${p1} distance={${slot} * ${i} / ${count}} draw=true${style}`,
             );
         }
         return commands;
@@ -1524,13 +2251,27 @@ export function buildPickOperationCommands(
     if (optionString(options, 'mode', 'length') === 'line') {
         // 延长成直线：直接以原对象的两个定义点作一条直线。
         const name = allocate('extLine');
-        return [`CREATE LINE name=${name} p1=${p1} p2=${p2} draw=true`];
+        return [`CREATE LINE name=${name} p1=${p1} p2=${p2} draw=true${style}`];
     }
 
-    const length = Math.max(0.1, optionNumber(options, 'length', 2));
     const side = optionString(options, 'side', 'end');
     const slot = `${sanitizeIdentifier(anchorName)}_len`;
     const commands = [`MEASURE type=distance slot=${slot} p1=${p1} p2=${p2}`];
+
+    // 「延长多少」有两个来源：自己填一个数，或取另一条**已有线段的长度**。
+    // 后者借 MEASURE 把那条线的长度存进槽位，写进脚本的是 `{那条线_len}` 而不是当时的数值 ——
+    // 那条线被拖动之后延长量会跟着变（和「在线上取点」「等分点」是同一套机制）。
+    const lengthSource = optionString(options, 'lengthSource', 'number');
+    let lengthExpr = formatNumber(Math.max(0.1, optionNumber(options, 'length', 2)));
+    if (lengthSource === 'segment') {
+        const referenceName = optionString(options, 'lengthObject', '');
+        const reference = referenceName ? context.getLinearEndpoints?.(referenceName) : null;
+        // 参照线段的定义点拿不到（名字过期、对象被删了）就生成不了 —— 对话框的「确定」会保持禁用。
+        if (!reference) return [];
+        const referenceSlot = `${sanitizeIdentifier(referenceName)}_len`;
+        commands.push(`MEASURE type=distance slot=${referenceSlot} p1=${reference.p1} p2=${reference.p2}`);
+        lengthExpr = referenceSlot;
+    }
 
     // pointAtDistance 的方向规则：以 p1 为参考点就往 p2 方向走，以 p2 为参考点就往 p1 方向走。
     // 所以「往 p2 外侧延长」= 从 p1 量出「原长 + 延长量」。
@@ -1539,19 +2280,20 @@ export function buildPickOperationCommands(
     if (side === 'end' || side === 'both') {
         const name = allocate('E2');
         commands.push(
-            `CREATE POINT_ON_LINE name=${name} line=${anchorName} point=${p1} distance={${slot} + ${formatNumber(length)}} draw=true`,
+            `CREATE POINT_ON_LINE name=${name} line=${anchorName} point=${p1} distance={${slot} + ${lengthExpr}} draw=true`,
         );
         endName = name;
     }
     if (side === 'start' || side === 'both') {
         const name = allocate('E1');
         commands.push(
-            `CREATE POINT_ON_LINE name=${name} line=${anchorName} point=${p2} distance={${slot} + ${formatNumber(length)}} draw=true`,
+            `CREATE POINT_ON_LINE name=${name} line=${anchorName} point=${p2} distance={${slot} + ${lengthExpr}} draw=true`,
         );
         startName = name;
     }
+    // 延长出来的那两个点只是新线段的端点，产物是这条线段 —— 样式加在它身上。
     const segmentName = allocate('ext');
-    commands.push(`CREATE SEGMENT name=${segmentName} p1=${startName} p2=${endName} draw=true`);
+    commands.push(`CREATE SEGMENT name=${segmentName} p1=${startName} p2=${endName} draw=true${style}`);
     return commands;
 }
 
@@ -1731,10 +2473,12 @@ export function buildCreateShapeCommands(spec: CreateShapeSpec, context: Command
             const corner = makePoint(ax, ay);
             const isSquare = spec.kind === 'square';
             const name = allocate(isSquare ? 'sq' : 'rect');
-            const width = isSquare ? unit : unit * 1.4;
+            const sizeA = isSquare ? unit : unit * 1.4;
             return [
                 corner.command,
-                `CREATE RECTANGLE name=${name} p1=${corner.name} width=${formatNumber(width)} height=${formatNumber(unit)} draw=true`,
+                // 边长写 `a=` / `b=`，不要写 width / height —— 那两个键在其它指令上是「线宽」，
+                // 同名不同义会让用户以为矩形「画坏了」（实际是几何对了、被超粗描边糊住）。
+                `CREATE RECTANGLE name=${name} p1=${corner.name} a=${formatNumber(sizeA)} b=${formatNumber(unit)} draw=true`,
             ];
         }
         case 'axis':

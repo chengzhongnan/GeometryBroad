@@ -56,6 +56,10 @@ export function resolveWheelZoom(isLocked: boolean, hoveringElement: boolean): b
  *
  * - 点 / 文本可以直接拖动；圆、线等其它几何对象不行（只能选中）。
  * - 点带 `frozen=true` 时即使类型允许也拒绝拖动，对应 `CREATE POINT ... frozen=true`。
+ * - **派生点**（坐标由别的几何对象算出来，如 `x={A.x + 50}`）同样拒绝拖动，
+ *   这是隐式冻结：拖一下会把整条表达式换成一个死数字，拓扑依赖当场断掉，
+ *   此后拖 A 它也不跟了。和 `frozen` 的区别是它**不可解冻** ——
+ *   要改就改表达式里的来源对象，所以界面上也不该给「Unfreeze」这种出口。
  *
  * 结果直接决定 `draggedObjectNameRef` 是否赋值，进而决定 resolveCanvasDragMode
  * 返回 'object' 还是 'none'，所以冻结点会走「命中了但不能拖动」这条路。
@@ -64,8 +68,11 @@ export function resolveWheelZoom(isLocked: boolean, hoveringElement: boolean): b
  * 所以 hover 光标仍是 `pointer`，不要为了「提示拖不动」去改成 `not-allowed`。
  * 判据是「这个元素还能不能被点中」—— 能，就不该显示禁止光标。
  */
-export function isDraggableElement(element: { type: string; frozen?: boolean } | null | undefined): boolean {
+export function isDraggableElement(
+    element: { type: string; frozen?: boolean; derived?: boolean } | null | undefined,
+): boolean {
     if (!element) return false;
     if (element.type !== 'point' && element.type !== 'text') return false;
+    if (element.derived === true) return false;
     return element.frozen !== true;
 }

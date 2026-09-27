@@ -15,7 +15,14 @@ export class Polygon extends GeometricObject {
         this.vertices = vertices;
     }
 
-    // 获取多边形的边（作为线段对象）
+    /**
+     * 多边形的边（作为线段对象）。
+     *
+     * **这是临时对象，不是解释器里那个可引用的部件**：每次访问都 `new` 一批，
+     * 名字也是临时的。真正能被 DSL 引用、能被面板列出、能被点中的边是解释器在
+     * 创建对象时注册的 `<父名>_e1..en`（见 `registerPolygonParts`）。
+     * 只做纯几何计算（比如量边长）时用这个 getter 就够了。
+     */
     get edges(): Segment[] {
         const edges: Segment[] = [];
         for (let i = 0; i < this.vertices.length; i++) {
@@ -247,18 +254,23 @@ export class Rectangle extends Polygon {
         // p4 = p1 + (p3 - p2)
         const p4_x = p1.x + v23.x;
         const p4_y = p1.y + v23.y;
-        const p4 = new Point(`${name}_p4`, p4_x, p4_y); // 自动生成的点
+        // 自动生成的点。名字用 `<矩形名>_v4`：解释器给多边形建的派生顶点一律叫
+        // `<父名>_v1..vn`，这里先对齐，省得注册时再改一次名。
+        const p4 = new Point(`${name}_v4`, p4_x, p4_y);
 
         return new Rectangle(name, [p1, p2, p3, p4]);
     }
 
     public static fromWidthHeight(name: string, p1: Point, width: number, height: number): Rectangle {
+        // 顶点顺序：左上 -> 右上 -> 右下 -> 左下。
+        // 名字一律 `<矩形名>_v<n>`，与解释器给多边形建的派生顶点同名 —— 这样解释器
+        // 注册部件时直接认下这三个点，不会再复制一份重合的点出来。
         // p2 = p1 + width
-        const p2 = new Point(`${name}_p2`, p1.x + width, p1.y);
+        const p2 = new Point(`${name}_v2`, p1.x + width, p1.y);
         // p3 = p2 + height
-        const p3 = new Point(`${name}_p3`, p2.x, p2.y - height);
+        const p3 = new Point(`${name}_v3`, p2.x, p2.y - height);
         // p4 = p1 + height
-        const p4 = new Point(`${name}_p4`, p1.x, p1.y - height);
+        const p4 = new Point(`${name}_v4`, p1.x, p1.y - height);
 
         return new Rectangle(name, [p1, p2, p3, p4]);
     }

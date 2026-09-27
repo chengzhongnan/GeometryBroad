@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import styled from 'styled-components';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -7,6 +7,7 @@ import AIChatPanel from './AIChatPanel';
 import ScriptInputPanel from './ScriptInputPanel';
 import OutputPanel, { type LogMessage } from './OutputPanel';
 import GeometricCanvas, { type CutPointPickRequest } from './GeometryCanvas';
+import ObjectEditDialog from './ObjectEditDialog';
 import ScriptTreePanel from './ScriptTreePanel';
 import type { FileNodeData } from './TreeNode';
 
@@ -37,6 +38,10 @@ import type { IPoint } from '../core/geometry/base';
 const SCRIPT_STORAGE_KEY = 'geo-script-last-code';
 const FILES_STORAGE_KEY = 'geo-script-files';
 
+// 没有选中对象时复用同一个空数组，避免每次渲染都造一个新引用 ——
+// ScriptInputPanel 里那个「重算红点」的 effect 依赖它，新引用会让 effect 每次都跑。
+const EMPTY_LINES: number[] = [];
+
 // 「保存脚本」新建文件时用的前缀与扩展名：保存一次生成一个 `geo_1.geo`、`geo_2.geo`……
 // 编号取当前文件树里尚未使用的下一个整数，保证不会重名。
 const SAVED_FILE_PREFIX = 'geo';
@@ -56,13 +61,30 @@ const DEFAULT_FILES: FileNodeData[] = [
     { id: '4', name: 'README.md', type: 'file', content: '# GeometryBroad scripts\n' },
 ];
 
-function MainContent() {
+interface MainContentProps {
+    /** 全屏作图模式：藏掉两侧面板和 Header，只留画布。由 App 统一持有，因为 Header 也在那一层。 */
+    isFullscreen: boolean;
+    onToggleFullscreen: () => void;
+}
+
+function MainContent({ isFullscreen, onToggleFullscreen }: MainContentProps) {
 
     const [userInput, setUserInput] = useState<string>(INITIAL_USER_INPUT);
     const [generatedScript, setGeneratedScript] = useState<string>('');
     const [isLoading, setIsLoading] = useState<boolean>(false);
     const [error, setError] = useState<string | null>(null);
     const [revision, setRevision] = useState<number>(0);
+    /**
+     * 「重播延时动画」令牌。只有用户**主动重新运行脚本**（点 Execute / 撤销 / 重做）时才 +1。
+     *
+     * 为什么不复用 `revision`：`revision` 的语义是「强制重跑解释器」，凡是脚本内容变了
+     * 都会 +1 —— 拖动一个点（`handleObjectPropertyChange`）、删对象都会。而 `ANIMATE`
+     * 的延时动画只该在用户主动运行时从头放一遍；否则拖一下点、点一下对象，
+     * 整幅图就会重新一个一个地画出来，完全没法用。
+     *
+     * 画布那侧拿它和「上次跑过的令牌」比对，只有变了才允许动画，见 GeometryCanvas 的 redraw。
+     */
+    const [animationToken, setAnimationToken] = useState<number>(0);
     const [files, setFiles] = useState<FileNodeData[]>(() => {
         const savedFiles = localStorage.getItem(FILES_STORAGE_KEY);
         if (!savedFiles) return DEFAULT_FILES;
@@ -89,6 +111,27 @@ function MainContent() {
     const [labelPositions, setLabelPositions] = useState<Record<string, IPoint>>({});
     // 「正在为哪条线挑截止点」。非空时画布进入点选模式，点一个点就把它写进 cutPoints。
     const [cutPointPick, setCutPointPick] = useState<CutPointPickRequest | null>(null);
+    /**
+     * 「编辑对象」对话框要编辑的对象名。
+     *
+     * 存**名字**而不是对象快照：属性改完会重跑脚本，解释器吐出来的那份快照整个换新，
+     * 存下来的旧快照会显示上一轮的数值。每次渲染都拿名字去 `variables` 里现查，
+     * 这样面板、对话框、画布永远是同一份数据。
+     */
+    const [objectEditTarget, setObjectEditTarget] = useState<string | null>(null);
+    /**
+     * 「变量表里右键」发起的对象菜单请求。
+     *
+     * 菜单本身由画布渲染（只有它拿得到解释器），这里只负责把「给谁、弹在哪」传过去。
+     * `id` 每次都变 —— 同一个对象连着右键两次也要重新弹。
+     */
+    const [objectMenuRequest, setObjectMenuRequest] = useState<{ id: number; names: string[]; x: number; y: number } | null>(null);
+    const objectMenuRequestIdRef = useRef(0);
+    /**
+     * 主画布元素。由画布挂载后报上来，供「编辑对象」对话框复制像素当图形预览。
+     * 存 state 而不是 ref：画布挂载完成时要触发一次重渲染，对话框才拿得到它。
+     */
+    const [canvasElement, setCanvasElement] = useState<HTMLCanvasElement | null>(null);
     // 使用 useRef 来为每条消息生成一个唯一的ID，避免不必要的重渲染
     const messageIdCounter = useRef(0);
 
@@ -122,6 +165,8 @@ function MainContent() {
         if (snapshot.generatedScript !== renderedScript) {
             setLogMessages([]);
             setRevision(previous => previous + 1);
+            // 撤销/重做回到的是另一份脚本，等于重新运行一次，延时动画可以再放一遍。
+            setAnimationToken(previous => previous + 1);
         }
     }, []);
 
@@ -236,6 +281,8 @@ function MainContent() {
         setLogMessages([]);
         setGeneratedScript(script);
         setRevision(previous => previous + 1);
+        // 用户主动运行 —— 延时动画从这里重新开始放（重复点 Execute 也会重放）。
+        setAnimationToken(previous => previous + 1);
     };
 
     const handleClearOutputMessage = useCallback(() => {
@@ -397,6 +444,42 @@ function MainContent() {
 
     const handleCancelCutPointPick = useCallback(() => setCutPointPick(null), []);
 
+    // ---- 「编辑对象」对话框 ----
+    // 每次渲染都按名字现查，而不是把快照存进 state：属性一改就会重跑脚本，
+    // 解释器吐出来的那份快照整个换新，存下来的旧快照会显示上一轮的数值。
+    const objectEditValue = objectEditTarget
+        ? variables.find(item => item.name === objectEditTarget) ?? null
+        : null;
+
+    const handleRequestObjectEdit = useCallback((name: string) => {
+        setObjectEditTarget(name);
+    }, []);
+
+    /**
+     * 变量表里在某个对象上右键：请画布弹同一个对象菜单。
+     *
+     * 选中规则和画布上右键保持一致：点到的对象**已经在选中集合里**就用整个集合，
+     * 否则把它设为唯一选中 —— 否则「先多选、再右键其中一个」会把刚选好的集合冲掉。
+     */
+    const handleRequestObjectMenu = useCallback((name: string, clientX: number, clientY: number) => {
+        const alreadySelected = selectedObjectNames.includes(name);
+        const names = alreadySelected ? selectedObjectNames : [name];
+        if (!alreadySelected) handleCanvasSelectObject(name);
+        objectMenuRequestIdRef.current += 1;
+        setObjectMenuRequest({ id: objectMenuRequestIdRef.current, names, x: clientX, y: clientY });
+    }, [selectedObjectNames, handleCanvasSelectObject]);
+
+    /**
+     * 对话框里点「± 点选」。
+     *
+     * **必须先关掉对话框**：它是模态的，遮罩挡住整个画布，不关就没法去画布上点。
+     * 点完把点写回 cutPoints 之后，用户想接着看结果可以再右键打开一次。
+     */
+    const handleDialogPickCutPoint = useCallback((name: string, sign: '+' | '-') => {
+        setObjectEditTarget(null);
+        handlePickCutPoint(name, sign);
+    }, [handlePickCutPoint]);
+
     const handleCutPointPicked = useCallback((pointName: string) => {
         const request = cutPointPick;
         setCutPointPick(null);
@@ -457,8 +540,24 @@ function MainContent() {
         });
     }, [variables]);
 
-    const handleGeometryMessage = useCallback((level: string, line: number, message: string) => {
-        const newMessage: LogMessage = {
+    // 选中对象 → 编辑器里要打红点的行号。
+    //
+    // 用 variables 里已经带上的 sourceLines，而不是去问画布的解释器实例：
+    // 解释器是画布的内部状态，跨组件伸手进去会把「谁拥有渲染状态」这条界线弄糊；
+    // 而 variables 本来就是解释器渲染完吐出来的快照，里面已经含了同一份行号。
+    //
+    // 多选时把每个对象的行号并起来 —— 用户框选一组对象，就该看到这一组定义在哪。
+    const highlightLines = useMemo(() => {
+        if (selectedObjectNames.length === 0) return EMPTY_LINES;
+        const lines = new Set<number>();
+        for (const name of selectedObjectNames) {
+            const variable = variables.find(item => item.name === name);
+            for (const line of variable?.sourceLines ?? []) lines.add(line);
+        }
+        return [...lines].sort((a, b) => a - b);
+    }, [selectedObjectNames, variables]);
+
+    const handleGeometryMessage = useCallback((level: string, line: number, message: string) => {        const newMessage: LogMessage = {
             id: messageIdCounter.current++,
             level,
             line,
@@ -469,34 +568,48 @@ function MainContent() {
     }, []);
 
     return (
-        <PageContainer>
-            <IntegratedWorkspace>
-                <TabsPanel >
-                    <ScriptTreePanel
-                        title='ScriptFiles'
-                        files={files}
-                        activeFileId={activeFileId}
-                        onFilesChange={handleFilesChange}
-                        onSelectFile={handleSelectFile}
-                    />
-                    <ScriptInputPanel
-                        title="Script Input"
-                        script={script}
-                        onScriptChange={handleScriptChange}
-                        onExecute={handleExecuteScript}
-                        onSave={handleSaveScript}
-                        saveStatus={saveStatus}
-                    />
-                    <AIChatPanel
-                        title='AI Chat'
-                    />
-                </TabsPanel>
+        <PageContainer $fullscreen={isFullscreen}>
+            <IntegratedWorkspace $fullscreen={isFullscreen}>
+                {/* 面板用 PanelSlot 包一层，靠 CSS 隐藏而不是条件渲染 ——
+                    组件仍留在树上，面板内部状态（AI 对话记录、当前页签、编辑器光标）不会因为
+                    进出全屏而丢掉。display: contents 时这层盒子不存在，两个面板照旧是
+                    IntegratedWorkspace 的直接 flex 子项。 */}
+                <PanelSlot $hidden={isFullscreen}>
+                    <TabsPanel >
+                        <ScriptTreePanel
+                            title='ScriptFiles'
+                            files={files}
+                            activeFileId={activeFileId}
+                            onFilesChange={handleFilesChange}
+                            onSelectFile={handleSelectFile}
+                        />
+                        <ScriptInputPanel
+                            title="Script Input"
+                            script={script}
+                            onScriptChange={handleScriptChange}
+                            onExecute={handleExecuteScript}
+                            onSave={handleSaveScript}
+                            saveStatus={saveStatus}
+                            highlightLines={highlightLines}
+                        />
+                        <AIChatPanel
+                            title='AI Chat'
+                        />
+                    </TabsPanel>
+                </PanelSlot>
 
                 <CanvasWrapper ref={canvasWrapperRef}>
                     {canvasDimensions.width > 0 && canvasDimensions.height > 0 && (
                         <GeometricCanvas
                             width={canvasDimensions.width}
                             height={canvasDimensions.height}
+                            isFullscreen={isFullscreen}
+                            onToggleFullscreen={onToggleFullscreen}
+                            onExecute={handleExecuteScript}
+                            onRequestObjectEdit={handleRequestObjectEdit}
+                            objectMenuRequest={objectMenuRequest}
+                            onCanvasReady={setCanvasElement}
+                            animationToken={animationToken}
                             script={generatedScript}
                             revision={revision}
                             onGeometryMessage={handleGeometryMessage}
@@ -524,54 +637,92 @@ function MainContent() {
                     )}
                 </CanvasWrapper>
 
-                <OutputPanel
-                    title="Output Panel"
-                    logs={logMessages}
-                    variables={variables}
-                    onToggleRandomVariable={handleToggleRandomVariable}
-                    onToggleRandomObject={handleToggleRandomObject}
-                    onTogglePointFrozen={handleTogglePointFrozen}
-                    selectedObjectName={selectedObjectName}
-                    onSelectObject={handleCanvasSelectObject}
-                    onObjectPropertyChange={handleObjectPropertyChange}
-                    onCutPointsChange={handleCutPointsChange}
-                    onLabelChange={handleLabelChange}
-                    onPickCutPoint={handlePickCutPoint}
-                />
+                <PanelSlot $hidden={isFullscreen}>
+                    <OutputPanel
+                        title="Output Panel"
+                        logs={logMessages}
+                        variables={variables}
+                        onToggleRandomVariable={handleToggleRandomVariable}
+                        onToggleRandomObject={handleToggleRandomObject}
+                        onTogglePointFrozen={handleTogglePointFrozen}
+                        selectedObjectName={selectedObjectName}
+                        selectedObjectNames={selectedObjectNames}
+                        onSelectObject={handleCanvasSelectObject}
+                        onRequestObjectMenu={handleRequestObjectMenu}
+                        onObjectPropertyChange={handleObjectPropertyChange}
+                        onCutPointsChange={handleCutPointsChange}
+                        onLabelChange={handleLabelChange}
+                        onPickCutPoint={handlePickCutPoint}
+                    />
+                </PanelSlot>
             </IntegratedWorkspace>
+
+            {/* 「编辑对象」对话框。放在这一层是因为它要的 `variables` 和那几个写回脚本的回调
+                本来就都在这里（右侧面板用的就是同一批）—— 画布不必为此再维护一份。
+                对象被删掉 / 脚本重跑后它不存在了就不渲染，对话框自然消失。 */}
+            {objectEditValue && (
+                <ObjectEditDialog
+                    object={objectEditValue}
+                    sourceCanvas={canvasElement}
+                    // 和画布同尺寸：对话框里的图形是主画布的像素副本，两边尺寸必须一致，
+                    // 否则贴上去会被拉伸。
+                    canvasWidth={canvasDimensions.width}
+                    canvasHeight={canvasDimensions.height}
+                    handlers={{
+                        onObjectPropertyChange: handleObjectPropertyChange,
+                        onCutPointsChange: handleCutPointsChange,
+                        onLabelChange: handleLabelChange,
+                        onPickCutPoint: handleDialogPickCutPoint,
+                    }}
+                    onTogglePointFrozen={handleTogglePointFrozen}
+                    onToggleRandomObject={handleToggleRandomObject}
+                    onClose={() => setObjectEditTarget(null)}
+                />
+            )}
         </PageContainer>
     );
 }
 
 // 页面容器，现在的主要职责是提供背景色并将工作区居中
-const PageContainer = styled.div`
+const PageContainer = styled.div<{ $fullscreen?: boolean }>`
   display: flex;
   justify-content: center; /* 水平居中 */
   align-items: center; /* 垂直居中 */
-  padding: 2rem; /* 确保工作区与浏览器边缘有边距 */
+  /* 全屏时去掉所有留白，让画布真的贴满视口 */
+  padding: ${({ $fullscreen }) => ($fullscreen ? '0' : '2rem')};
   
-  height: calc(100vh - 80px); /* 假设Header高度为80px */
+  /* 普通模式给 Header 让出 80px；全屏模式 Header 已隐藏，容器直接吃满整屏 */
+  height: ${({ $fullscreen }) => ($fullscreen ? '100vh' : 'calc(100vh - 80px)')};
   width: 100%;
   box-sizing: border-box;
-  background-color: #f4f7fc; /* 页面的浅灰色背景 */
+  background-color: ${({ $fullscreen }) => ($fullscreen ? '#ffffff' : '#f4f7fc')};
 `;
 
 // 新增的整合式工作区，这是一个“卡片”
-const IntegratedWorkspace = styled.div`
+const IntegratedWorkspace = styled.div<{ $fullscreen?: boolean }>`
   display: flex;
   align-items: stretch;
-  gap: 1.5rem; /* 稍微减小面板间的距离，让它们更紧凑 */
+  gap: ${({ $fullscreen }) => ($fullscreen ? '0' : '1.5rem')}; /* 全屏只剩一个子项，间距无意义 */
   
   width: 100%;
-  max-width: 1700px; /* 设置一个最大宽度，防止在大屏幕上过分拉伸 */
-  height: 95%;
-  max-height: 1200px; /* 设置一个最大高度 */
+  /* 全屏时解除 1700px / 1200px 的封顶，否则大屏上画布反而比窗口小 */
+  max-width: ${({ $fullscreen }) => ($fullscreen ? 'none' : '1700px')};
+  height: ${({ $fullscreen }) => ($fullscreen ? '100%' : '95%')};
+  max-height: ${({ $fullscreen }) => ($fullscreen ? 'none' : '1200px')};
 
-  padding: 1.5rem; /* 卡片内部的边距 */
-  background-color: #ffffff; /* 卡片使用白色背景 */
-  border-radius: 16px; /* 更大的圆角，更柔和 */
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.08); /* 更明显的阴影以突出层次感 */
+  padding: ${({ $fullscreen }) => ($fullscreen ? '0' : '1.5rem')};
+  background-color: #ffffff;
+  /* 全屏时不要圆角和阴影，画布边界就是屏幕边界 */
+  border-radius: ${({ $fullscreen }) => ($fullscreen ? '0' : '16px')};
+  box-shadow: ${({ $fullscreen }) => ($fullscreen ? 'none' : '0 10px 40px rgba(0, 0, 0, 0.08)')};
   box-sizing: border-box;
+`;
+
+// 面板插槽。平时 display: contents —— 盒子不参与布局，里面的面板照旧是
+// IntegratedWorkspace 的直接 flex 子项，宽度/收缩行为和以前完全一致；
+// 全屏时改成 display: none 把面板藏掉，但组件仍挂在 React 树上（状态不丢）。
+const PanelSlot = styled.div<{ $hidden?: boolean }>`
+  display: ${({ $hidden }) => ($hidden ? 'none' : 'contents')};
 `;
 
 // 中间画布的包裹容器（保持不变）

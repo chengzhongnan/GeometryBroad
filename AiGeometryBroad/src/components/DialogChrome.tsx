@@ -12,10 +12,17 @@ import styled from 'styled-components';
  * 不要在下游重写一遍背景色和阴影。
  */
 
-export const Backdrop = styled.div`
+/**
+ * 遮罩层。
+ *
+ * `$faint` 给「边改边看」的对话框用（比如编辑对象属性）：那些对话框的改动**立即生效**，
+ * 用户需要一边改一边看画布上的结果，遮得太黑就什么都看不见了。
+ * 它仍然挡住指针事件 —— 看得见不等于点得到，避免误操作画布。
+ */
+export const Backdrop = styled.div<{ $faint?: boolean }>`
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.42);
+  background: ${({ $faint }) => ($faint ? 'rgba(15, 23, 42, 0.12)' : 'rgba(15, 23, 42, 0.42)')};
   display: flex;
   align-items: center;
   justify-content: center;

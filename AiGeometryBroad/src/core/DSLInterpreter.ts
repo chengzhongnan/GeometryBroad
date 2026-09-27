@@ -25,14 +25,24 @@ import {
 
 import { toScreenPoint, fromScreenPoint, DEFAULT_POINT_RADIUS_PIXELS, resolvePointRadius, type DrawTransform } from './geometry/base';
 import {
+    centroid as triangleCentroid,
+    circumcenter as triangleCircumcenter,
+    excenters as triangleExcenters,
+    fermatPoint as triangleFermatPoint,
+    incenter as triangleIncenter,
+    orthocenter as triangleOrthocenter,
+    type TriangleVertices,
+} from './geometry/triangleCenters';
+import {
     buildCanvasMatrix,
     degreesToRadians,
+    radiansToDegrees,
     isUsableView,
     rotateAbout,
     viewPivot,
     type CanvasView,
 } from './viewTransform';
-import { calculate } from './expression';
+import { calculate, collectMemberTokens, splitMemberToken, MEMBER_PROPERTIES } from './expression';
 import { getHelpMessages } from './HelpCommand';
 import { isGeometricCommandName, isMetaCommandName } from './dslCommandNames';
 import { splitLatexParts, latexRegionMask } from './latexSplit';
@@ -90,6 +100,14 @@ export interface VariableInfo {
     pointFrozen?: boolean;
     // 对象创建指令在脚本中的物理行号（1-based），用于把属性改动写回正确的行。
     lineNumber?: number;
+    /**
+     * 这个对象在脚本里出现的**所有**行号（定义行 + `DRAW obj=X` + `SETLABEL name=X`），升序。
+     *
+     * 和 `lineNumber` 的分工：那个必须唯一（写回属性时得确定改哪一行），
+     * 这个用于在编辑器里打标记 —— 标记要覆盖「定义」和「绘制」两处，
+     * 因为对象常常定义在一行、画在另一行。
+     */
+    sourceLines?: number[];
     details?: Record<string, string>;
     editableProperties?: EditableObjectProperty[];
     // 直线/射线/线段的截止点。它是一串「点名 + 方向」，不是数值，
@@ -98,7 +116,58 @@ export interface VariableInfo {
     // 对象的显示标签。和 editableCutPoints 同理：字符串值 + 可能落在 DRAW 行上，
     // 塞不进只认数值和定义行的 editableProperties。
     editableLabel?: EditableLabelProperty;
+    /**
+     * 父对象名 —— 非空表示这是某个多边形的**派生部件**（顶点 / 边），
+     * 由解释器自动建出来，脚本里没有它自己的定义行。
+     *
+     * 面板据此把它收进父对象下面折叠显示，而不是和平铺对象混在一起刷屏。
+     */
+    parentName?: string;
+    /** 派生部件的角色：`vertex` 是顶点、`edge` 是边。只有 `parentName` 非空时才有值。 */
+    partRole?: 'vertex' | 'edge';
 }
+
+/**
+ * 多边形的自动派生部件。
+ *
+ * `CREATE TRIANGLE / RECTANGLE / POLYGON / REGION` 建出来的东西以前是「一整块」：
+ * 只有整体一个对象，里面的顶点和边在 DSL 里一个都引用不到，于是「取某条边的中点」
+ * 「过某个顶点作垂线」这类操作全都做不了。现在解释器在建多边形的同时把它的
+ * 顶点和边也注册成正式对象，命名固定：
+ *
+ * - 顶点 `<父名>_v1 .. <父名>_vn`（第 i 条边的**起点**是 `v_i`）
+ * - 边   `<父名>_e1 .. <父名>_en`（`e_i` 连 `v_i` -> `v_{i+1}`，`e_n` 回到 `v_1`）
+ *
+ * 顶点分两种：本来就是用户自己的点（三角形/多边形的顶点）时**只登记一个别名**，
+ * 不新建重合的点（图上不该出现两个叠在一起的点）；矩形自动补出来的角才是真的新点。
+ */
+export interface DerivedPart {
+    name: string;
+    role: 'vertex' | 'edge';
+}
+
+/** 超过这个顶点数就不再派生部件：点集围出来的区域动辄上百个点，全建出来会拖垮面板。 */
+const MAX_DERIVED_PART_VERTICES = 64;
+
+/**
+ * 「坐标由别的几何对象算出来」的造点指令。
+ *
+ * 这些指令的产物**在画布上拖不动** —— 它们的定义行里没有 `x=` / `y=` 可以写回，
+ * 拖完脚本不会变、图形会弹回原位。以前只有「表达式驱动」的点才被标成派生
+ * （`isObjectDerived`），这类点没被标上，于是表现为「光标是可拖的、拖起来点也跟着走、
+ * 松手又跳回去」——用户只会以为程序坏了。
+ *
+ * 为什么是白名单而不是「凡造点指令都算」：`POINT` 自己当然不算；
+ * `POINT_ON_LINE` / `POINT_ON_CIRCLE` 也不算 —— 它们虽然也没有 `x=`，
+ * 但有**受约束拖动**（写回 `distance=` / `angle=`），而且 `isObjectDerived` 正是
+ * `resolveConstrainedPointDrag` 用来拒绝拖动的那道闸，把这两个放进来会直接把功能关掉。
+ */
+const COMPUTED_POINT_COMMANDS = new Set([
+    'MIDPOINT', 'INTERSECT', 'PERPENDICULAR_FOOT', 'ROTATED_POINT', 'REFLECTED_POINT',
+    'CIRCLE_CENTER', 'RANDOMPOINT',
+    // 三角形的「心」
+    'CENTROID', 'ORTHOCENTER', 'INCENTER', 'CIRCUMCENTER', 'FERMAT_POINT', 'EXCENTER',
+]);
 
 /**
  * 线性对象的截止点属性。
@@ -245,15 +314,36 @@ interface InterpreterState {
     previewObjectProperties: Map<string, Map<ObjectPropertyKey, number>>;
     textElements: Map<string, TextElement>;
     pointSets: Map<string, Point[]>;
+    /**
+     * 多边形的派生部件：父对象名 -> 部件列表（顶点在前、边在后，各自按序）。
+     *
+     * 只在这里记「父子关系」，真正的对象仍然放在 `objects`（边）或
+     * `objectAliases`（顶点别名）里，这样 `getObject('<父名>_e2')` 这类引用
+     * 走的是和其它对象完全相同的查找路径。
+     */
+    derivedParts: Map<string, DerivedPart[]>;
+    /** 部件名 -> 父对象名。命中检测和面板分组都要反查，单独存一份省得每次遍历。 */
+    derivedPartOwners: Map<string, string>;
+    /** 部件别名 -> 真实对象名。顶点本来就存在时只记别名，不复制点。 */
+    objectAliases: Map<string, string>;
     /** 当前正在执行的指令行号，供「事后才发现的错误」在消息里报出准确位置。 */
     currentCommandLine: number;
     /**
-     * 「create 时写了 draw=true」的几何对象，等脚本跑完统一绘制。
+     * 待绘队列：这一轮脚本里所有「绘制动作」，等脚本跑完统一画（或交给延时动画逐个画）。
      *
-     * 用数组保序：绘制顺序 = 创建顺序，所以 z 序与「逐个立即绘制」时一致。
-     * 统一后置的原因见 `collectDraw`。
+     * 用数组保序：绘制顺序 = 入队顺序 = 脚本里出现的顺序，所以 z 序与「逐个立即绘制」时一致。
+     * 几何对象统一后置的原因见 `collectDraw`；`ANIMATE` 打开时这个队列会被交给驱动，
+     * 每隔 `interval` 毫秒弹出一项来画。
      */
     pendingDraws: PendingDraw[];
+    /**
+     * `ANIMATE` 全局指令的配置；`null` = 没有这条指令（或显式关掉了），整份脚本一次性画完。
+     *
+     * 和 `VIEW` 一样是**位置无关**的：写在脚本哪一行都作用于整份脚本。
+     * 但和 `defaultOptions` 里的那些不同，它在每次 `execute` 开始时都会重置 ——
+     * 脚本里删掉这一行，动画就该真的停掉。
+     */
+    delayedDraw: { interval: number } | null;
     /**
      * 创建时还没解析出来的截止点引用，按对象名索引。
      *
@@ -265,14 +355,57 @@ interface InterpreterState {
     executeDepth: number;
 }
 
-/** 一个「create 时写了 draw=true」、等着脚本跑完统一绘制的几何对象。 */
-interface PendingDraw {
-    /** 绘制参数（创建时那一行的副本）。 */
-    params: Map<string, string>;
-    object: GeometricObject;
-    /** 点的标签名（`drawObject` 需要），非点对象是 undefined。 */
-    label: string | undefined;
+/**
+ * 浅拷贝一份解释器状态：所有容器（Map / Set / 数组）都换成新的一份，
+ * 里面的元素仍然是同一批引用。
+ *
+ * 用途是「预览」：作图对话框要在真正插入指令之前先画一遍看看效果，
+ * 那一次绘制会往 `objects` / `variableInfo` / `renderedObjectNames` 等容器里塞东西。
+ * 换一份副本之后，预览期间的副作用只落在副本上，跑完把原 state 换回来即可。
+ *
+ * 为什么按类型遍历而不是手写字段清单：`InterpreterState` 有二十多个容器字段，
+ * 手写清单迟早会漏 —— 漏一个就意味着预览会污染正在用的解释器（幽灵对象、
+ * 重复的命中区域），而且症状离原因很远，很难查。按类型克隆对新增字段自动生效。
+ *
+ * `defaultOptions` 单独再拷一层：它是唯一一个「值语义的嵌套对象」，
+ * 预览指令里的 `SET` 之类的元指令会改它，不隔开就会把默认色改掉。
+ */
+function cloneInterpreterState(state: InterpreterState): InterpreterState {
+    const copy = {
+        ...state,
+        defaultOptions: { ...state.defaultOptions },
+    } as unknown as Record<string, unknown>;
+
+    for (const key of Object.keys(copy)) {
+        const value = copy[key];
+        if (value instanceof Map) copy[key] = new Map(value);
+        else if (value instanceof Set) copy[key] = new Set(value);
+        else if (Array.isArray(value)) copy[key] = [...value];
+    }
+
+    return copy as unknown as InterpreterState;
 }
+
+/**
+ * 待绘队列里的一项 —— 也就是**一次绘制动作**。
+ *
+ * 以前这里只有「几何对象 + 创建行参数」一种；`ANIMATE` 延时动画要求
+ * 「哪怕是及时绘制指令也一并加入延时绘制」，所以 `DRAW` / `FILL` / `TEXT` / `AXIS` / `GRID`
+ * 这些本来当场就画的指令，在动画模式下也会往这里排，于是改成联合类型。
+ *
+ * 每一项都带 `lineNumber`：延时绘制是**脚本跑完之后**才落笔的，那时
+ * `state.currentCommandLine` 早就不是这一项的位置了，只有随项记下来，
+ * 出错的报错才能指回脚本里真正的那一行。
+ */
+type PendingDraw =
+    /** 几何对象：来自 `CREATE ... draw=true`（`collectDraw`），或显式 `DRAW` / `FILL`。 */
+    | { kind: 'object'; params: Map<string, string>; object: GeometricObject; label: string | undefined; lineNumber: number }
+    /** 一段画布文字（`TEXT`）。延后画时靠 `rawCommand` 原样重放，见 `executeText`。 */
+    | { kind: 'text'; params: Map<string, string>; rawCommand: string; lineNumber: number }
+    /** 坐标轴（`CREATE AXIS`）。它不建对象、只往 ctx 上画，所以整条指令作为一项延后重放。 */
+    | { kind: 'axis'; params: Map<string, string>; lineNumber: number }
+    /** 坐标网格（`CREATE GRID`）。同上。 */
+    | { kind: 'grid'; params: Map<string, string>; lineNumber: number };
 
 /** 一个创建时引用了尚未定义的点的线性对象。 */
 interface PendingCutResolution {
@@ -282,7 +415,22 @@ interface PendingCutResolution {
     lineNumber: number;
 }
 
-export type ObjectPropertyKey = 'x' | 'y' | 'radius' | 'radiusX' | 'radiusY' | 'rotation' | 'width' | 'height';
+/**
+ * 属性面板 / 画布拖动能改的属性。
+ *
+ * `distance` / `angle` 是「受约束的点」专用的：
+ * `POINT_ON_LINE` 的点沿所在线移动改的是 `distance=`，
+ * `POINT_ON_CIRCLE` 的点沿圆周移动改的是 `angle=`。
+ * 这两个不是自由坐标，拖动时要把鼠标位置换算成它们，不能直接写 x / y。
+ *
+ * `a` / `b` 专属于 `RECTANGLE`：它是**唯一的**用数值描述自身尺寸的对象，
+ * 早期在这里用 `width` / `height`，可这两个键在别的指令上表示「线宽」，
+ * 同名不同义导致 AI 和用户频繁写出把矩形糊成实心块的代码。
+ * 现在边长改叫 `a` / `b`，DSL 里再没有第二种含义。
+ */
+export type ObjectPropertyKey =
+    | 'x' | 'y' | 'radius' | 'radiusX' | 'radiusY' | 'rotation' | 'width' | 'height'
+    | 'distance' | 'angle' | 'a' | 'b';
 
 export interface EditableObjectProperty {
     key: ObjectPropertyKey;
@@ -359,6 +507,14 @@ export type CanvasSelection =
 const SELECTED_OBJECT_COLOR = '#e11d48';
 
 /**
+ * `ANIMATE` 不写 `interval=` 时的默认间隔（毫秒）。
+ *
+ * 300ms 是「看得清是一个一个出现的」和「整幅图别等到不耐烦」之间的折中：
+ * 20 个对象的构造大约 6 秒放完。觉得慢就写 `ANIMATE interval=120`。
+ */
+const DEFAULT_DELAYED_DRAW_INTERVAL = 300;
+
+/**
  * 能产生线性对象、并且接受 `cutPoints` 的创建指令。
  *
  * 派生线（中垂线 / 垂线 / 平行线 / 角平分线）的两个定义点是内部合成点，DSL 里引用不到，
@@ -383,6 +539,52 @@ export class GeometryDSLInterpreter {
     // 当前挂起的动画帧回调。浏览器是 requestAnimationFrame，Node 是 setTimeout。
     // 全解释器只有一个，所有动画共用一个循环，不再每个动画挂一条定时器链。
     private scheduledFrame: { cancel: () => void } | null = null;
+
+    /**
+     * 延时绘制（`ANIMATE`）正在播的那一轮。`null` = 没在播。
+     *
+     * 和上面的 `scheduledFrame` 是**两条独立的调度**：那个跑的是 `CREATE ANIMATION`
+     * 的逐帧循环（跟着刷新率走），这个跑的是「一个一个对象慢慢画出来」（按固定毫秒间隔）。
+     * 两者可以同时存在，所以句柄不能共用 —— 共用的话后开的那条会把先开的挤掉。
+     */
+    private delayedDrawPlayback: { queue: PendingDraw[]; cursor: number; interval: number } | null = null;
+    /** 下一次「画下一项」的定时器句柄。 */
+    private delayedDrawTimer: { cancel: () => void } | null = null;
+    /**
+     * 用户按下了「暂停」。
+     *
+     * 这个开关同时管住**两条**动画调度：
+     *   - `CREATE ANIMATION` 的 rAF 逐帧循环（`scheduledFrame`）；
+     *   - `ANIMATE` 的延时绘制（`delayedDrawTimer`）。
+     *
+     * 暂停只是「不再往下推进」，两边的进度都原地保留（`cursor` / `lastFrameTime`），
+     * 所以恢复时能接着放，而不是从头再来。和 `animationAutoStart` 的分工：
+     * 那个是「离线导出，干脆别起动画」，这个是「交互中按了暂停，随时可能恢复」。
+     */
+    private animationPaused = false;
+    /**
+     * 上一轮延时绘制已经画到第几项。**跨 `execute` 保留**，是「接着放」的依据。
+     *
+     * 画布因为选中对象 / 拖动 / 改属性 / 改窗口大小 / KaTeX 异步缓存命中而重绘时，
+     * 会整块清空重跑脚本 —— 这一轮**不该从头再放**，也不该直接跳到结尾，而应当
+     * 把已经画过的前缀补回来、再从断点接着往下放。这个数就是那个断点。
+     */
+    private delayedDrawProgress = 0;
+    /**
+     * 下一次开播时要**先补画**几项（`delayedDrawProgress` 的快照）。
+     *
+     * 由 `execute` 写入、`startDelayedDrawPlayback` 消费掉。单独存一份是为了让「续播」
+     * 只作用于紧随其后的那一次开播 —— 一轮执行里可能因为 `CREATE ANIMATION` 逐帧而
+     * 冲刷多次，后面几次不该再拿着旧进度去补画。
+     */
+    private delayedDrawResume = 0;
+    /**
+     * 「当前正在重放队列里的某一项」。
+     *
+     * 重放 `TEXT` / `AXIS` / `GRID` 的办法就是把原指令再执行一遍，而那些方法开头都有
+     * 「动画模式下先入队」的判断 —— 不设这个开关就会无限自我入队。
+     */
+    private replayingDelayedDraw = false;
 
     constructor(canvas?: HTMLCanvasElement, onMessage?: onMessageCallback) {
         this.state = {
@@ -456,8 +658,12 @@ export class GeometryDSLInterpreter {
             previewObjectProperties: new Map(),
             textElements: new Map(),
             pointSets: new Map(),
+            derivedParts: new Map(),
+            derivedPartOwners: new Map(),
+            objectAliases: new Map(),
             currentCommandLine: 0,
             pendingDraws: [],
+            delayedDraw: null,
             pendingCutResolutions: new Map(),
             executeDepth: 0,
         };
@@ -487,9 +693,19 @@ export class GeometryDSLInterpreter {
             this.state.sourceBindings.set(name, { command, lineNumber: command.lineNumber });
             return;
         }
-        const name = command.params.get('name') || command.params.get('n');
-        if (!name || command.type !== 'geometric') return;
-        this.state.sourceBindings.set(name, { command, lineNumber: command.lineNumber });
+        // `name=X,Y` 一条指令建出多个对象（`CREATE INTERSECT` 的两个交点、
+        // `CREATE TANGENT` 的两个切点、`CREATE FOCIS` 的两个焦点…）。
+        // 必须**逐个名字分别登记**：早先这里把整串 `"X,Y"` 当成一个 key 存进去，
+        // 于是 `X` 和 `Y` 谁也查不到自己的定义行 —— `getSourceLineForObject` 对它们
+        // 一律返回 null。后果不只是「对象面板少个行号」：截取线段靠
+        // `isReferenceablePoint`（= 有没有源码行）筛掉内部合成点，
+        // 交点因此被当成合成点剔除，直线按「没有这个交点」来分段，截取就切错了。
+        const rawName = command.params.get('name') || command.params.get('n');
+        if (!rawName || command.type !== 'geometric') return;
+        const names = rawName.split(',').map(part => part.trim()).filter(Boolean);
+        for (const name of names) {
+            this.state.sourceBindings.set(name, { command, lineNumber: command.lineNumber });
+        }
     }
 
     private getTextObjectName(params: Map<string, string>, lineNumber: number): string {
@@ -571,11 +787,29 @@ export class GeometryDSLInterpreter {
     }
 
     // 主要的解析和执行函数
-    public execute(script: string): void {
+    /**
+     * 跑一遍脚本。
+     *
+     * `options.restartAnimation === false` 表示「这一轮重绘不是用户主动重跑」——
+     * 画布因为**选中对象 / 拖动 / 改属性 / 改窗口大小 / KaTeX 异步缓存命中**而重绘时走这条。
+     * 这种情况下延时动画不会从头再放，而是**接着上一轮的进度**继续：先把已经画过的
+     * 那几项补回来（画布刚被清空过），再从断点往下放。省略该选项 = 从头开始放。
+     */
+    public execute(script: string, options: { restartAnimation?: boolean } = {}): void {
         // 清空state中的命令和slot
         this.state.codes.clear();
         // 脚本重跑会重建全部动画，先停掉驱动循环，否则旧循环会继续空转。
         this.cancelScheduledFrame();
+        // 上一轮的延时绘制也一起停掉：它手里攥着上一份脚本的对象引用。
+        // 注意顺序 —— 进度存在 `delayedDrawProgress` 里，不受这次取消影响。
+        this.cancelDelayedDrawPlayback();
+        if (options.restartAnimation === false) {
+            // 续播：记下上一轮画到哪，稍后由 `startDelayedDrawPlayback` 补画并接着放。
+            this.delayedDrawResume = this.delayedDrawProgress;
+        } else {
+            this.delayedDrawProgress = 0;
+            this.delayedDrawResume = 0;
+        }
         this.state.animations.clear();
         this.state.lastCodeName = undefined;
         this.state.objects.clear();
@@ -584,8 +818,16 @@ export class GeometryDSLInterpreter {
         this.state.variableInfo.clear();
         this.state.sourceBindings.clear();
         this.state.topLevelCommands = [];
+        // 两个倒排索引都是从顶层指令表建的，指令表一清就得作废。
+        this.objectLineIndex = null;
+        this.drawLineIndex = null;
         this.state.textElements.clear();
         this.state.pointSets.clear();
+        // 派生部件（顶点别名 / 边）跟着对象一起作废：脚本重跑会重新注册一遍，
+        // 留着旧的会让「上次跑出来的边」继续参与命中检测和面板显示。
+        this.state.derivedParts.clear();
+        this.state.derivedPartOwners.clear();
+        this.state.objectAliases.clear();
         // 标签覆盖表由 SETLABEL 写入，而脚本里就写着 SETLABEL，重跑会重新填一遍。
         // 不全清的话，用户把 SETLABEL 那行删掉后旧标签会阴魂不散地留在图上。
         this.state.labelOverrides.clear();
@@ -596,6 +838,18 @@ export class GeometryDSLInterpreter {
         this.state.pendingDraws = [];
         this.state.pendingCutResolutions.clear();
         this.state.executeDepth = 0;
+        // `ANIMATE` 是脚本级设置：每次重跑都从「没写」开始，脚本里删掉它动画就真的停了。
+        // （`defaultOptions` 里的 VIEW/SET 不重置是另一回事 —— 那是交互视图状态。）
+        //
+        // **例外：暂停态下即使没写 `ANIMATE`，也把绘制排成队列。**
+        // 用户按了暂停/单步就是想要「一项一项地看」，静态脚本本来会一次性画完，
+        // 排成队列才有的可推。这正是「对没有动画的脚本也能单步作图」的实现方式 ——
+        // 不需要脚本配合，暂停这个动作本身就切换到了逐项模式。
+        // 恢复播放（resumeAnimations）会清掉 animationPaused，下一次重跑就回到一次性绘制。
+        // 脚本里真写了 `ANIMATE` 的话由 `executeAnimate` 覆盖掉这里，它的 interval 说了算。
+        this.state.delayedDraw = this.animationPaused
+            ? { interval: DEFAULT_DELAYED_DRAW_INTERVAL }
+            : null;
 
         const lines = buildLogicalLines(script);
         this.executeLines(lines, true);
@@ -786,6 +1040,8 @@ export class GeometryDSLInterpreter {
             }
         } else {
             this.cancelScheduledFrame();
+            // 延时绘制也靠计时器驱动，离线导出（autoStart=false）同样不能让它继续跑。
+            this.cancelDelayedDrawPlayback();
         }
     }
 
@@ -793,9 +1049,75 @@ export class GeometryDSLInterpreter {
     // 组件卸载 / 丢弃解释器实例时调用：否则 rAF 循环会继续对已经脱离文档的 canvas 绘制。
     public dispose(): void {
         this.cancelScheduledFrame();
+        this.cancelDelayedDrawPlayback();
         for (const animation of this.state.animations.values()) {
             animation.isRunning = false;
         }
+    }
+
+    /**
+     * 暂停动画。`CREATE ANIMATION` 的逐帧播放和 `ANIMATE` 的延时绘制一起停。
+     *
+     * 只停「推进」，不停「状态」：
+     *   - 逐帧动画的 `isRunning` 不动，`lastFrameTime` 也不动（恢复时会重置，见 resume）；
+     *   - 延时绘制的 `delayedDrawPlayback` 留着 —— 它的 `cursor` 就是断点，丢了就只能从头放。
+     *
+     * 暂停是**幂等**的：重复调用不会把已经取消的定时器再取消一次。
+     */
+    public pauseAnimations(): void {
+        if (this.animationPaused) return;
+        this.animationPaused = true;
+        // 逐帧动画：停掉 rAF 驱动循环。
+        this.cancelScheduledFrame();
+        // 延时绘制：只取消「下一次画下一项」的定时器，playback 本体留着当断点。
+        this.delayedDrawTimer?.cancel();
+        this.delayedDrawTimer = null;
+    }
+
+    /**
+     * 恢复动画。和 `pauseAnimations` 成对，两边都从断点接着放。
+     *
+     * 逐帧动画的 `lastFrameTime` 会被重置成 -1：暂停期间 rAF 是停的，但时间照走，
+     * 不重置的话恢复后第一帧会拿「暂停了多久」去比 interval，直接连跳好几帧。
+     * 重置成 -1 正好落进 `onAnimationFrame` 的「第一帧不等间隔」分支，恢复即出下一帧。
+     */
+    public resumeAnimations(): void {
+        if (!this.animationPaused) return;
+        this.animationPaused = false;
+
+        let hasRunningAnimation = false;
+        for (const animation of this.state.animations.values()) {
+            if (!animation.isRunning) continue;
+            animation.lastFrameTime = -1;
+            hasRunningAnimation = true;
+        }
+        if (hasRunningAnimation) this.startAnimationLoop();
+
+        // 延时绘制：从 cursor 接着放。已经在等下一项的定时器就不用再挂一条。
+        const playback = this.delayedDrawPlayback;
+        if (playback && playback.cursor < playback.queue.length && !this.delayedDrawTimer) {
+            this.delayedDrawTimer = this.scheduleDelayedStep(playback.interval);
+        }
+    }
+
+    /** 当前是否处于暂停状态（按钮据此显示「暂停」还是「继续」）。 */
+    public isAnimationPaused(): boolean {
+        return this.animationPaused;
+    }
+
+    /**
+     * 此刻还有没有动画在推进。用于决定「暂停」按钮要不要置灰。
+     *
+     * 注意这是**即时快照**：延时绘制画完最后一项、或非循环动画播完最后一帧之后，
+     * 这个值会变成 false，但调用方不会自动收到通知 —— 组件侧按固定间隔轮询即可，
+     * 比为此加一套回调/事件简单得多，也不会漏事件。
+     */
+    public hasActiveAnimations(): boolean {
+        const frameAnimationsRunning = Array.from(this.state.animations.values())
+            .some(animation => animation.isRunning);
+        const playback = this.delayedDrawPlayback;
+        const delayedDrawRunning = playback !== null && playback.cursor < playback.queue.length;
+        return frameAnimationsRunning || delayedDrawRunning;
     }
 
     public setFrozenRandomVariables(values: Record<string, number>): void {
@@ -826,12 +1148,46 @@ export class GeometryDSLInterpreter {
                 randomSource,
                 pointFrozen,
                 lineNumber: this.getSourceLineForObject(object.name) ?? undefined,
+                sourceLines: this.getSourceLinesForObject(object.name),
                 details: this.getObjectDetails(object),
                 editableProperties: this.getEditableObjectProperties(object.name),
                 editableCutPoints: this.getEditableCutPoints(object.name),
                 editableLabel: this.getEditableLabel(object.name),
+                parentName: this.state.derivedPartOwners.get(object.name),
+                partRole: this.getDerivedPartRole(object.name),
             };
         });
+
+        // 只登记了别名的顶点（三角形 / 多边形的 A、B、C）不在 objects 表里，
+        // 得单独补一行，否则面板里看不到 `tri1_v1` 这个名字，用户也就不知道能引用它。
+        // 刻意不给可编辑属性：别名不是独立对象，改坐标请改它指向的那个点（面板里另有那一行）——
+        // 给了的话写回会拿 `tri1_v1` 去脚本里找 `name=tri1_v1`，找不到，改了没反应。
+        const aliasParts: VariableInfo[] = [];
+        for (const [parentName, parts] of this.state.derivedParts) {
+            for (const part of parts) {
+                if (part.role !== 'vertex') continue;
+                const targetName = this.state.objectAliases.get(part.name);
+                if (!targetName) continue;
+                const target = this.state.objects.get(targetName);
+                if (!target) continue;
+                aliasParts.push({
+                    name: part.name,
+                    expression: `= ${targetName}`,
+                    value: target.type,
+                    kind: 'object',
+                    frozen: false,
+                    objectType: target.type,
+                    randomObject: false,
+                    pointFrozen: target.type === 'point' && (target as Point).frozen === true,
+                    lineNumber: this.getSourceLineForObject(part.name) ?? undefined,
+                    sourceLines: this.getSourceLinesForObject(part.name),
+                    details: this.getObjectDetails(target),
+                    parentName,
+                    partRole: 'vertex',
+                });
+            }
+        }
+
         const texts = Array.from(this.state.textElements.values()).map(text => ({
             name: text.name,
             expression: 'TEXT',
@@ -840,6 +1196,7 @@ export class GeometryDSLInterpreter {
             frozen: false,
             objectType: 'text',
             lineNumber: this.getSourceLineForObject(text.name) ?? undefined,
+            sourceLines: this.getSourceLinesForObject(text.name),
             details: {
                 type: 'text',
                 'position.x': this.formatObjectNumber(text.x),
@@ -848,7 +1205,14 @@ export class GeometryDSLInterpreter {
             },
             editableProperties: this.getEditableObjectProperties(text.name),
         }));
-        return [...variables, ...objects, ...texts];
+        return [...variables, ...objects, ...aliasParts, ...texts];
+    }
+
+    /** 派生部件的角色；不是部件时返回 undefined。 */
+    private getDerivedPartRole(name: string): 'vertex' | 'edge' | undefined {
+        const owner = this.state.derivedPartOwners.get(name);
+        if (!owner) return undefined;
+        return this.state.derivedParts.get(owner)?.find(part => part.name === name)?.role;
     }
 
     /**
@@ -857,9 +1221,137 @@ export class GeometryDSLInterpreter {
      * 空行、注释、跨行引号值和行末续行都不会影响这个行号。
      */
     public getSourceLineForObject(name: string): number | null {
-        const binding = this.state.sourceBindings.get(name);
+        // 派生顶点别名指向的是用户自己的点，行号当然也是那个点的行号 ——
+        // 不换真名的话，拖动 `tri1_v1` 会因为「查不到行」而拖不动。
+        const binding = this.state.sourceBindings.get(this.state.objectAliases.get(name) ?? name);
         if (!binding || !(binding.lineNumber > 0)) return null;
         return binding.lineNumber;
+    }
+
+    /**
+     * 一个对象在脚本里**所有**相关的行号（升序去重），供编辑器打标记用。
+     *
+     * 和 `getSourceLineForObject` 的区别：那个只给「定义指令」那**一行**，
+     * 是给属性写回用的（必须唯一确定改哪一行）。这里要的是「这个对象在脚本里
+     * 出现在哪些地方」，所以额外收进把对象画出来的 `DRAW obj=X` 和 `SETLABEL name=X`。
+     *
+     * 为什么需要这个：脚本里对象常常是「定义在一行、画在另一行」的。
+     * 只标定义行的话，用户选中一个显示出来的对象，高亮的那一行可能根本没在画它，
+     * 而真正把它画出来的那行反倒没有任何提示。
+     *
+     * 返回空数组表示这个对象在脚本里没有对应行（解释器自动派生出来的对象，
+     * 例如 `CREATE TANGENT` 顺带建的 `T2_tan`），调用方据此不打标记。
+     */
+    public getSourceLinesForObject(name: string): number[] {
+        const lines = new Set<number>();
+        // 派生顶点别名换成真名再找（`tri1_v1` 就是 A，行的当然是 A 那几行）。
+        const resolved = this.state.objectAliases.get(name) ?? name;
+
+        const binding = this.state.sourceBindings.get(resolved);
+        if (binding && binding.lineNumber > 0) lines.add(binding.lineNumber);
+
+        // 顶层 `DRAW obj=X` / `SETLABEL name=X`。同一个对象可能被画多次、被 SETLABEL
+        // 点名多次，所以全部收进来而不是取第一条。
+        //
+        // 走预先建好的倒排索引，不再每次扫全表 —— 变量面板会对**每个**对象调一次这个函数，
+        // 原来那种写法是 O(对象数 × 指令数)：正 257 边形那种 4000 条指令的脚本，
+        // 光算行号就要 1 秒以上（实测 1109ms → 建索引后 6ms）。
+        for (const line of this.getObjectLineIndex().get(resolved) ?? []) {
+            lines.add(line);
+        }
+
+        // 派生部件自己没有定义行（矩形的边 `sq_e2` 就是）。退回父对象那一行 ——
+        // 选中一条边却一行都不亮，用户只会以为标记坏了；亮出「造出它的那条指令」
+        // 正好说明了这条边是打哪来的。
+        if (lines.size === 0) {
+            const owner = this.state.derivedPartOwners.get(resolved);
+            if (owner && owner !== resolved) {
+                const ownerBinding = this.state.sourceBindings.get(owner);
+                if (ownerBinding && ownerBinding.lineNumber > 0) lines.add(ownerBinding.lineNumber);
+            }
+        }
+
+        return [...lines].sort((a, b) => a - b);
+    }
+
+    /**
+     * 这条指令是否「点名」了某个对象（`DRAW obj=A` / `SETLABEL name=A,B` 这类）。
+     *
+     * 值允许是逗号分隔的名称列表，所以必须拆开逐个比，不能拿整串去相等 ——
+     * 否则 `obj=A,B` 里的 A 会被漏掉。引号也要剥掉（`label="点 P"` 的写法）。
+     */
+    private static commandMentionsObject(command: ParsedCommand, name: string): boolean {
+        const raw = GeometryDSLInterpreter.mentionedObjectNames(command);
+        if (!raw) return false;
+        return raw.includes(name);
+    }
+
+    /**
+     * 一条顶层指令「点名」了哪些对象（`DRAW obj=A,B` / `SETLABEL name=A`），已拆好、去引号。
+     * 只认这两条指令 —— 其它指令里的名字不是「显示这个对象」的意思。
+     */
+    private static mentionedObjectNames(command: ParsedCommand): string[] | null {
+        const commandName = command.command.toUpperCase();
+        let raw: string | undefined;
+        if (commandName === 'DRAW') {
+            raw = command.params.get('obj') ?? command.params.get('o');
+        } else if (commandName === 'SETLABEL') {
+            raw = command.params.get('name') ?? command.params.get('n')
+                ?? command.params.get('obj') ?? command.params.get('o');
+        }
+        if (!raw) return null;
+        return raw.replace(/^["']|["']$/g, '').split(',').map(item => item.trim()).filter(Boolean);
+    }
+
+    /**
+     * 「对象名 -> 它出现在哪些行」的倒排索引，由 `getSourceLinesForObject` 懒建一次。
+     *
+     * 为什么必须建索引：变量面板对每个对象都要问一次「它有哪些源码行」，
+     * 每次都扫一遍顶层指令表就是 O(对象数 × 指令数)。4000 条指令的正 257 边形脚本上
+     * 实测 1109ms，而面板是每次渲染都调的 —— 不建索引这个规模的脚本根本没法用。
+     * `execute()` 会清掉缓存，脚本一改就重建。
+     */
+    private objectLineIndex: Map<string, number[]> | null = null;
+
+    private getObjectLineIndex(): Map<string, number[]> {
+        if (this.objectLineIndex) return this.objectLineIndex;
+        const index = new Map<string, number[]>();
+        for (const entry of this.state.topLevelCommands) {
+            if (!entry.lineNumber || entry.lineNumber <= 0) continue;
+            for (const objectName of GeometryDSLInterpreter.mentionedObjectNames(entry) ?? []) {
+                const list = index.get(objectName);
+                if (list) {
+                    if (!list.includes(entry.lineNumber)) list.push(entry.lineNumber);
+                } else {
+                    index.set(objectName, [entry.lineNumber]);
+                }
+            }
+        }
+        for (const list of index.values()) list.sort((a, b) => a - b);
+        this.objectLineIndex = index;
+        return index;
+    }
+
+    /**
+     * 「对象名 -> 第一条 `DRAW obj=X` 指令」的倒排索引，由 `resolveLabelSource` 懒建一次。
+     * 和 `getObjectLineIndex` 是同一类问题（O(对象数 × 指令数)），理由见那里。
+     */
+    private drawLineIndex: Map<string, ParsedCommand> | null = null;
+
+    private getDrawLineIndex(): Map<string, ParsedCommand> {
+        if (this.drawLineIndex) return this.drawLineIndex;
+        const index = new Map<string, ParsedCommand>();
+        for (const entry of this.state.topLevelCommands) {
+            if (entry.command.toUpperCase() !== 'DRAW') continue;
+            const target = entry.params.get('obj') ?? entry.params.get('o');
+            if (!target) continue;
+            for (const item of target.split(',').map(value => value.trim()).filter(Boolean)) {
+                // 同一个对象画多次时以第一条为准 —— 与原来「扫到就返回」的顺序一致。
+                if (!index.has(item)) index.set(item, entry);
+            }
+        }
+        this.drawLineIndex = index;
+        return index;
     }
 
     /**
@@ -882,11 +1374,107 @@ export class GeometryDSLInterpreter {
         }));
     }
 
+    /**
+     * 「受约束的点」当前该写的属性值 —— 线上点的 `distance`、圆上点的 `angle`。
+     *
+     * **不看脚本里写的是字面量还是表达式**，一律按点的**实际位置反算**：
+     * 「在线上取点」生成的正是 `distance={L_len * 0.37}` 这种表达式写法，
+     * 靠解析脚本取数是取不到的（Number("{...}") = NaN），而它恰恰是最需要能拖的那个。
+     *
+     * @param position 传入时用它的位置反算（拖动路径）；传 null 用点自己的当前位置（读值路径）。
+     * @param clampToObject 拖动时把位置先投影/裁剪回对象上：线段不能把点拖到两端之外。
+     */
+    private resolveConstrainedPointValue(
+        name: string,
+        position: { x: number; y: number } | null,
+        clampToObject: boolean,
+    ): { key: ObjectPropertyKey; value: number } | null {
+        const binding = this.state.sourceBindings.get(name);
+        if (!binding) return null;
+        const command = binding.command.command.toUpperCase();
+        const params = binding.command.params;
+        if (command !== 'POINT_ON_LINE' && command !== 'POINT_ON_CIRCLE') return null;
+
+        const object = this.getObject(name);
+        const from = position ?? (object instanceof Point ? { x: object.x, y: object.y } : null);
+        if (!from) return null;
+
+        if (command === 'POINT_ON_LINE') {
+            const lineName = params.get('line');
+            const referenceName = params.get('point') || params.get('p');
+            if (!lineName || !referenceName) return null;
+            const line = this.getObject(lineName);
+            const reference = this.getObject(referenceName);
+            if (!(line instanceof LinearObject) || !(reference instanceof Point)) return null;
+
+            const spanX = line.p2.x - line.p1.x;
+            const spanY = line.p2.y - line.p1.y;
+            const spanSquared = spanX * spanX + spanY * spanY;
+            if (!(spanSquared > 0)) return null;
+
+            let source = from;
+            if (clampToObject) {
+                let t = ((from.x - line.p1.x) * spanX + (from.y - line.p1.y) * spanY) / spanSquared;
+                if (line.type === 'segment') t = Math.min(1, Math.max(0, t));
+                else if (line.type === 'ray') t = Math.max(0, t);
+                source = { x: line.p1.x + spanX * t, y: line.p1.y + spanY * t };
+            }
+
+            // 方向规则必须和 LinearObject.pointAtDistance 完全一致 ——
+            // 参考点是 p2 时沿 p2→p1，否则沿 p1→p2。两边不一致的话拖动会往反方向跑。
+            const towardP1 = reference.name === line.p2.name;
+            const dirX = towardP1 ? -spanX : spanX;
+            const dirY = towardP1 ? -spanY : spanY;
+            const length = Math.sqrt(spanSquared);
+            const value = ((source.x - reference.x) * dirX + (source.y - reference.y) * dirY) / length;
+            return Number.isFinite(value) ? { key: 'distance', value } : null;
+        }
+
+        const circleName = params.get('circle') || params.get('c');
+        if (!circleName) return null;
+        const circle = this.getObject(circleName);
+        if (!(circle instanceof Circle)) return null;
+        const value = Math.atan2(from.y - circle.center.y, from.x - circle.center.x) * 180 / Math.PI;
+        return Number.isFinite(value) ? { key: 'angle', value } : null;
+    }
+
+    /**
+     * 把「鼠标拖到的位置」换算成这个点该写的属性值。
+     *
+     * 只有**受约束的点**（`POINT_ON_LINE` / `POINT_ON_CIRCLE`）会给出结果；
+     * 自由点、交点、中点等返回 null，调用方照旧按 x / y 拖动。
+     */
+    public resolveConstrainedPointDrag(
+        name: string,
+        target: { x: number; y: number },
+    ): { key: ObjectPropertyKey; value: number } | null {
+        if (this.isObjectFrozen(name)) return null;
+        // 派生点（`distance={A.x}` 这种）同理：换算出来的值写回脚本会把表达式换成死数字。
+        if (this.isObjectDerived(name)) return null;
+        return this.resolveConstrainedPointValue(name, target, true);
+    }
+
     public getEditableObjectProperties(name: string): EditableObjectProperty[] {
         const binding = this.state.sourceBindings.get(name);
         if (!binding) return [];
 
         const command = binding.command.command.toUpperCase();
+
+        // 线上点 / 圆上点：只有一个可改的属性，而且**总是可改** ——
+        // 哪怕脚本里写的是表达式。改了之后表达式会被换成算出来的数值，
+        // 这正是「把它拖到一个新位置」的语义，不该因为「非字面量」就拒绝。
+        if (command === 'POINT_ON_LINE' || command === 'POINT_ON_CIRCLE') {
+            const current = this.resolveConstrainedPointValue(name, null, false);
+            if (!current) return [];
+            return [{
+                key: current.key,
+                label: current.key === 'distance' ? '沿线距离' : '圆心角（度）',
+                value: this.getPreviewProperty(name, current.key) ?? current.value,
+                lineNumber: binding.lineNumber,
+                editable: !this.isObjectFrozen(name),
+            }];
+        }
+
         const propertyKeys: Array<{ key: ObjectPropertyKey; label: string; aliases: string[] }> =
             command === 'TEXT'
                 ? [
@@ -909,25 +1497,61 @@ export class GeometryDSLInterpreter {
                         ]
                         : command === 'RECTANGLE'
                             ? [
-                                { key: 'width', label: '宽度', aliases: ['width', 'w'] },
-                                { key: 'height', label: '高度', aliases: ['height', 'h'] },
+                                { key: 'a', label: '边长 a', aliases: ['a', 'width'] },
+                                { key: 'b', label: '边长 b', aliases: ['b', 'height'] },
                             ]
                             : [];
 
-        return propertyKeys.flatMap(({ key, label, aliases }) => {
+        return propertyKeys.flatMap(({ key, label, aliases }): EditableObjectProperty[] => {
             const raw = aliases.map(alias => binding.command.params.get(alias)).find(value => value !== undefined);
-            const value = raw === undefined ? undefined : Number(raw);
-            if (value === undefined || !Number.isFinite(value)) return [];
-            const isLiteral = this.isLiteralNumber(raw!);
+            if (raw === undefined) return [];
+
+            // 非字面量（`{slot}` / `{A.x + 50}`）：**仍然列出来**，值取对象的实时属性，
+            // 但标成不可编辑并写明原因。以前这里直接 `return []`，结果是
+            // 「表达式驱动的坐标在面板里整行消失」—— 用户既看不到值，
+            // 也不知道画布上为什么拖不动（画布那边正是按这里同一套判据拒绝拖动的）。
+            if (!this.isLiteralNumber(raw)) {
+                const live = this.livePropertyValue(name, key);
+                if (live === undefined) return []; // 读不到实时值（例如矩形的 a/b）就维持原样：不显示
+                return [{
+                    key,
+                    label,
+                    value: this.getPreviewProperty(name, key) ?? live,
+                    lineNumber: binding.lineNumber,
+                    editable: false,
+                    reason: this.isObjectDerived(name)
+                        // 派生量：改它等于把表达式换成死数字，拓扑依赖当场断掉。
+                        // 画布上同样拖不动（见 isObjectDerived），两处提示要对得上。
+                        ? '该属性由其它几何对象算出来（表达式里有「对象.属性」），画布上也无法直接拖动；要改请改表达式里的来源对象。'
+                        : '该属性由槽位或表达式驱动，请先在代码中改为数值。',
+                }];
+            }
+
+            const value = Number(raw);
+            if (!Number.isFinite(value)) return [];
             return [{
                 key,
                 label,
                 value: this.getPreviewProperty(name, key) ?? value,
                 lineNumber: binding.lineNumber,
-                editable: isLiteral,
-                reason: isLiteral ? undefined : '该属性由槽位或表达式驱动，请先在代码中改为数值。',
+                editable: true,
             }];
         });
+    }
+
+    /**
+     * 对象**当前**的某个数值属性（面板展示用）。
+     *
+     * 属性面板的键名和几何类上的字段名并不总是一致 —— 椭圆在面板里叫 `radiusX`，
+     * 类上是 `rx`。这里只做这一层映射，读不到就返回 undefined（调用方据此不显示这一行）。
+     */
+    private livePropertyValue(name: string, key: ObjectPropertyKey): number | undefined {
+        const targetName = this.state.objectAliases.get(name) ?? name;
+        const object = this.state.objects.get(targetName);
+        if (!object) return undefined;
+        const field = key === 'radiusX' ? 'rx' : key === 'radiusY' ? 'ry' : key;
+        const value = (object as unknown as Record<string, unknown>)[field];
+        return typeof value === 'number' ? value : undefined;
     }
 
     /**
@@ -979,13 +1603,11 @@ export class GeometryDSLInterpreter {
         // 那边按同样优先级决定把 `label=` 写在哪一行，两边不一致就会出现
         // 「面板里显示 A、画布上是 B」。定义行只要有 `name=` 就能匹配，若让它抢先，
         // 一条没写 `draw=true` 的定义行就会把真正的 DRAW 行遮住。
-        for (const entry of this.state.topLevelCommands) {
-            if (entry.command.toUpperCase() !== 'DRAW') continue;
-            const target = entry.params.get('obj') ?? entry.params.get('o');
-            if (!target) continue;
-            if (target.split(',').some(item => item.trim() === name)) {
-                return { lineNumber: entry.lineNumber, params: entry.params, onDrawLine: true };
-            }
+        // 走倒排索引（与 getObjectLineIndex 同理：面板对每个对象都要问一次，
+        // 每次都扫全表就是 O(对象数 × 指令数)）。索引保留**第一条** DRAW，与原语义一致。
+        const drawEntry = this.getDrawLineIndex().get(name);
+        if (drawEntry) {
+            return { lineNumber: drawEntry.lineNumber, params: drawEntry.params, onDrawLine: true };
         }
 
         if ((binding.command.params.get('draw') ?? '').toLowerCase() === 'true') {
@@ -1068,7 +1690,8 @@ export class GeometryDSLInterpreter {
      * TEXT 的定位只有**行号**这一个可靠依据：它没有 `name=`，解释器内部合成
      * `text_<行号>` 只是为了让选择和命中测试有个标识。所以这里从 `topLevelCommands`
      * 里找那条 TEXT 指令的行号 —— 那份表是解释器解析脚本时留下的，比从
-     * `textElements` 反推更可靠（TEXT 会被延迟到末尾统一绘制，元素上的行号未必是定义行）。
+     * `textElements` 反推更可靠（写了 `ANIMATE` 时 TEXT 会排进延时队列延后绘制，
+     * 元素上的行号未必就是定义行）。
      *
      * 找不到时返回 `editable: false` 并给出原因：文字可能来自 CODE 块 / 动画帧，
      * 那些上下文里的指令没有稳定的顶层源码行，硬改会改错地方。
@@ -1102,14 +1725,24 @@ export class GeometryDSLInterpreter {
         };
     }
 
-    public getEditableElementPosition(name: string): { type: string; x: number; y: number; frozen: boolean } | null {
-        const object = this.state.objects.get(name);
+    public getEditableElementPosition(name: string): { type: string; x: number; y: number; frozen: boolean; derived: boolean } | null {
+        // 派生顶点别名（`tri1_v1`）指向的那个点才是真正能被拖动的对象，先换成真名。
+        const targetName = this.state.objectAliases.get(name) ?? name;
+        const object = this.state.objects.get(targetName);
         if (object && typeof (object as any).x === 'number' && typeof (object as any).y === 'number') {
+            // 多边形自动补出来的合成点（矩形的 `_v2` / `_v3` / `_v4`）在脚本里没有
+            // 自己的定义行，拖它没有地方可写回。宁可直接判成「不可拖动」，
+            // 也不要让人拖了半天发现图形纹丝不动。
+            // 顶点别名已经换成了用户那个点的真名，这里拦不到它。
+            if (this.state.derivedPartOwners.has(targetName) && !this.state.sourceBindings.has(targetName)) {
+                return null;
+            }
             return {
                 type: object.type,
-                x: this.getPreviewProperty(name, 'x') ?? (object as any).x,
-                y: this.getPreviewProperty(name, 'y') ?? (object as any).y,
-                frozen: this.isObjectFrozen(name),
+                x: this.getPreviewProperty(targetName, 'x') ?? (object as any).x,
+                y: this.getPreviewProperty(targetName, 'y') ?? (object as any).y,
+                frozen: this.isObjectFrozen(targetName),
+                derived: this.isObjectDerived(targetName),
             };
         }
         const text = this.state.textElements.get(name);
@@ -1119,18 +1752,86 @@ export class GeometryDSLInterpreter {
                 x: this.getPreviewProperty(name, 'x') ?? text.x,
                 y: this.getPreviewProperty(name, 'y') ?? text.y,
                 frozen: false,
+                derived: this.isObjectDerived(name),
             };
         }
         return null;
     }
 
     /**
+     * 这一轮脚本有没有真的把它**画出来**。
+     *
+     * 派生的边（`tri_e1`）和矩形自动补出来的角（`sq_v2`）是「可引用、可命中」的对象，
+     * 但它们没有自己的绘制项 —— 多边形画的是一整条轮廓，边只是挂在它下面的部件。
+     * 画布据此判断「选中了但没被画出来」的对象要不要补一遍高亮，
+     * 否则点中一条边时画布上一点变化都没有，用户会以为根本点不中。
+     */
+    public isObjectRendered(name: string): boolean {
+        return this.state.renderedObjectNames.includes(name);
+    }
+
+    /**
      * 该对象是否被冻结、禁止在画布上拖动。
-     * 目前只有 POINT 支持 `frozen=true`；其它类型和解释器自动生成的点都是 false。
+     * 只有「造点」的指令支持 `frozen=true`（POINT / POINT_ON_LINE / POINT_ON_CIRCLE）；
+     * 其它类型和解释器自动生成的点（中点、垂足、交点…）都是 false。
      */
     public isObjectFrozen(name: string): boolean {
         const object = this.state.objects.get(name);
         return object?.type === 'point' && (object as Point).frozen === true;
+    }
+
+    /**
+     * 这个对象的坐标是不是「由别的几何对象算出来的派生量」。
+     *
+     * 画布拖拽会把拖到的位置**当成数值写回脚本**，对派生对象来说等于把
+     * `x={A.x + 50}` 整条表达式换成一个死数字：拓扑依赖当场断掉，此后拖 A 它也不跟了。
+     * 所以这类对象必须拒绝直接拖动（隐式冻结），要改就去改表达式里的来源对象。
+     *
+     * 判据只看**画布拖动能改的那几个属性**，而且必须是**属性穿透**：
+     *   - 点 / 文字：`x` / `y`；
+     *   - 线上点 / 圆上点：`distance` / `angle`（拖动写的就是这两个）。
+     *
+     * `{seg_len * 0.3}` 这种**只引用槽位**的表达式不算派生 —— 槽位就是个数字，
+     * 拖一下把它换成具体数值是既有且合理的语义（见 `getEditableObjectProperties` 的说明），
+     * 不能因为「不是字面量」就把所有表达式驱动的点都锁死。
+     */
+    public isObjectDerived(name: string): boolean {
+        const binding = this.state.sourceBindings.get(name);
+        if (!binding) return false;
+
+        const command = binding.command.command.toUpperCase();
+        // 坐标由别的对象算出来的造点指令：产物本来就没有可写回的 `x=` / `y=`，
+        // 直接算派生 —— 这样画布上不会给它「能拖」的假象。
+        if (COMPUTED_POINT_COMMANDS.has(command)) return true;
+
+        const keys = command === 'POINT' || command === 'TEXT'
+            ? ['x', 'y']
+            : command === 'POINT_ON_LINE'
+                ? ['distance', 'd']
+                : command === 'POINT_ON_CIRCLE'
+                    ? ['angle', 'a']
+                    : [];
+        return keys.some(key => this.expressionHasMemberReference(binding.command.params.get(key)));
+    }
+
+    /**
+     * 这条参数值里有没有「对象.属性」穿透 —— 有就说明它依赖别的几何对象。
+     *
+     * 两种写法都算（`{A.x}` 和 `{A_x}`），但都要按**槽位名 / 对象名优先**过滤一遍：
+     * 属性词表里有 `len` / `x` / `y` 这种短名字，`{seg_len * 0.3}` 纯看语法很像
+     * 「seg 的 len」，可 `seg_len` 其实是这个项目自己生成的槽位名 ——
+     * 不按名字整个对一遍，所有既有脚本都会被误判成派生点、集体拖不动。
+     */
+    private expressionHasMemberReference(raw: string | undefined): boolean {
+        if (!raw || !raw.startsWith('{') || !raw.endsWith('}')) return false;
+
+        for (const token of collectMemberTokens(raw.slice(1, -1))) {
+            if (this.state.slots.has(token)) continue;                      // 是槽位，不是穿透
+            if (!token.includes('.') && this.getObject(token)) continue;    // 名字整个就是一个对象
+            const reference = splitMemberToken(token);
+            if (reference && this.getObject(reference.root)) return true;   // 根确实是几何对象 → 真·派生
+        }
+        return false;
     }
 
     public previewObjectPropertyChange(name: string, key: ObjectPropertyKey, value: number): boolean {
@@ -1451,6 +2152,9 @@ private parseParameters(paramString: string): Map<string, string> {
             case 'VIEW':
                 this.executeView(params);
                 break;
+            case 'ANIMATE':
+                this.executeAnimate(params);
+                break;
             case 'DRAW':
                 this.executeDraw(params);
                 break;
@@ -1547,6 +2251,28 @@ private parseParameters(paramString: string): Map<string, string> {
                 break;
             case 'INCIRCLE':
                 this.createIncircle(params);
+                break;
+            // 三角形的「心」。六个命令共用同一段实现，差别只在算哪一个点。
+            case 'CENTROID':
+                this.createTriangleCenter(params, 'centroid');
+                break;
+            case 'ORTHOCENTER':
+                this.createTriangleCenter(params, 'orthocenter');
+                break;
+            case 'INCENTER':
+                this.createTriangleCenter(params, 'incenter');
+                break;
+            case 'CIRCUMCENTER':
+                this.createTriangleCenter(params, 'circumcenter');
+                break;
+            case 'FERMAT_POINT':
+                this.createTriangleCenter(params, 'fermat');
+                break;
+            case 'EXCENTER':
+                this.createExcenters(params);
+                break;
+            case 'EXCIRCLE':
+                this.createExcircles(params);
                 break;
             case 'TANGENT':
                 this.createTangent(params);
@@ -1653,6 +2379,13 @@ private parseParameters(paramString: string): Map<string, string> {
         // 否则「先建对象再 CLEAR」的脚本会在清屏之后把它们又画回来。
         this.state.pendingDraws = [];
         this.state.pendingCutResolutions.clear();
+        // 正在播的延时绘制也要停：它手里那批动作画的就是刚被抹掉的内容。
+        //
+        // **不动 `delayedDrawProgress`**：脚本几乎总是以 `CLEAR` 开头，而那个进度说的是
+        // 「上一轮动画画到第几项」。在这里归零的话，画布因为选中/拖动而重绘时
+        // （`execute` 刚把进度存进 `delayedDrawResume`，紧接着就跑到这一行）
+        // 续播信息会被立刻抹掉，动画只能从头再来 —— 正是要避免的那件事。
+        this.cancelDelayedDrawPlayback();
     }
 
     // 设置全局默认属性。
@@ -1923,6 +2656,62 @@ private parseParameters(paramString: string): Map<string, string> {
         }
     }
 
+    /**
+     * `ANIMATE` —— 延时动画绘图的总开关。
+     *
+     * 打开后，这一轮脚本里**所有**绘制动作（几何对象、`DRAW`、`FILL`、`TEXT`、`AXIS`、`GRID`）
+     * 都不再当场落笔，而是按脚本顺序排进待绘队列，由驱动每隔 `interval` 毫秒弹出一项来画，
+     * 第一项立刻画、最后一项画完就停。
+     *
+     * 位置无关：写在脚本哪一行都作用于整份脚本（和 `VIEW` 一样）。
+     *
+     * 参数：
+     *   - `interval` / `delay`：两项之间的间隔，单位毫秒，缺省 300。`0` 表示不等待。
+     *   - `enabled` / `on`：写 `false` 可临时关掉而不用删掉这一行。
+     */
+    private executeAnimate(params: Map<string, string>): void {
+        const rawEnabled = params.get('enabled') ?? params.get('on');
+        const enabled = rawEnabled === undefined ? true : GeometryDSLInterpreter.parseBoolean(rawEnabled);
+        if (!enabled) {
+            this.state.delayedDraw = null;
+            return;
+        }
+
+        const intervalKey = params.has('interval') ? 'interval' : params.has('delay') ? 'delay' : undefined;
+        if (intervalKey === undefined) {
+            this.state.delayedDraw = { interval: DEFAULT_DELAYED_DRAW_INTERVAL };
+            return;
+        }
+
+        const interval = this.getNumberValue(params, intervalKey);
+        // 这里**不**静默回落到默认值：写错单位（比如 `interval=0.3` 想表达 0.3 秒）
+        // 会变成「每 0.3 毫秒画一个」，看起来就是动画根本没生效，报错比装死好。
+        if (interval === undefined || !Number.isFinite(interval) || interval < 0) {
+            throw new Error('ANIMATE requires a non-negative interval in milliseconds (e.g. ANIMATE interval=300)');
+        }
+        this.state.delayedDraw = { interval };
+    }
+
+    /**
+     * `width=` 在这个对象上是**边长**（而不是线宽）吗？
+     *
+     * 只有 `RECTANGLE` 出现过这种情况：它的边长以前就叫 `width` / `height`，可这两键在
+     * 别的指令上是「线宽」的意思。`collectDraw` 又把整张参数表原样带过来，
+     * 于是边长 53 被当成 53 逻辑单位的描边，粗到把图形内部糊满 ——
+     * 这正是「正方形只画出一个黑方块」的原因。
+     *
+     * 边长改叫 `a` / `b` 之后，`width` 的含义重新统一了：**在一切对象上都只表示线宽**。
+     * 所以这里只剩下给**旧脚本**兜底 —— 判断方式是「写没写 a / b」：
+     *   - 写了 `a=` / `b=`（新写法）→ `width` 回来当线宽，爱加粗就加粗；
+     *   - 没写（只写 `width=` / `height=`，旧写法）→ 那两个数确实是边长，不能再当线宽。
+     *
+     * 用「有没有 a / b」而不是按对象类型一刀切，是为了让**同一条 RECTANGLE 指令里
+     * `width` 的含义由它自己说清楚**，不需要额外约定「矩形的线宽要换名字写」。
+     */
+    private static usesWidthAsSize(object: GeometricObject, params: Map<string, string>): boolean {
+        return object.type === 'rectangle' && !params.has('a') && !params.has('b');
+    }
+
     private drawObject(ctx: CanvasRenderingContext2D, params: Map<string, string>, obj: GeometricObject, label: string | undefined): void {
         // 记录实际绘制顺序，命中检测时让视觉上层的对象优先。
         this.state.renderedObjectNames.push(obj.name);
@@ -1945,10 +2734,31 @@ private parseParameters(paramString: string): Map<string, string> {
             // 「geoColor: 后续几何图形的默认颜色」其实从没生效过。
             options.color = this.state.defaultOptions.geoColor;
         }
-        if (params.has('width')) {
-            options.lineWidth = this.getNumberValue(params, 'width') || this.getNumberValue(params, 'w') || 1; // 默认线宽为1
+        // `width=` 的含义必须是「线宽」，这是本 DSL 的统一约定（`SET item=penSize` 之外
+        // 给某个对象单独加粗就是写 `width=`）。唯一例外是**老版本的 RECTANGLE**：
+        // 它把边长写成了 `width=` / `height=`，而绘制参数表是从创建指令原样复制过来的
+        // （见 `collectDraw`），于是边长 53 会被读成 53 逻辑单位的线宽 ——
+        // 边长 53 的矩形用 53 单位描边，内部糊满，只看得到一个黑方块。
+        // 用户以为「矩形画错了」，其实**几何是对的、只是被线宽盖住了**。
+        // 边长改叫 `a` / `b` 之后，矩形再写 `width=` 就是真的要加粗了。
+        const geometryOwnsSize = GeometryDSLInterpreter.usesWidthAsSize(obj, params);
+
+        // 键的顺序就是优先级：`width` / `w` 是 DSL 里一贯的写法，`lineWidth` / `lw` 是
+        // 自解释的长名。两者对**所有对象**都认，矩形也不例外 ——
+        // 边长改叫 a / b 之后，`width` 在矩形上就只剩「线宽」这一种含义了。
+        // 只有「只写了 width= / height= 的老 RECTANGLE」才被上面的判定拦下来。
+        const strokeWidthKeys = geometryOwnsSize
+            ? ['lineWidth', 'lw']
+            : ['width', 'w', 'lineWidth', 'lw'];
+
+        const explicitStrokeWidth = strokeWidthKeys
+            .map(key => this.getNumberValue(params, key))
+            .find(value => value !== undefined);
+
+        if (explicitStrokeWidth !== undefined) {
+            options.lineWidth = explicitStrokeWidth || 1; // 默认线宽为1
         } else {
-            // 没写 width= 就用 `SET item=penSize` 的默认线宽。
+            // 没写线宽就用 `SET item=penSize` 的默认线宽。
             // penSize 与默认线宽同口径（**屏幕像素**），而 options.lineWidth 是逻辑单位、
             // 会被外层变换按 pixelScale 放大，所以这里先折回逻辑单位，画出来才是恒定的 penSize 像素。
             // 默认 penSize=1 与 DEFAULT_LINE_WIDTH_PIXELS 相同 → 不设 SET 时行为完全不变。
@@ -2043,14 +2853,16 @@ private parseParameters(paramString: string): Map<string, string> {
             }
 
             // `DRAW obj=X` 一般就是「显式、带样式、画在这个位置」，按原样立即绘制。
-            // 但有两种情况不能在这里画：
+            // 但下面几种情况不能在这里画：
             //   1) 它已经在待绘队列里（create 上写了 draw=true）—— 再画一次的话，
             //      最后统一绘制的那一次会盖在上面，`DRAW` 指定的样式反而失效。
             //      所以只把这次的样式并到队列项上，位置仍是创建顺序里的位置。
             //   2) 它的截止点还没解析出来（引用的点还没建）—— 「还没准备好」，
             //      现在画就是整条，而画布只增不减、之后盖不掉。并入待绘队列等冲刷。
-            const queued = this.state.pendingDraws.some(entry => entry.object === obj);
-            if (queued || this.state.pendingCutResolutions.has(name)) {
+            //   3) `ANIMATE` 延时动画开着 —— 用户要求「哪怕是及时绘制指令也一并加入
+            //      延时绘制」，所以这里也入队，位置就是它在脚本里的位置。
+            const queued = this.findPendingObject(obj) !== undefined;
+            if (queued || this.delayedDrawActive() || this.state.pendingCutResolutions.has(name)) {
                 this.mergePendingDraw(params, obj, undefined);
                 continue;
             }
@@ -2097,7 +2909,8 @@ private parseParameters(paramString: string): Map<string, string> {
             // 对象写了 draw=true、还排在待绘队列里没画。这里立即画的话，末尾统一绘制
             // 那一次会用 create 时的样式（没有 fill、color 也回落到默认黑）盖上去，
             // `FILL` 的填充和 borderColor 就被吃掉了。并进队列项，等统一绘制一次画对。
-            if (this.state.pendingDraws.some(entry => entry.object === obj)) {
+            // 延时动画模式下同理：一律入队，由驱动按脚本顺序画。
+            if (this.findPendingObject(obj) !== undefined || this.delayedDrawActive()) {
                 this.mergePendingDraw(drawParams, obj, undefined);
                 continue;
             }
@@ -2590,6 +3403,19 @@ private parseParameters(paramString: string): Map<string, string> {
     private executeText(params: Map<string, string>, rawCommand: string, lineNumber: number): void {
         if (!this.state.ctx || !this.state.canvas) return;
 
+        // 延时动画：文字同样是一次绘制动作，排进队列，到点才真正落到画布上。
+        // 播放时 `paintPendingDraw` 会把这条指令原样再跑一遍，那时 `replayingDelayedDraw`
+        // 为真、`delayedDrawActive()` 为假，于是走到下面的真实绘制分支。
+        if (this.delayedDrawActive()) {
+            this.state.pendingDraws.push({
+                kind: 'text',
+                params: new Map(params),
+                rawCommand,
+                lineNumber,
+            });
+            return;
+        }
+
         const textObjectName = this.getTextObjectName(params, lineNumber);
         const x = this.getPreviewProperty(textObjectName, 'x') ?? this.getNumberValue(params, 'x');
         const y = this.getPreviewProperty(textObjectName, 'y') ?? this.getNumberValue(params, 'y');
@@ -2913,7 +3739,132 @@ private parseParameters(paramString: string): Map<string, string> {
         // 处理表达式中存在的负号，在前面加一个0，例如 -3 + (6 * (-{x} + 2 * 3)) ，替换成 0 - 3 + (6 * (0- {x} + 2 * 3))
         expression = expression.replace(/(^|\()\s*-\s*/g, '$10 - ');
 
-        return calculate(expression, this.state.slots, this.state.functions);
+        // 第四个参数是属性穿透取值器：`{A.x + 50}` 里的 `A.x` 靠它变成实时数值。
+        // 只有这里能提供 —— 对象表、槽位表、属性表都在解释器手上。
+        return calculate(expression, this.state.slots, this.state.functions, token => this.resolveMemberValue(token));
+    }
+
+    /**
+     * 属性穿透的取值入口：把 `A.x` / `A_x` / `c1.center.y` 变成数值。
+     *
+     * 返回 `undefined` 表示「这个 token 不是属性穿透」，让表达式引擎照旧报「变量找不到」；
+     * 一旦确认是属性穿透（点号写法，或下划线写法能对上根对象），出错就**直接抛**，
+     * 因为静默返回 undefined 会退化成「变量找不到」，而用户真正想知道的是
+     * 「A 没有这个属性」还是「A 这个对象不存在」。
+     *
+     * 槽位优先级由调用链保证：表达式引擎先查 `slots`，查不到才调到这里。
+     */
+    private resolveMemberValue(token: string): number | undefined {
+        const reference = splitMemberToken(token);
+        if (!reference) return undefined;
+
+        // 下划线写法天生有歧义：`A_x` 既可能是「A 的 x」，也可能是一个真叫 `A_x` 的对象。
+        // 名字整个对得上就先当对象 —— 这样用户拿到的是准确的「变量找不到」，
+        // 而不是「point 对象 A 没有属性 x」这种指错地方的提示。
+        // （点号写法是显式语法，不存在这个歧义，不需要这一步。）
+        if (!token.includes('.') && this.getObject(token)) return undefined;
+
+        let current = this.getObject(reference.root);
+        if (!current) {
+            if (!token.includes('.')) return undefined; // 下划线写法可能只是个没定义的普通变量
+            throw new Error(`属性穿透 ${token} 里的对象 ${reference.root} 不存在`);
+        }
+
+        for (let index = 0; index < reference.path.length; index++) {
+            const property = reference.path[index];
+            const isLast = index === reference.path.length - 1;
+            const member = GeometryDSLInterpreter.readMember(current, property);
+
+            if (member === undefined) {
+                throw new Error(
+                    `${current.type} 对象 ${current.name} 没有属性 ${property}（可用：${GeometryDSLInterpreter.memberNamesOf(current).join(' / ')}）`,
+                );
+            }
+            if (typeof member === 'number') {
+                if (!isLast) {
+                    throw new Error(`属性 ${property} 是数值，后面不能再接 .${reference.path[index + 1]}`);
+                }
+                return member;
+            }
+            if (isLast) {
+                throw new Error(`${property} 是一个对象，不能直接当数值用；继续往下取一层，例如 ${token}.x`);
+            }
+            current = member;
+        }
+        return undefined;
+    }
+
+    /**
+     * `对象.属性` 穿透读取的**唯一**实现（属性名大小写不敏感，对象名大小写敏感）。
+     *
+     * 返回 `number` 或者另一个几何对象 —— 后者让 `c1.center.y` 这种链式写法能走通，
+     * 只有链子走到最后一节时才要求是数值。
+     *
+     * 属性名清单是 `expression.ts` 里的 `MEMBER_PROPERTIES`（词法层判断下划线切点要用它），
+     * 这里必须与它同步；`expression-member-access-regression` 有对照断言。
+     */
+    private static readMember(object: GeometricObject, property: string): number | GeometricObject | undefined {
+        const key = property.toLowerCase();
+
+        if (object instanceof Point) {
+            if (key === 'x') return object.x;
+            if (key === 'y') return object.y;
+            if (key === 'r' || key === 'radius') return object.radius;
+        }
+        if (object instanceof Circle) {
+            if (key === 'center' || key === 'c') return object.center;
+            if (key === 'r' || key === 'radius') return object.radius;
+            if (key === 'd' || key === 'diameter') return object.diameter;
+            if (key === 'area') return object.area;
+            if (key === 'circumference' || key === 'perimeter') return object.circumference;
+        }
+        if (object instanceof Segment) {
+            if (key === 'length' || key === 'len') return object.length;
+        }
+        if (object instanceof LinearObject) {
+            if (key === 'p1') return object.p1;
+            if (key === 'p2') return object.p2;
+            if (key === 'dx') return object.p2.x - object.p1.x;
+            if (key === 'dy') return object.p2.y - object.p1.y;
+        }
+        if (object instanceof Ellipse) {
+            if (key === 'center' || key === 'c') return object.center;
+            if (key === 'rx' || key === 'radiusx') return object.rx;
+            if (key === 'ry' || key === 'radiusy') return object.ry;
+            if (key === 'rotation') return object.rotation;
+            if (key === 'rotationdegrees') return radiansToDegrees(object.rotation);
+        }
+        if (object instanceof Angle) {
+            if (key === 'value' || key === 'radians') return object.value;
+            if (key === 'degrees') return object.degreesValue;
+            if (key === 'vertex' || key === 'v') return object.vertex;
+        }
+        if (object instanceof Parabola) {
+            if (key === 'p' || key === 'pvalue') return object.pValue;
+            if (key === 'vertex' || key === 'v') return object.vertex;
+        }
+        if (object instanceof Hyperbola) {
+            if (key === 'center' || key === 'c') return object.center;
+            if (key === 'a' || key === 'avalue') return object.aValue;
+            if (key === 'b' || key === 'bvalue') return object.bValue;
+        }
+        if (object instanceof Polygon) {
+            if (key === 'area') return object.area;
+            if (key === 'n' || key === 'vertexcount') return object.vertices.length;
+        }
+        if (object instanceof Curve) {
+            if (key === 'start' || key === 'rangestart') return object.rangeStart;
+            if (key === 'end' || key === 'rangeend') return object.rangeEnd;
+        }
+        return undefined;
+    }
+
+    /**
+     * 某个对象可读的属性名（只用于报错信息里列给用户看）。
+     * 直接遍历词表反查 `readMember`，所以两边不可能漂移。
+     */
+    private static memberNamesOf(object: GeometricObject): string[] {
+        return Array.from(MEMBER_PROPERTIES).filter(name => GeometryDSLInterpreter.readMember(object, name) !== undefined);
     }
 
     private getNumberValue(params: Map<string, string>, key: string): number | undefined {
@@ -3032,11 +3983,11 @@ private parseParameters(paramString: string): Map<string, string> {
      * 干脆几何对象一律不在 create 时画，等对象表建完再一次性画。
      * 这样任何对象都能引用在它后面才创建的东西，不必为每种前向引用各写一套。
      *
-     * 只对几何对象这么做：TEXT / AXIS 之类仍立即绘制（它们不参与几何引用，
-     * 且通常要求压在图形之上）。
-     *
-     * 代价：脚本里显式写的 `DRAW obj=X` 会排在所有 `draw=true` 对象**下面**
-     * （前者在指令位置就画了，后者统一等到最后）。要调整层级就用 `DRAW obj=X` 显式画。
+     * 不写 `ANIMATE` 时：TEXT / AXIS / GRID 仍立即绘制（它们不参与几何引用，
+     * 且通常要求压在图形之上），显式 `DRAW obj=X` 也在指令位置就画 ——
+     * 于是它排在所有 `draw=true` 对象**下面**。要调整层级就用 `DRAW obj=X` 显式画。
+     * 写了 `ANIMATE` 时这些区别消失：所有绘制动作都按脚本顺序排进同一个队列，
+     * 由驱动一个一个画出来（见 `flushPendingDraws`）。
      *
      * 调用点都在 `if (draw === 'true' && this.state.ctx)` 守卫里，所以这里不再重复判断。
      */
@@ -3050,7 +4001,7 @@ private parseParameters(paramString: string): Map<string, string> {
         // 这里只负责把值取出来存进待绘队列。
         const effectiveLabel = params.get('label') ?? params.get('l');
 
-        const existing = this.state.pendingDraws.find(entry => entry.object === object);
+        const existing = this.findPendingObject(object);
         if (existing) {
             // 走到这里基本只剩「同名对象被重建」：新定义应当**完全取代**旧样式，
             // 所以整体替换而不是叠加（叠加会把上一个定义的 width/color 带过来）。
@@ -3060,11 +4011,21 @@ private parseParameters(paramString: string): Map<string, string> {
             return;
         }
         this.state.pendingDraws.push({
+            kind: 'object',
             // 复制一份：指令表在 execute 之间会重建，留着引用没有意义，但复制成本极低。
             params: new Map(params),
             object,
             label: effectiveLabel,
+            lineNumber: this.state.currentCommandLine,
         });
+    }
+
+    /** 在待绘队列里找某个几何对象的那一项。队列里还混着 text/axis/grid，所以要按 kind 过滤。 */
+    private findPendingObject(object: GeometricObject) {
+        for (const entry of this.state.pendingDraws) {
+            if (entry.kind === 'object' && entry.object === object) return entry;
+        }
+        return undefined;
     }
 
     /**
@@ -3075,23 +4036,25 @@ private parseParameters(paramString: string): Map<string, string> {
      * 文档里写的也是「只覆盖其样式」：create 上写的 `width` / `radius` 不该因为
      * 后面一条只改颜色的 `DRAW` 就丢掉。
      *
-     * 对象还不在队列里时退化成入队 —— `DRAW` 命中「截止点尚未解析」的情况走这条。
+     * 对象还不在队列里时退化成入队 —— 延时动画模式下 `DRAW` / `FILL` 都走这条。
      */
     private mergePendingDraw(
         params: Map<string, string>,
         object: GeometricObject,
         label: string | undefined,
     ): void {
-        const existing = this.state.pendingDraws.find(entry => entry.object === object);
+        const existing = this.findPendingObject(object);
         if (existing) {
             for (const [key, value] of params) existing.params.set(key, value);
             if (label !== undefined) existing.label = label;
             return;
         }
         this.state.pendingDraws.push({
+            kind: 'object',
             params: new Map(params),
             object,
             label,
+            lineNumber: this.state.currentCommandLine,
         });
     }
 
@@ -3126,12 +4089,15 @@ private parseParameters(paramString: string): Map<string, string> {
     }
 
     /**
-     * 画掉所有收集到的对象。由 `executeLines` 回到最外层时自动调用 ——
+     * 处理这一轮收集到的绘制动作。由 `executeLines` 回到最外层时自动调用 ——
      * 相当于脚本末尾隐式补了一条 `DRAW`，不需要用户在代码里显式写。
      *
      * 先解析截止点再绘制：顺序反了就会照着「还没补全截止点」的样子画，
      * 而画布只增不减，之后盖不掉。
-     * 绘制顺序 = 创建顺序，所以 z 序与「逐个立即绘制」时一致。
+     *
+     * 两种收尾方式：
+     *   - 没写 `ANIMATE`（或这一轮被要求跳过动画）：当场按顺序全部画完；
+     *   - 写了 `ANIMATE`：把队列交给驱动，每隔 `interval` 毫秒画一项，画完最后一项就停。
      */
     private flushPendingDraws(): void {
         this.resolvePendingCuts();
@@ -3140,10 +4106,265 @@ private parseParameters(paramString: string): Map<string, string> {
         this.state.pendingDraws = [];
         if (pending.length === 0 || !this.state.ctx) return;
 
+        const config = this.state.delayedDraw;
+        if (config && this.delayedDrawActive()) {
+            this.enqueueDelayedDraw(pending, config.interval);
+            return;
+        }
+
         const ctx = this.state.ctx;
         for (const entry of pending) {
-            this.drawObject(ctx, entry.params, entry.object, entry.label);
+            this.paintPendingDraw(ctx, entry);
         }
+    }
+
+    /**
+     * 这一轮要不要走「一个一个慢慢画」。
+     *
+     * 两个否定条件都不能少：
+     *   - `animationAutoStart === false`：SVG 导出等离线场景。它们没有计时器可等，
+     *     一次画完才是对的 —— 否则导出的图里只有第一个对象。
+     *   - `replayingDelayedDraw`：正在重放队列里的某一项（`TEXT`/`AXIS`/`GRID` 是
+     *     「把原指令再跑一遍」实现的），这时必须真画，不能再入队。
+     */
+    private delayedDrawActive(): boolean {
+        return this.state.delayedDraw !== null
+            && this.state.animationAutoStart
+            && !this.replayingDelayedDraw;
+    }
+
+    /** 画掉队列里的一项。延时播放和「一次画完」两条路都走这里，保证两者结果完全一致。 */
+    private paintPendingDraw(ctx: CanvasRenderingContext2D, entry: PendingDraw): void {
+        // 重放期间要挡住上面那个 `delayedDrawActive`，否则 text/axis/grid 会自己再排一次队。
+        const previous = this.replayingDelayedDraw;
+        this.replayingDelayedDraw = true;
+        try {
+            switch (entry.kind) {
+                case 'object':
+                    this.drawObject(ctx, entry.params, entry.object, entry.label);
+                    return;
+                case 'text':
+                    // TEXT 的排版、命中区域登记、LaTeX 渲染全在 executeText 里，
+                    // 与其把它拆成「算规格 / 落笔」两半，不如原样重跑一遍 —— 状态（slots、
+                    // preview 属性）在脚本跑完之后仍然有效，重跑得到的是同一个结果。
+                    this.executeText(entry.params, entry.rawCommand, entry.lineNumber);
+                    return;
+                case 'axis':
+                    this.createAxis(entry.params);
+                    return;
+                case 'grid':
+                    this.createGrid(entry.params);
+                    return;
+            }
+        } catch (error) {
+            // 延后绘制时错误已经脱离了 `executeLinesInner` 的 try/catch，
+            // 自己报出去，行号用入队时记下的那一行。
+            console.error(`Error painting deferred draw at line ${entry.lineNumber}`, error);
+            this.state.onMessage?.('error', entry.lineNumber, `Error painting deferred draw: ${error}`);
+        } finally {
+            this.replayingDelayedDraw = previous;
+        }
+    }
+
+    /**
+     * 把新收集到的一批绘制动作交给延时播放。
+     *
+     * 已经在播就**接在后面**而不是打断重来：`CREATE ANIMATION` 的每一帧都会冲刷一次队列，
+     * 重来会让整幅图每帧从头开始。
+     */
+    private enqueueDelayedDraw(pending: PendingDraw[], interval: number): void {
+        const playback = this.delayedDrawPlayback;
+        if (playback) {
+            playback.queue.push(...pending);
+            return;
+        }
+        this.startDelayedDrawPlayback(pending, interval);
+    }
+
+    /**
+     * 开播一轮。
+     *
+     * 两件事：
+     *   1) **续播**：如果这一轮是「画布重绘」而不是用户重跑，`delayedDrawResume` 记着上一轮
+     *      画到哪。先把那几项补回来（画布刚被清空过，不补就没了），再从断点接着放；
+     *      已经放完（resume >= 队列长度）就什么都不做，整幅图直接保持画完的样子。
+     *   2) **起播**：正常情况第一项**立刻**画（用户要的「第一下绘制一个」），之后才按间隔等。
+     */
+    private startDelayedDrawPlayback(queue: PendingDraw[], interval: number): void {
+        this.cancelDelayedDrawPlayback();
+        if (queue.length === 0) return;
+
+        const ctx = this.state.ctx;
+        if (!ctx) return;
+
+        const resume = Math.max(0, Math.min(this.delayedDrawResume, queue.length));
+        // 补画只做一次：同一轮执行里后续再冲刷（逐帧动画）不该重复补。
+        this.delayedDrawResume = 0;
+        for (let i = 0; i < resume; i++) {
+            this.paintPendingDraw(ctx, queue[i]);
+        }
+        if (resume >= queue.length) {
+            // 上一轮已经放完了：这次重绘把整幅图直接摆好，不再动画。
+            this.delayedDrawProgress = queue.length;
+            return;
+        }
+
+        this.delayedDrawProgress = resume;
+        this.delayedDrawPlayback = { queue, cursor: resume, interval };
+        // 暂停期间的重绘（选中对象 / 拖动 / 改属性都会重跑脚本）：把已经画过的前缀补回来，
+        // 然后把断点存好就此打住 —— 不能顺势往下画，否则用户按了暂停图还在长。
+        // 恢复走 resumeAnimations，它从这个 cursor 接着挂定时器。
+        if (this.animationPaused) return;
+        if (resume > 0) {
+            // 续播：断点之后的那一项要**按间隔等**，不能像起播那样立刻画 ——
+            // 否则「补画 + 立刻画下一项」会在一次同步调用里把整个队列画完，等于没动画。
+            this.delayedDrawTimer = this.scheduleDelayedStep(interval);
+            return;
+        }
+        this.drawNextDelayedStep();
+    }
+
+    private drawNextDelayedStep(): void {
+        this.delayedDrawTimer = null;
+        const playback = this.delayedDrawPlayback;
+        if (!playback) return;
+
+        if (!this.paintNextDelayedDraw()) {
+            // 画布没了（或队列空了）—— 整轮作废，别再挂定时器。
+            this.cancelDelayedDrawPlayback();
+            return;
+        }
+
+        if (playback.cursor < playback.queue.length) {
+            this.delayedDrawTimer = this.scheduleDelayedStep(playback.interval);
+            return;
+        }
+
+        // 最后一项画完就停：不再挂定时器，队列也丢掉（对象引用可以早点释放）。
+        this.finishDelayedDrawPlayback();
+    }
+
+    /**
+     * 画掉队列里的**下一项**并推进断点，返回是否真的画了。
+     *
+     * 只落笔、不调度 —— 自动播放（`drawNextDelayedStep`）和手动单步（`stepDelayedDraw`）
+     * 共用这一份，两条路的绘制结果和进度记账因此不可能分叉。
+     */
+    private paintNextDelayedDraw(): boolean {
+        const playback = this.delayedDrawPlayback;
+        if (!playback) return false;
+
+        const ctx = this.state.ctx;
+        if (!ctx) return false;
+
+        const entry = playback.queue[playback.cursor];
+        if (!entry) return false;
+
+        playback.cursor++;
+        // 记下进度：中途画布重绘（选中 / 拖动 / KaTeX 缓存命中）时靠它接着放，而不是从头再来。
+        this.delayedDrawProgress = playback.cursor;
+        this.paintPendingDraw(ctx, entry);
+        return true;
+    }
+
+    /** 一轮延时绘制结束：进度定格在队尾，队列丢掉。 */
+    private finishDelayedDrawPlayback(): void {
+        const playback = this.delayedDrawPlayback;
+        if (playback) this.delayedDrawProgress = playback.queue.length;
+        this.delayedDrawPlayback = null;
+        this.delayedDrawTimer = null;
+    }
+
+    /**
+     * 单步绘制：从断点往前画**一项**，然后停在原地（不排下一次）。
+     *
+     * 这就是「暂停」的手动版：用户每点一下按钮，画布上多出一个绘制指令的结果。
+     * 所以这里会先把自动播放的定时器掐掉 —— 不掐的话，间隔一到它就会抢着继续往下画，
+     * 单步就变成了「点一下然后自己跑完」。
+     *
+     * 返回是否真的画了一项（队列不存在 / 已经放完时返回 false，调用方据此决定要不要重新装填）。
+     */
+    public stepDelayedDraw(): boolean {
+        this.delayedDrawTimer?.cancel();
+        this.delayedDrawTimer = null;
+
+        if (!this.paintNextDelayedDraw()) return false;
+
+        const playback = this.delayedDrawPlayback;
+        if (playback && playback.cursor >= playback.queue.length) {
+            this.finishDelayedDrawPlayback();
+        }
+        return true;
+    }
+
+    /** 延时绘制队列里还有没有没画的项。 */
+    public hasPendingDelayedDraw(): boolean {
+        const playback = this.delayedDrawPlayback;
+        return playback !== null && playback.cursor < playback.queue.length;
+    }
+
+    /** 延时绘制的进度快照，供按钮提示显示「第几 / 共几」。没有待画队列时返回 null。 */
+    public getDelayedDrawProgress(): { drawn: number; total: number } | null {
+        const playback = this.delayedDrawPlayback;
+        if (!playback) return null;
+        return { drawn: playback.cursor, total: playback.queue.length };
+    }
+
+    /**
+     * 逐帧动画各跑**一帧**，返回推进了几个动画。
+     *
+     * 和 `stepDelayedDraw` 是同一件事在另一条调度链上的版本：先掐掉 rAF 循环，
+     * 再手动跑一帧。**不受 `interval` 节流** —— 单步是用户主动点的，点一下就该动一帧，
+     * 让他等 100 毫秒才看到变化反而像卡了。
+     *
+     * `lastFrameTime` 归 -1：恢复自动播放时下一帧立刻跑，而不是拿「手动点了几下花了多久」去比间隔。
+     */
+    public stepFrameAnimations(): number {
+        this.cancelScheduledFrame();
+        let stepped = 0;
+        for (const animation of this.state.animations.values()) {
+            if (!animation.isRunning) continue;
+            animation.lastFrameTime = -1;
+            this.runAnimationCode(animation);
+            stepped++;
+        }
+        return stepped;
+    }
+
+    /**
+     * 「单步」按钮的统一入口：推进一步，返回是否真的推进了。
+     *
+     * 优先级 —— 延时绘制队列排在前面：它本身就是一串「绘制指令」，逐项推进就是用户说的
+     * 「每次仅仅执行一个绘制指令」。只有在没有这个队列时（脚本没写 `ANIMATE`，
+     * 或者队列已经放完）才退而求其次去推逐帧动画的一帧。
+     */
+    public step(): boolean {
+        if (this.stepDelayedDraw()) return true;
+        return this.stepFrameAnimations() > 0;
+    }
+
+    /** 此刻「单步」能不能推进一步 —— 按钮据此置灰。 */
+    public canStep(): boolean {
+        if (this.hasPendingDelayedDraw()) return true;
+        return Array.from(this.state.animations.values()).some(animation => animation.isRunning);
+    }
+
+    /**
+     * 挂下一次「画下一项」。
+     *
+     * 这里用 `setTimeout` 而不是 `requestAnimationFrame`：间隔是用户给的毫秒数
+     * （几百毫秒量级），rAF 还得自己累计时间，反而更绕。Node 下同样可用，
+     * 所以离线测试可以换掉 `setTimeout` 来精确驱动。
+     */
+    private scheduleDelayedStep(delay: number): { cancel: () => void } {
+        const handle = setTimeout(() => this.drawNextDelayedStep(), Math.max(0, delay));
+        return { cancel: () => clearTimeout(handle) };
+    }
+
+    private cancelDelayedDrawPlayback(): void {
+        this.delayedDrawTimer?.cancel();
+        this.delayedDrawTimer = null;
+        this.delayedDrawPlayback = null;
     }
 
     private createLine(params: Map<string, string>): void {
@@ -3684,7 +4905,13 @@ private parseParameters(paramString: string): Map<string, string> {
         // 实现线上点创建
         const name = params.get('name');
         const lineName = params.get('line');
-        const distance = this.getNumberValue(params, 'distance') || this.getNumberValue(params, 'd') || 0;
+        // 拖动预览优先：拖动线上点时改的是 `distance=` 而不是 x / y，
+        // 预览值由画布算好后放在这里，脚本重跑时按它重新定位。
+        const previewDistance = name ? this.getPreviewProperty(name, 'distance') : undefined;
+        const distance = previewDistance
+            ?? this.getNumberValue(params, 'distance')
+            ?? this.getNumberValue(params, 'd')
+            ?? 0;
         const pointName = params.get('point') || params.get('p');
 
         if (!name || !lineName || !pointName || isNaN(distance)) {
@@ -3708,6 +4935,8 @@ private parseParameters(paramString: string): Map<string, string> {
         // 计算点在线段上的位置
         const newPointPos = line.pointAtDistance(point, distance);
         const newPoint = new Point(name, newPointPos.x, newPointPos.y);
+        // 和 CREATE POINT 一样：frozen=true 时画布上不允许拖动（沿线拖也被拒）。
+        newPoint.frozen = GeometryDSLInterpreter.parseBoolean(params.get('frozen'));
         this.state.objects.set(name, newPoint);
 
         const draw = params.get('draw');
@@ -3739,7 +4968,10 @@ private parseParameters(paramString: string): Map<string, string> {
         }
         const circle = circleRaw as Circle;
 
-        const angleDegrees = this.getNumberValue(params, 'angle') ?? this.getNumberValue(params, 'a');
+        const previewAngle = name ? this.getPreviewProperty(name, 'angle') : undefined;
+        const angleDegrees = previewAngle
+            ?? this.getNumberValue(params, 'angle')
+            ?? this.getNumberValue(params, 'a');
         if (angleDegrees == null || isNaN(angleDegrees)) {
             throw new Error(`Invalid angle value: ${angleStr}`);
         }
@@ -3748,6 +4980,8 @@ private parseParameters(paramString: string): Map<string, string> {
         const newX = circle.center.x + circle.radius * Math.cos(angleRad);
         const newY = circle.center.y + circle.radius * Math.sin(angleRad);
         const newPoint = new Point(name, newX, newY);
+        // 同上：frozen=true 时连「沿圆周拖」也一起拒绝。
+        newPoint.frozen = GeometryDSLInterpreter.parseBoolean(params.get('frozen'));
         this.state.objects.set(name, newPoint);
 
         const draw = params.get('draw');
@@ -3935,66 +5169,177 @@ private parseParameters(paramString: string): Map<string, string> {
         }
     }
 
-    private createCircumcircle(params: Map<string, string>): void {
-        // 实现外接圆创建
-        const name = params.get('name');
+    /**
+     * 取出三个顶点。两种写法都认：
+     *   - `p1= p2= p3=`：直接点名三个点；
+     *   - `tri=<三角形名>`：用那个三角形的三个顶点（`CREATE TRIANGLE` 建出来的）。
+     *
+     * 为什么要第二种：用户先画了一个三角形，之后想作它的重心 —— 让他重新把三个顶点
+     * 再点一遍是没道理的。两条路最终都归约成「三个点」，后面的计算完全共用。
+     */
+    private resolveTriangleVertices(params: Map<string, string>, commandName: string): [Point, Point, Point] {
+        const triName = params.get('tri') ?? params.get('triangle');
+        if (triName) {
+            const target = this.getObject(triName);
+            const vertices = target instanceof Polygon ? target.vertices : null;
+            if (!vertices) {
+                throw new Error(`${commandName}: tri=${triName} 不是一个三角形对象`);
+            }
+            if (vertices.length !== 3) {
+                throw new Error(
+                    `${commandName}: tri=${triName} 有 ${vertices.length} 个顶点，只有三角形（3 个顶点）才能这样用`,
+                );
+            }
+            return [vertices[0], vertices[1], vertices[2]];
+        }
+
+        // 三个键名**必须字面量读**，不能写成 `['p1','p2','p3'].map(key => params.get(key))`：
+        // `documented-param-regression` 是静态扫描 `params.get('x')` 这种字面量来核对
+        // 「HELP 里声明的参数实现里到底读没读」，用变量读的话它一律看不见，
+        // 于是每个三角形指令都会凭空多出一条「声明了但没读」的假失败。
         const p1Name = params.get('p1');
         const p2Name = params.get('p2');
         const p3Name = params.get('p3');
-
-        if (!name || !p1Name || !p2Name || !p3Name) {
-            throw new Error('CIRCUMCIRCLE command requires name, p1, p2, and p3 parameters');
+        if (!p1Name || !p2Name || !p3Name) {
+            throw new Error(`${commandName} 需要 p1= p2= p3= 三个点，或者 tri=<三角形名>`);
         }
-        const p1 = this.getObject(p1Name);
-        const p2 = this.getObject(p2Name);
-        const p3 = this.getObject(p3Name);
-
-        if (!p1 || !p2 || !p3) {
-            throw new Error(`Points ${p1Name}, ${p2Name}, or ${p3Name} not found`);
+        const points = [this.getObject(p1Name), this.getObject(p2Name), this.getObject(p3Name)];
+        if (points.some(point => !(point instanceof Point))) {
+            const missing = [p1Name, p2Name, p3Name]
+                .filter((name, index) => !(points[index] instanceof Point))
+                .join(', ');
+            throw new Error(`${commandName}: ${missing} 找不到或不是点`);
         }
+        return [points[0] as Point, points[1] as Point, points[2] as Point];
+    }
 
-        // 这里需要创建实际的Circumcircle对象
-        const circumcircle = Circle.fromCircumcircle(p1 as Point, p2 as Point, p3 as Point);
+    /** `name=A,B,C` 这种「一条指令建多个对象」的命名：只给一个名字时后面几个补 `_2` / `_3`。 */
+    private splitDerivedNames(raw: string, count: number): string[] {
+        const parts = raw.split(',').map(part => part.trim()).filter(Boolean);
+        if (parts.length === 0) return [];
+        const names = [...parts];
+        while (names.length < count) names.push(`${parts[0]}_${names.length + 1}`);
+        return names.slice(0, count);
+    }
+
+    /** 这条指令是不是要求立刻画出来。 */
+    private wantsDraw(params: Map<string, string>): boolean {
+        return params.get('draw') === 'true' && Boolean(this.state.ctx);
+    }
+
+    private triangleVerticesOf(params: Map<string, string>, commandName: string): TriangleVertices {
+        const [p1, p2, p3] = this.resolveTriangleVertices(params, commandName);
+        return { p1, p2, p3 };
+    }
+
+    /**
+     * 三角形的「心」：重心 / 垂心 / 内心 / 外心 / 费马点。
+     *
+     * 五个命令共用这一段 —— 差别只在调用哪个纯函数，创建对象、登记、绘制完全一样。
+     * 数学在 `triangleCenters.ts` 里，能脱离画布单独断言。
+     *
+     * 产出的点是**一等公民**：有 `name=`、有源码行，能被后面的指令引用
+     * （比如 `CREATE INCIRCLE` 用不上，但 `DRAW obj=I` / `MEASURE` 都能用）。
+     * 和 `CIRCUMCIRCLE` 顺手建的那个 `<名字>_<cumcenter>` 不一样，那个是内部点。
+     */
+    private createTriangleCenter(
+        params: Map<string, string>,
+        kind: 'centroid' | 'orthocenter' | 'incenter' | 'circumcenter' | 'fermat',
+    ): void {
+        const commandName = {
+            centroid: 'CENTROID',
+            orthocenter: 'ORTHOCENTER',
+            incenter: 'INCENTER',
+            circumcenter: 'CIRCUMCENTER',
+            fermat: 'FERMAT_POINT',
+        }[kind];
+
+        const name = params.get('name');
+        if (!name) throw new Error(`${commandName} 需要 name= 参数`);
+
+        const triangle = this.triangleVerticesOf(params, commandName);
+        const center = kind === 'centroid' ? triangleCentroid(triangle)
+            : kind === 'orthocenter' ? triangleOrthocenter(triangle)
+                : kind === 'incenter' ? triangleIncenter(triangle).center
+                    : kind === 'circumcenter' ? triangleCircumcenter(triangle).center
+                        : triangleFermatPoint(triangle);
+
+        const point = new Point(name, center.x, center.y);
+        this.state.objects.set(name, point);
+        if (this.wantsDraw(params)) this.collectDraw(params, point);
+    }
+
+    /**
+     * 三个旁心。
+     *
+     * 旁心总是三个一组（每个顶点对面一个），所以一条指令建三个点，
+     * 命名沿用 `INTERSECT name=A,B` 那套：`name=I1,I2,I3`，
+     * 只给一个名字时后面两个补 `_2` / `_3`。
+     * 返回顺序固定为「对着 p1 / p2 / p3 的那一个」。
+     */
+    private createExcenters(params: Map<string, string>): void {
+        const rawNames = params.get('name');
+        if (!rawNames) throw new Error('EXCENTER 需要 name= 参数（三个旁心，逗号分隔）');
+        const names = this.splitDerivedNames(rawNames, 3);
+
+        const triangle = this.triangleVerticesOf(params, 'EXCENTER');
+        const draw = this.wantsDraw(params);
+        triangleExcenters(triangle).forEach((item, index) => {
+            const point = new Point(names[index], item.center.x, item.center.y);
+            this.state.objects.set(names[index], point);
+            if (draw) this.collectDraw(params, point);
+        });
+    }
+
+    /**
+     * 三个旁切圆。与 `EXCENTER` 一一对应：第 k 个与 p_k 对面的那条边相切。
+     *
+     * 圆心和 `EXCENTER` 一样要建出来（`Circle` 必须挂在一个真实的 `Point` 上），
+     * 但它是个内部点 —— 名字带 `<` `>`，和 `CIRCUMCIRCLE` 的 `_<cumcenter>` 同一套习惯，
+     * 想拿到可引用的旁心请用 `CREATE EXCENTER`。
+     */
+    private createExcircles(params: Map<string, string>): void {
+        const rawNames = params.get('name');
+        if (!rawNames) throw new Error('EXCIRCLE 需要 name= 参数（三个旁切圆，逗号分隔）');
+        const names = this.splitDerivedNames(rawNames, 3);
+
+        const triangle = this.triangleVerticesOf(params, 'EXCIRCLE');
+        const draw = this.wantsDraw(params);
+        triangleExcenters(triangle).forEach((item, index) => {
+            const center = new Point(`${names[index]}_<excenter>`, item.center.x, item.center.y);
+            this.state.objects.set(center.name, center);
+            const circle = Circle.fromRadius(names[index], center, item.radius);
+            this.state.objects.set(names[index], circle);
+            if (draw) this.collectDraw(params, circle);
+        });
+    }
+
+    private createCircumcircle(params: Map<string, string>): void {
+        const name = params.get('name');
+        if (!name) throw new Error('CIRCUMCIRCLE 需要 name= 参数');
+
+        const [p1, p2, p3] = this.resolveTriangleVertices(params, 'CIRCUMCIRCLE');
+        const circumcircle = Circle.fromCircumcircle(p1, p2, p3);
         const center = new Point(name + '_<cumcenter>', circumcircle.pt.x, circumcircle.pt.y);
         this.state.objects.set(center.name, center);
         const circle = Circle.fromRadius(name, center, circumcircle.radius);
         this.state.objects.set(name, circle);
 
-        const draw = params.get('draw');
-        if (draw != null && draw == 'true' && this.state.ctx) {
-            this.collectDraw(params, circle);
-        }
+        if (this.wantsDraw(params)) this.collectDraw(params, circle);
     }
 
     private createIncircle(params: Map<string, string>): void {
-        // 实现内切圆创建
         const name = params.get('name');
-        const p1Name = params.get('p1');
-        const p2Name = params.get('p2');
-        const p3Name = params.get('p3');
+        if (!name) throw new Error('INCIRCLE 需要 name= 参数');
 
-        if (!name || !p1Name || !p2Name || !p3Name) {
-            throw new Error('CIRCUMCIRCLE command requires name, p1, p2, and p3 parameters');
-        }
-        const p1 = this.getObject(p1Name);
-        const p2 = this.getObject(p2Name);
-        const p3 = this.getObject(p3Name);
-
-        if (!p1 || !p2 || !p3) {
-            throw new Error(`Points ${p1Name}, ${p2Name}, or ${p3Name} not found`);
-        }
-
-        // 这里需要创建实际的Incircle对象
-        const incircle = Circle.fromIncircle(p1 as Point, p2 as Point, p3 as Point);
+        const [p1, p2, p3] = this.resolveTriangleVertices(params, 'INCIRCLE');
+        const incircle = Circle.fromIncircle(p1, p2, p3);
         const center = new Point(name + '_<inccenter>', incircle.pt.x, incircle.pt.y);
         this.state.objects.set(center.name, center);
         const circle = Circle.fromRadius(name, center, incircle.radius);
         this.state.objects.set(name, circle);
 
-        const draw = params.get('draw');
-        if (draw != null && draw == 'true' && this.state.ctx) {
-            this.collectDraw(params, circle);
-        }
+        if (this.wantsDraw(params)) this.collectDraw(params, circle);
     }
 
     /**
@@ -4142,6 +5487,97 @@ private parseParameters(paramString: string): Map<string, string> {
         }
     }
 
+    /**
+     * 给多边形类对象登记派生部件（顶点 + 边）。
+     *
+     * 命名固定为 `<父名>_v1..vn` / `<父名>_e1..en`，因为脚本里没有它们的定义行 ——
+     * 用户和 AI 只能靠「父名 + 固定后缀」推出来写，所以这个名字必须可预测，
+     * 不能按顶点当前名字拼（矩形自动补的角叫 `sq_v2`，拼出来会变成 `sq_sq_v2`）。
+     *
+     * 顶点本来就存在时**只记别名**、不新建点：三角形的 A、B、C 是用户自己的点，
+     * 再复制一份重合的点，图上会出现两个叠在一起、还能各自拖动的点。
+     *
+     * 名字撞车（用户自己建了叫 `sq_e1` 的对象）时不覆盖、也不改号 ——
+     * 改号会让名字变得猜不出来，宁可少一个部件并报一条 warning。
+     */
+    private registerPolygonParts(parentName: string, vertices: Point[]): void {
+        const parts: DerivedPart[] = [];
+
+        if (vertices.length > MAX_DERIVED_PART_VERTICES) {
+            this.state.onMessage?.(
+                'warning',
+                this.state.currentCommandLine,
+                `${parentName} 有 ${vertices.length} 个顶点，超过 ${MAX_DERIVED_PART_VERTICES} 个，不再自动生成顶点 / 边部件（改用已有的点名引用）`,
+            );
+            this.state.derivedParts.set(parentName, parts);
+            return;
+        }
+
+        // 部件名能用吗：既不能撞上别的对象，也不能是另一个多边形的部件。
+        const claimName = (partName: string): boolean => {
+            if (this.state.objects.has(partName)) return false;
+            const owner = this.state.derivedPartOwners.get(partName);
+            return owner === undefined || owner === parentName;
+        };
+
+        for (let i = 0; i < vertices.length; i++) {
+            const partName = `${parentName}_v${i + 1}`;
+            const vertex = vertices[i];
+            if (vertex.name === partName) {
+                // 顶点自己就叫这个名字（矩形自动补的角），它就是部件本体，
+                // 补进对象表即可 —— 不这么做它只是在 Polygon 里躺着的一个裸点，
+                // DSL 里写 `sq_v2` 会查不到。
+                if (!this.state.objects.has(partName)) this.state.objects.set(partName, vertex);
+            } else {
+                // 顶点本来就是用户自己的点（三角形 / 多边形的 A、B、C），只记别名。
+                if (!claimName(partName)) continue;
+                this.state.objectAliases.set(partName, vertex.name);
+            }
+            this.state.derivedPartOwners.set(partName, parentName);
+            parts.push({ name: partName, role: 'vertex' });
+        }
+
+        for (let i = 0; i < vertices.length; i++) {
+            const partName = `${parentName}_e${i + 1}`;
+            if (!claimName(partName)) continue;
+            const edge = new Segment(partName, vertices[i], vertices[(i + 1) % vertices.length]);
+            this.state.objects.set(partName, edge);
+            this.state.derivedPartOwners.set(partName, parentName);
+            parts.push({ name: partName, role: 'edge' });
+        }
+
+        this.state.derivedParts.set(parentName, parts);
+    }
+
+    /** 派生部件的父对象名；不是部件时返回 undefined。 */
+    public getDerivedPartOwner(name: string): string | undefined {
+        return this.state.derivedPartOwners.get(name);
+    }
+
+    /** 一个多边形的派生部件列表（顶点在前、边在后）。没有部件时返回空数组。 */
+    public getDerivedParts(name: string): DerivedPart[] {
+        return this.state.derivedParts.get(name)?.map(part => ({ ...part })) ?? [];
+    }
+
+    /**
+     * 这个名字能不能**写进脚本**当引用用。
+     *
+     * 判据以前是「有没有源码行」，用它挡掉了中垂线 / 角平分线自己造的内部合成点
+     * （`pb_<mid>` 那类）：它们只在内存里，重跑脚本时不存在，写进去就是悬空引用。
+     *
+     * 多边形的派生顶点是另一种情况：脚本里同样没有它们的定义行，但名字是
+     * **父名 + 固定后缀**，重跑时解释器会照样建出来，所以写进脚本是安全的。
+     * 少了这一条，矩形自动补的角（`sq_v2` 等）会被当成不可引用，
+     * 「在矩形这条边上作中垂线」这类操作就整个做不了。
+     */
+    public isReferenceableObjectName(name: string): boolean {
+        if (this.getSourceLineForObject(name) !== null) return true;
+        const owner = this.state.derivedPartOwners.get(name);
+        if (owner === undefined) return false;
+        return this.state.derivedParts.get(owner)
+            ?.some(part => part.name === name && part.role === 'vertex') ?? false;
+    }
+
     private createPolygon(params: Map<string, string>): void {
         // 实现多边形创建
         const name = params.get('name');
@@ -4166,6 +5602,8 @@ private parseParameters(paramString: string): Map<string, string> {
         // 这里需要创建实际的Polygon对象
         const polygon = new Polygon(name, points);
         this.state.objects.set(name, polygon);
+        // 顶点是用户自己的点，所以只登记别名；边是这里新建的 Segment。
+        this.registerPolygonParts(name, points);
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
@@ -4309,6 +5747,13 @@ private parseParameters(paramString: string): Map<string, string> {
 
     private createAxis(params: Map<string, string>): void {
         if (!this.state.ctx || !this.state.canvas) return;
+
+        // 延时动画：坐标轴也是一次绘制动作，整条指令入队，到点再重放（见 `executeText` 的说明）。
+        if (this.delayedDrawActive()) {
+            this.state.pendingDraws.push({ kind: 'axis', params: new Map(params), lineNumber: this.state.currentCommandLine });
+            return;
+        }
+
         const originX = this.getNumberParam(params, 'originX', 'ox') ?? 0;
         const originY = this.getNumberParam(params, 'originY', 'oy') ?? 0;
         const transform = this.getTextRenderTransform();
@@ -4433,6 +5878,13 @@ private parseParameters(paramString: string): Map<string, string> {
 
     private createGrid(params: Map<string, string>): void {
         if (!this.state.ctx || !this.state.canvas) return;
+
+        // 延时动画：网格同理，整条指令入队（见 `executeText` 的说明）。
+        if (this.delayedDrawActive()) {
+            this.state.pendingDraws.push({ kind: 'grid', params: new Map(params), lineNumber: this.state.currentCommandLine });
+            return;
+        }
+
         const transform = this.getTextRenderTransform();
         const scale = Math.abs(transform.scale) > this.zeroThresholdValue ? Math.abs(transform.scale) : 1;
         // 网格和坐标轴共用同一套「默认范围 + 默认步长」，两者不写范围时也会自动对齐。
@@ -4633,6 +6085,8 @@ private parseParameters(paramString: string): Map<string, string> {
             this.validateSimpleRegionBoundary(name, points);
             const region = new Region(name, points);
             this.state.objects.set(name, region);
+            // 点集围出来的区域顶点常常上百个，registerPolygonParts 内部会按上限拦掉。
+            this.registerPolygonParts(name, region.vertices);
             const draw = params.get('draw');
             if (draw === 'true' && this.state.ctx) {
                 this.collectDraw(params, region);
@@ -4666,6 +6120,7 @@ private parseParameters(paramString: string): Map<string, string> {
         this.validateSimpleRegionBoundary(name, points);
         const region = new Region(name, points);
         this.state.objects.set(name, region);
+        this.registerPolygonParts(name, region.vertices);
 
         const draw = params.get('draw');
         if (draw === 'true' && this.state.ctx) {
@@ -4982,6 +6437,7 @@ private parseParameters(paramString: string): Map<string, string> {
         // 这里需要创建实际的Triangle对象
         const triangle = new Triangle(name, p1 as Point, p2 as Point, p3 as Point);
         this.state.objects.set(name, triangle);
+        this.registerPolygonParts(name, triangle.vertices);
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
@@ -4990,14 +6446,28 @@ private parseParameters(paramString: string): Map<string, string> {
     }
 
     private createRectangle(params: Map<string, string>): void {
-        // 实现矩形创建
+        // 边长叫 `a` / `b`，不叫 `width` / `height` —— 后者在其它指令上是「线宽」的意思，
+        // 同名不同义害惨了 AI 生成的代码（写出过把 53 单位长的矩形用 53 像素描边、
+        // 糊成一坨实心黑块的结果）。
+        //
+        // `width` / `height` 仍然认，纯粹是为了让**旧脚本不至于一跑就报错**。
+        // 已经停产的写法：不再出现在文档里，生成器也只产出 a / b。
         const name = params.get('name');
         const p1Name = params.get('p1');
-        const width = this.getNumberValue(params, 'width') || this.getNumberValue(params, 'w') || 0;
-        const height = this.getNumberValue(params, 'height') || this.getNumberValue(params, 'h') || 0;
+        const a =
+            this.getNumberValue(params, 'a') ??
+            this.getNumberValue(params, 'width') ??
+            0;
+        const b =
+            this.getNumberValue(params, 'b') ??
+            this.getNumberValue(params, 'height') ??
+            0;
 
-        if (!name || !p1Name || !width || !height) {
-            throw new Error('RECTANGLE command requires name, p1, width, and height parameters');
+        if (!name || !p1Name || !a || !b) {
+            throw new Error(
+                'RECTANGLE command requires name, p1, a, and b parameters ' +
+                '(width/height still accepted for backward compatibility, but a/b is preferred)',
+            );
         }
 
         const p1 = this.getObject(p1Name);
@@ -5006,8 +6476,12 @@ private parseParameters(paramString: string): Map<string, string> {
         }
 
         // 这里需要创建实际的Rectangle对象
-        const rectangle = Rectangle.fromWidthHeight(name, p1 as Point, width, height);
+        const rectangle = Rectangle.fromWidthHeight(name, p1 as Point, a, b);
         this.state.objects.set(name, rectangle);
+        // `_v2` / `_v3` / `_v4` 是 fromWidthHeight 现造的角，这里把它们连同
+        // 给定的 p1（登记成 `_v1` 别名）一起变成可引用的对象。
+        // 顺序：左上 -> 右上 -> 右下 -> 左下。
+        this.registerPolygonParts(name, rectangle.vertices);
 
         const draw = params.get('draw');
         if (draw != null && draw == 'true' && this.state.ctx) {
@@ -5792,6 +7266,8 @@ private parseParameters(paramString: string): Map<string, string> {
     // 启动驱动循环。已经在跑就什么都不做，所以可以放心地每个动画各调一次。
     private startAnimationLoop(): void {
         if (!this.state.animationAutoStart) return;
+        // 暂停期间不起循环 —— 否则恢复按钮还没按，动画已经自己跑起来了。
+        if (this.animationPaused) return;
         if (this.scheduledFrame) return;
         this.scheduleAnimationFrame(this.onAnimationFrame);
     }
@@ -5826,6 +7302,8 @@ private parseParameters(paramString: string): Map<string, string> {
     private onAnimationFrame = (timestamp: number): void => {
         this.scheduledFrame = null;
         if (!this.state.animationAutoStart) return;
+        // 暂停：这一帧直接丢掉，也不再排下一帧。`isRunning` 保留着，恢复时接着跑。
+        if (this.animationPaused) return;
 
         const now = Number.isFinite(timestamp) ? timestamp : this.animationNow();
         let hasRunningAnimation = false;
@@ -6102,6 +7580,31 @@ private parseParameters(paramString: string): Map<string, string> {
             }
         }
 
+        // 多边形的派生边优先于多边形本身：点在边界上时选中那条边，点进内部才选中整体。
+        //
+        // 边和多边形的边界完全重合，谁后画谁赢的话边永远选不中 —— 而「选中一条边
+        // 再对它作中垂线 / 取中点」正是这整套派生部件的用处。
+        // 仍然只对**已经画出来的**多边形生效：没画的多边形它的边也不该形成隐形墙
+        // （理由同下面那段的注释），所以这里按 renderedObjectNames 逆序遍历。
+        checked.clear();
+        for (let i = this.state.renderedObjectNames.length - 1; i >= 0; i--) {
+            const parentName = this.state.renderedObjectNames[i];
+            const parts = this.state.derivedParts.get(parentName);
+            if (!parts) continue;
+            for (let j = parts.length - 1; j >= 0; j--) {
+                const part = parts[j];
+                // 顶点在上面「点优先」那两轮里已经查过了（别名指向的就是用户那个点，
+                // 合成顶点也在 objects 表里），这里只补边，免得重复判一遍。
+                if (part.role !== 'edge') continue;
+                if (checked.has(part.name)) continue;
+                const object = this.state.objects.get(part.name);
+                if (object instanceof Segment && this.hitTestObject(object, point, tolerance, transform)) {
+                    return { kind: 'object', name: object.name };
+                }
+                checked.add(part.name);
+            }
+        }
+
         // 只命中真正画出来的对象，按绘制顺序逆序检查。
         //
         // 这里曾经把 state.objects 全表当兜底，结果那些「建了但没画」的辅助对象
@@ -6223,6 +7726,63 @@ private parseParameters(paramString: string): Map<string, string> {
         if (!canvas) return;
         const matrix = buildCanvasMatrix(view, canvas.width, canvas.height, this.getDeclaredRotationRadians());
         ctx.setTransform(matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5]);
+    }
+
+    /**
+     * 把一段**额外的** DSL 指令画到给定的 2D 上下文上 —— 作图对话框的实时预览。
+     *
+     * 用途：右键作图对话框里，用户选好目标、调好参数之后要**立刻**看到「画出来是什么样」，
+     * 而不是先点确定再回画布上检查。这里只画新增的那几条指令；底下的既有图形由对话框
+     * 直接复制主画布的像素，所以随机点不会跳位置、动画不会重启、KaTeX 也不会重排。
+     *
+     * 为什么不干脆 `execute(script + commands)` 重画整幅图：那会重掷随机点、重播动画，
+     * 而且会**改掉正在用的解释器状态** —— 对话框取消之后画布上就会多出一个幽灵对象。
+     *
+     * 状态隔离靠**整体换一份 state**：所有容器（Map / Set / 数组）浅拷贝一层，
+     * 预览期间新建的对象只落在副本里，跑完把原 state 换回来。
+     * 对象本身是共享引用 —— 预览指令只**新建**对象、不改动已有的，所以是安全的。
+     * 用「遍历字段按类型克隆」而不是手写字段清单：state 以后加字段不会漏，
+     * 漏掉的后果是预览悄悄污染正在用的解释器（幽灵对象、重复的命中区域）。
+     *
+     * 返回是否真的画了（没有画布 / 指令为空时返回 false）。
+     */
+    public renderPreviewCommands(
+        ctx: CanvasRenderingContext2D,
+        commands: readonly string[],
+        view: CanvasView,
+    ): boolean {
+        const canvas = this.state.canvas;
+        if (!canvas || commands.length === 0) return false;
+
+        const savedState = this.state;
+        const previewState = cloneInterpreterState(savedState);
+        // 预览必须**立刻画完**：不能被 `ANIMATE` 排进队列，也不能被暂停态扣住 ——
+        // 否则用户改一个参数，预览里什么都看不见。
+        previewState.delayedDraw = null;
+        previewState.animationAutoStart = false;
+        previewState.executeDepth = 0;
+        previewState.pendingDraws = [];
+        previewState.ctx = ctx;
+        // 预览里的报错不回灌到输出面板：用户每动一下参数就会重画一次，
+        // 有问题等确认之后主画布正经重跑时再报。
+        previewState.onMessage = undefined;
+
+        this.state = previewState;
+        try {
+            ctx.save();
+            this.applyViewMatrix(ctx, view);
+            this.executeLines(buildLogicalLines(commands.join('\n')), false);
+        } catch (error) {
+            console.error('Error rendering preview commands', error);
+        } finally {
+            try {
+                ctx.restore();
+            } catch {
+                // 上下文已经失效（对话框关掉了），restore 失败无所谓。
+            }
+            this.state = savedState;
+        }
+        return true;
     }
 
     /**
@@ -6475,6 +8035,14 @@ private parseParameters(paramString: string): Map<string, string> {
         const existNameObject = this.state.objects.get(name);
         if (existNameObject) {
             return existNameObject;
+        }
+
+        // 多边形的派生顶点别名（`sq_v1` -> 用户那个点、`tri1_v2` -> B）。
+        // 别名不进 objects 表，是为了不让同一个点在面板里出现两行；
+        // 但 DSL 里写 `p1=sq_v1` 必须能查到，所以在这里多认一次。
+        const aliasTarget = this.state.objectAliases.get(name);
+        if (aliasTarget) {
+            return this.state.objects.get(aliasTarget);
         }
 
         // TEXT 不在 `state.objects` 里（它不是几何对象，没有几何语义），但画布上的

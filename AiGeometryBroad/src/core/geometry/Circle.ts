@@ -1,6 +1,7 @@
 import { GeometricObject, type DrawTransform, type DrawLabelOptions, type DrawOptions, type IPoint, toScreenPoint, resolveLineWidth } from './base';
 import { Point, PointNativeObject } from './Point';
 import { LinearObject, Segment } from './LinearObject';
+import { circumcenter, incenter } from './triangleCenters';
 
 export class Circle extends GeometricObject {
     public center: Point;
@@ -116,35 +117,16 @@ export class Circle extends GeometricObject {
     /**
         * Creates a Circle instance representing the circumcircle of a triangle defined by three points.
         * The circumcircle passes through all three vertices of the triangle.
-        * @param name The name of the new circle.
-        * @param p1 The first vertex of the triangle.
-        * @param p2 The second vertex of the triangle.
-        * @param p3 The third vertex of the triangle.
-        * @returns A new Circle object.
+        *
+        * 数学部分在 `triangleCenters.ts` 里 —— 外心 / 内心 / 垂心 / 旁心 / 费马点用的是同一批
+        * 初等几何公式，集中放一处才能被离线断言逐个核对（算错了在图上只表现为「圆没贴住边」，
+        * 肉眼很难发现）。这里只负责把结果包成 `Circle` 需要的形状。
+        *
         * @throws An error if the three points are collinear.
         */
     public static fromCircumcircle(p1: Point, p2: Point, p3: Point): { pt: PointNativeObject, radius: number } {
-        // Using a formula based on coordinates to find the circumcenter (cx, cy)
-        // The denominator D is twice the signed area of the triangle. If D is 0, the points are collinear.
-        const D = 2 * (p1.x * (p2.y - p3.y) + p2.x * (p3.y - p1.y) + p3.x * (p1.y - p2.y));
-
-        if (Math.abs(D) < 1e-9) { // Use a small epsilon for floating-point comparison
-            throw new Error("Cannot create a circumcircle for collinear points.");
-        }
-
-        const p1_sq = p1.x * p1.x + p1.y * p1.y;
-        const p2_sq = p2.x * p2.x + p2.y * p2.y;
-        const p3_sq = p3.x * p3.x + p3.y * p3.y;
-
-        const centerX = (p1_sq * (p2.y - p3.y) + p2_sq * (p3.y - p1.y) + p3_sq * (p1.y - p2.y)) / D;
-        const centerY = (p1_sq * (p3.x - p2.x) + p2_sq * (p1.x - p3.x) + p3_sq * (p2.x - p1.x)) / D;
-
-        const center = new PointNativeObject(centerX, centerY);
-
-        // The radius is the distance from the center to any of the vertices.
-        const radius = Math.sqrt((centerX - p1.x) ** 2 + (centerY - p1.y) ** 2);
-
-        return { pt: center, radius: radius };
+        const { center, radius } = circumcenter({ p1, p2, p3 });
+        return { pt: new PointNativeObject(center.x, center.y), radius };
     }
 
     /**
@@ -158,29 +140,8 @@ export class Circle extends GeometricObject {
         * @throws An error if the three points are collinear.
         */
     public static fromIncircle(p1: Point, p2: Point, p3: Point): { pt: PointNativeObject, radius: number } {
-        // Calculate the lengths of the triangle's sides
-        const a = p2.distanceTo(p3); // Length of the side opposite p1
-        const b = p1.distanceTo(p3); // Length of the side opposite p2
-        const c = p1.distanceTo(p2); // Length of the side opposite p3
-
-        const perimeter = a + b + c;
-
-        // Check for collinearity: if the sum of two sides equals the third, they form a line.
-        if (Math.abs(perimeter - 2 * Math.max(a, b, c)) < 1e-9) {
-            throw new Error("Cannot create an incircle for collinear points.");
-        }
-
-        // The incenter's coordinates are a weighted average of the vertices' coordinates.
-        const centerX = (a * p1.x + b * p2.x + c * p3.x) / perimeter;
-        const centerY = (a * p1.y + b * p2.y + c * p3.y) / perimeter;
-
-        // The radius is calculated by the formula: r = Area / s
-        // where s is the semi-perimeter (perimeter / 2).
-        const s = perimeter / 2;
-        const area = Math.sqrt(s * (s - a) * (s - b) * (s - c)); // Heron's formula for area
-        const radius = area / s;
-
-        return { pt: new PointNativeObject(centerX, centerY), radius: radius };
+        const { center, radius } = incenter({ p1, p2, p3 });
+        return { pt: new PointNativeObject(center.x, center.y), radius };
     }
 
     /**

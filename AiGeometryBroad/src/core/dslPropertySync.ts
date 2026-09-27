@@ -21,6 +21,16 @@ const PARAMETER_ALIASES: Record<ObjectPropertyKey, string[]> = {
     rotation: ['rotation', 'angle'],
     width: ['width', 'w'],
     height: ['height', 'h'],
+    // RECTANGLE 的两条边长。新写法是 `a=` / `b=`，旧的 `width=` / `height=` 也认，
+    // 写在后面当兜底：这样老脚本照样能在属性面板里改，写回时也保留它原本的键名。
+    a: ['a', 'width'],
+    b: ['b', 'height'],
+    // 受约束的点：线上点改 `distance=`、圆上点改 `angle=`。
+    // 长名写在短名前面：alternation 是按顺序试的，先试 `distance` 才不会把
+    // `distance=2` 误当成 `d=` 去匹配（`\bd\s*=` 其实匹配不上 "distance="，
+    // 但顺序摆对了更稳，也不会被同一行上的 `draw=true` 干扰）。
+    distance: ['distance', 'd'],
+    angle: ['angle', 'a'],
 };
 
 // POINT 的 frozen 是布尔属性，单独处理（见 updateDslObjectFrozen）。
@@ -70,9 +80,15 @@ interface ParameterMatch {
     prefix: string;
 }
 
+// 参数值的形状。除了引号串和普通裸值，还要认**花括号表达式**：
+// `distance={seg_len * 0.3}` 里值内含空格，按 `\S+` 断词只会匹配到 `{seg_len`，
+// 替换完就变成 `distance=6.25 * 0.3}` —— 半个表达式留在行里，脚本直接跑坏。
+// 表达式里允许再嵌一层花括号（`angle={abs({slot})}`），所以内层也收进去。
+const PARAMETER_VALUE_PATTERN = '"[^"]*"|\'[^\']*\'|\\{(?:[^{}]|\\{[^{}]*\\})*\\}|[^\\s]+';
+
 function findParameter(line: string, aliases: string[]): ParameterMatch | null {
     const aliasPattern = aliases.map(escapeRegExp).join('|');
-    const parameter = new RegExp(`(\\b(?:${aliasPattern})\\s*=\\s*)("[^"]*"|'[^']*'|[^\\s]+)`, 'gi');
+    const parameter = new RegExp(`(\\b(?:${aliasPattern})\\s*=\\s*)(${PARAMETER_VALUE_PATTERN})`, 'gi');
     let match: RegExpExecArray | null;
     while ((match = parameter.exec(line)) !== null) {
         if (!isInsideQuotes(line, match.index)) {
@@ -242,8 +258,11 @@ function isDrawLineForObject(line: string, name: string): boolean {
  * 标签可以带空格（`label=点 P`），也可以带 `#`。裸写的话解释器会把空格后面当成
  * 下一个参数、把 `#` 当成行尾注释，值就被吃掉了，所以这种值必须加引号。
  * 不含特殊字符时保持裸写 —— 和用户手写的风格一致，读起来也干净。
+ *
+ * 导出是因为作图对话框生成 `label=` 时也得用同一套引号规则：两处各写一份的话，
+ * 「面板里改标签」和「作图时顺手带标签」迟早会分叉，带空格的标签在其中一条路上会被吃掉。
  */
-function formatLabelValue(value: string): string {
+export function formatLabelValue(value: string): string {
     if (/[\s"']/.test(value)) return `"${value.replace(/"/g, '\\"')}"`;
     return value;
 }
@@ -402,11 +421,17 @@ function upsertSetLabelLine(
     return { script: lines.join('\n'), lineNumber: lines.length };
 }
 
-// frozen 只存在于 POINT 指令上。限定指令类型有两个作用：
+// frozen 只存在于「造点」的指令上：POINT、POINT_ON_LINE、POINT_ON_CIRCLE。
+// 限定指令类型有两个作用：
 //   1. 面板传错 name（比如 TEXT 恰好同名）时不会往别的指令上乱加参数；
 //   2. 行号过期、指向了别的指令时直接放弃，而不是改坏一行。
+//
+// `POINT` 后面的 `\b` 不能省：`POINT_ON_LINE` 里 POINT 后面接的是 `_`（也是词字符），
+// 没有 `\b` 就会被当成 POINT 指令命中，于是两个指令被重复匹配。
+// 线上点 / 圆上点也要支持冻结 —— 对象面板里任何点都有 Freeze 按钮，
+// 不认这两条指令的话按钮按下去什么都不会发生。
 function isPointDefinitionLine(line: string): boolean {
-    return /^\s*(?:CREATE\s+)?POINT\b/i.test(line);
+    return /^\s*(?:CREATE\s+)?(?:POINT\b|POINT_ON_LINE\b|POINT_ON_CIRCLE\b)/i.test(line);
 }
 
 /**

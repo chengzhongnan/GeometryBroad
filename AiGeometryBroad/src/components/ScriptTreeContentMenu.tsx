@@ -27,15 +27,15 @@ const ContextMenu: React.FC<ContextMenuProps> = ({ x, y, node, onClose, onNewFil
   return (
     <MenuWrapper style={{ top: y, left: x }}>
       {/* Actions for Folders or Background */}
-      {(isFolder || !node) && <MenuItem onClick={handleAction(() => onNewFile(node?.id))}>New File</MenuItem>}
-      {(isFolder || !node) && <MenuItem onClick={handleAction(() => onNewFolder(node?.id))}>New Folder</MenuItem>}
-      
+      {(isFolder || !node) && <MenuItem onClick={handleAction(() => onNewFile(node?.id))}>新建文件</MenuItem>}
+      {(isFolder || !node) && <MenuItem onClick={handleAction(() => onNewFolder(node?.id))}>新建文件夹</MenuItem>}
+
       {/* Separator */}
       {(isFolder || !node) && (isFile || isFolder) && <MenuSeparator />}
 
       {/* Actions for any Node (File or Folder) */}
-      {(isFile || isFolder) && <MenuItem onClick={handleAction(() => onRename(node!))}>Rename</MenuItem>}
-      {(isFile || isFolder) && <MenuItem onClick={handleAction(() => onDelete(node!))} $isDestructive>Delete</MenuItem>}
+      {(isFile || isFolder) && <MenuItem onClick={handleAction(() => onRename(node!))}>重命名</MenuItem>}
+      {(isFile || isFolder) && <MenuItem onClick={handleAction(() => onDelete(node!))} $isDestructive>删除</MenuItem>}
     </MenuWrapper>
   );
 };

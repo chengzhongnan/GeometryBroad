@@ -25,6 +25,7 @@
 * 所有参数均以 `key=value` 的形式提供。
 * 几何指令以 `CREATE` 关键字作为前缀 (例如 `CREATE POINT ...`)。
 * 数值参数可以使用直接量（如 `100`），也可以引用**插槽(Slot)**中的值。要使用插槽值，请将其名称包含在花括号中，如 `{slot_name}`。支持复杂的数学表达式，例如 `{slot_A * sin(PI()/4)}`。
+* 表达式里还可以**穿透读取几何对象的属性**，写法是 `{对象名.属性}`，例如 `{A.x + 50}`、`{c1.radius * 2}`、`{c1.center.y}`。完整属性表见 1.14 节。
 * 注释以 `#` 开始，直到行尾。
 * **跨行书写**：带引号的参数值（如 `text="..."`、`message="..."`）允许跨多行书写，解释器会自动拼接成同一条指令（不加分隔符，因此 LaTeX 公式可以被安全地换行）。
 * **续行**：也可以在一行末尾写 `\` 把一条长指令拆成多行。
@@ -212,6 +213,46 @@
     WITH code=draw_special_circle with={condition_slot}
     ```
 
+#### **1.13 `ANIMATE`**
+
+* `ANIMATE [interval=<ms>] [enabled=<bool>]`
+    * **描述**: 打开**延时动画绘图**。打开后，本轮脚本里**所有**绘制动作（几何对象、`DRAW`、`FILL`、`TEXT`、`AXIS`、`GRID`）都不再当场落笔，而是按脚本顺序排进队列，每隔 `interval` 毫秒画出一个：**第一项立刻画**，之后每等一会儿画下一个，画完最后一项自动停止。
+    * **参数**:
+        * `interval` 或 `delay`: (可选) 两项之间的间隔，单位**毫秒**，缺省 `300`。写 `0` 表示不等待。
+        * `enabled` 或 `on`: (可选, 布尔) 写 `false` 可临时关掉而不用删掉这一行。
+    * **位置无关**: 和 `VIEW` 一样，写在脚本哪一行都作用于整份脚本。每次重新执行脚本都会重置。
+    * **顺序**: 队列顺序 = 绘制动作在脚本里出现的顺序。`DRAW obj=X` 排在**它在脚本里的位置**，而不是像不开动画时那样统一压在所有 `draw=true` 对象的下面。
+    * **与 `CREATE ANIMATION` 的区别**: 后者是「每隔 N 毫秒重跑一个代码块、推进一个槽位」的逐帧动画；`ANIMATE` 是「把这一轮要画的东西一个一个画出来」的一次性播放。两者可以同时用。
+    * **不影响导出**: 导出 / 复制 SVG 时一律一次画完，不会只导出第一个对象。
+    * **示例**: `ANIMATE interval=300`、慢放 `ANIMATE interval=800`、临时关掉 `ANIMATE enabled=false`
+
+#### **1.14 属性穿透（表达式里的 `对象.属性`）**
+
+* `{对象名.属性}` —— 在任意数值参数、`CALCULATE`、`PRINT`、`TEXT` 的表达式里直接读取几何对象的**实时**属性。
+    * **描述**: 表达式引擎支持在复合标识符上做属性穿透。`{A.x + 50}` 里 `A.x` 会取到点 A 当前的 x 坐标，所以拖动 A 之后重跑脚本，B 会自动跟着走。
+    * **链式访问**: 属性值本身是几何对象时可以继续往下取，例如 `{c1.center.x}`、`{seg1.p1.y}`。
+    * **下划线写法**: `{A_x + 50}` 等价于 `{A.x + 50}`，只支持单层属性。注意对象名/槽位名里本来就常含下划线，**名字整个对得上时优先当对象/槽位**，所以推荐一律用点号。
+    * **示例**:
+        ```
+        CREATE POINT name=A x=0 y=0
+        # B 永远在 A 右边 50、同一水平线上 —— 拖 A，B 跟着走
+        CREATE POINT name=B x={A.x + 50} y={A.y}
+        CREATE CIRCLE name=c1 center=A radius=30
+        CREATE POINT name=P x={c1.center.x} y={c1.radius * 2}
+        ```
+    * **可用属性**:
+        * 点: `x`, `y`, `radius`(或 `r`)
+        * 圆: `radius`(或 `r`), `diameter`(或 `d`), `area`, `circumference`(或 `perimeter`), `center`(或 `c`, 是个点)
+        * 线段: `length`(或 `len`), `p1`, `p2`；直线/射线: `p1`, `p2`, `dx`, `dy`
+        * 椭圆: `rx`(或 `radiusX`), `ry`(或 `radiusY`), `rotation`(弧度), `rotationDegrees`, `center`
+        * 角: `value`(弧度, 或 `radians`), `degrees`, `vertex`
+        * 抛物线: `p`(或 `pValue`), `vertex`；双曲线: `a`(或 `aValue`), `b`(或 `bValue`), `center`
+        * 多边形/三角形/矩形/区域: `area`, `n`(或 `vertexCount`)；曲线: `start`(或 `rangeStart`), `end`(或 `rangeEnd`)
+        * 属性名**不区分大小写**；对象名区分大小写。
+    * **拓扑依赖**: 表达式里出现 `A.x` 就意味着这个对象**依赖 A**。删除 A 时，所有 `{A.x}` 的对象会被一并删除。
+    * **派生对象不能直接拖动**: 坐标由 `{A.x + 50}` 这种属性穿透算出来的点，在画布上**无法用鼠标拖动**。要改就去改表达式里的来源对象。
+    * **求值时机**: 属性在**创建该对象的那一刻**读取，所以来源对象必须已经定义过（写在前面）。
+
 ---
 
 ### **2. 几何指令 (Geometric Commands)**
@@ -244,17 +285,24 @@
 >
 > **多选作图**（ctrl+左键逐个点选）：
 > - 选三个点 → 右键菜单给「作三角形 / 作外接圆 / 作内切圆」；三点共线时置灰并说明原因。
-> - 选两条共端点的线 → 右键菜单给「作角平分线（第一条 → 第二条）/ 以这两条边作平行四边形 / 求两条线的交点」。
+> - 选两条共端点的线 → 右键菜单给「作角平分线（第一条 → 第二条）/ 以这两条边作平行四边形 / 求两条线的交点 / 作角（鼠标选一个角）」。
+>   - 「作角」没有对话框：两条线在公共端点处划出**四个**角，鼠标移到哪个角里，夹出它的那两条射线就变琥珀色，单击即作出那个角。不共端点（或两条线重合）时置灰并说明原因，判定与角平分线共用。
+>   - 产物是 `ROTATED_POINT`（按需）+ `CREATE ANGLE`：角的每一条边都要有一个点名可引用；落在「反向延长」那一侧的边在线上没有现成的点，就绕顶点转 180° 补一个（`draw=false`，它只是角的一条边，不单独画出来）。两条边都有现成点时不补任何多余对象。
 > - 选一个点 + 一个圆 → 右键菜单给「过该点作圆的切线」（点在圆外作两条切线并标出两个切点；点在圆内时置灰）。
 > - 选一个圆 + 一条线（直线/线段/射线）→ 右键菜单给「求线与圆的交点」（已有的交点不重复创建，菜单上会写明还要补建几个点）。
-> - 选两个圆 → 右键菜单给「求两圆交点」（同样只补建尚不存在的交点）。
+> - 选两个圆 → 右键菜单给「求两圆交点」（同样只补建尚不存在的交点），以及「作外公切线 / 作内公切线」。
+>   - 公钥线不是 DSL 原语，而是动态组合出来的：`GETOBJ` 读两个圆心坐标与半径进 slot → `MEASURE distance` 量圆心距 d → `CALCULATE` 用表达式算 φ = atan2(Δy, Δx)（圆心连线方向）与 θ = acos(δ/d)（`δ` 对外公切线是 r1−r2、对内公切线是 r1+r2）→ `POINT_ON_CIRCLE angle={φ±θ}` 定出切点 → `LINE` 连两个切点。
+>   - 因此拖动圆或圆心后切点会随表达式重算，切线自动跟随，不会脱钩。退化情形自动置灰：内含/重合 → 无外公切线；相交/内含 → 无内公切线（外切时内公切线只有 1 条）。
 > - 角平分线不区分选中顺序 —— 内部走 `ANGLE + ANGLE_BISECTOR`，`ANGLE` 取的是 |值|≤180° 的有符号角，两条顺序给出同一条内角平分线（DSL 当前行为）。
 > - 平行四边形 = `MIDPOINT + REFLECTED_POINT + POLYGON`：用 BC 的中点 M，把 A 关于 M 中心对称得 D = B+C−A，再用 `POLYGON points=A,B,D,C`。
 >
 > **单选作图**：
 > - 右键一个点 → 「过该点作圆的切线…」（对话框里再点选一个圆）。
 > - 右键一个圆 → 「在圆周上创建点 / 创建圆心 / 过该点作切线 / 过该点作法线」（切点取圆周上离右键处最近的位置），以及「过某个已有点作切线…」（对话框里再点选一个点）。
-> - 右键一条线（直线 / 射线 / 线段）→ 「在线上取点 / 求 N 等分点 / 延长 / 作中垂线 / 与另一条线求交点…」，以及「截取线段（选要删除的一段）」。截取会进入选段模式：鼠标移到线上时高亮光标所在的一段（直线、射线两端无限延伸的部分也可选中，标签写作 `−∞ → A` / `B → +∞`），单击删掉那一段。**截取只改写原定义行的 `cutPoints=`，不会创建任何新点或新对象**；想把直线截成线段，依次点掉两条无限延伸的部分即可。
+> - 右键一条线（直线 / 射线 / 线段）→ 「在线上取点 / 作指定角的直线… / 求 N 等分点 / 延长 / 作中垂线 / 与另一条线求交点…」，以及「截取线段（选要删除的一段）」。截取会进入选段模式：鼠标移到线上时高亮光标所在的一段（直线、射线两端无限延伸的部分也可选中，标签写作 `−∞ → A` / `B → +∞`），单击删掉那一段。**截取只改写原定义行的 `cutPoints=`，不会创建任何新点或新对象**；想把直线截成线段，依次点掉两条无限延伸的部分即可。
+>   - 「作指定角的直线…」弹面板：选**顶点**（这条线的哪一个端点）、选**角度来源**（手填角度值 / 取一个已创建的角）、选**旋转方向**（逆时针 / 顺时针），并可勾选是否标出旋转得到的那个点（默认不标）。
+>   - 产物是 `ROTATED_POINT` + `LINE`：把另一个端点绕顶点转指定角度，转出来的点与顶点连成直线。全程只引用已存在的点名，不写死坐标，拖动原线后这条直线跟着转。
+>   - 「取已创建的角」是**动态**的：先 `MEASURE type=angle slot=… obj=<角名>`，旋转角写成 `{abs({slot})}`（逆时针）或 `{0-abs({slot})}`（顺时针）。取绝对值再定符号，是为了让「顺/逆时针」的含义不随参照角自身的正负翻转；`0-` 而不是 `-` 是因为表达式求值器只认二元减号。
 
 #### **2.1 基础对象**
 
@@ -313,8 +361,17 @@
 
 * **2.2.3 `CREATE POINT_ON_LINE`**: `name=<name> line=<line> point=<p> distance=<d>`
     * **描述**: 在一个线性对象上，根据与某参考点的距离定义一个新点。
-    * **参数**: `name`, `line`(或`l`), `point`(或`p`), `distance`(或`d`)。
+    * **参数**: `name`, `line`(或`l`), `point`(或`p`), `distance`(或`d`), 可选 `frozen`。
+    * **方向**: `distance` 从参考点 `point` 量起，沿 `p1→p2`；参考点正好是线的 `p2` 时沿 `p2→p1`（和线的参数方向保持一致）。
+    * **范围**: 线段会被钳在 [0, 长度]、射线钳在 ≥0、直线不钳（可以为负，即反向延长线上）。
+    * **可拖动**: 这类点在画布上**只能沿线拖**，拖的时候改的是 `distance=` 而不是坐标，所以不会脱离所在的线。`distance` 写成表达式（如 `distance={L_len * 0.37}`）也照样能拖 —— 第一次拖动后表达式会被替换成算出来的数值。`frozen=true` 时连沿线拖也一并禁止。
     * **示例**: `CREATE POINT_ON_LINE name=P3 line=l_AB distance=50 point=A`
+
+* **2.2.3b `CREATE POINT_ON_CIRCLE`**: `name=<name> circle=<c> angle=<deg>`
+    * **描述**: 在一个圆上，按「以圆心为原点、给定角度（度）」定义圆周边上的一点。
+    * **参数**: `name`, `circle`(或`c`), `angle`(或`a`), 可选 `frozen`。
+    * **可拖动**: 与线上点同理，这类点**只能沿圆周拖**，拖的时候改的是 `angle=`。圆被平移 / 缩放时点自动跟着走（每次重跑都按 `center + radius·(cosθ, sinθ)` 重算）。
+    * **示例**: `CREATE POINT_ON_CIRCLE name=T1 circle=c_O angle=45 draw=true`
 
 * **2.2.4 `CREATE PERPENDICULAR_FOOT`**: `name=<name> from=<point> on=<line>`
     * **描述**: 一步到位创建从一个点到一条直线的垂足。
@@ -419,10 +476,11 @@
     * **参数**: `name`(必须), `p1`(必须), `p2`(必须), `p3`(必须)。
     * **示例**: `CREATE TRIANGLE name=tri1 p1=A p2=B p3=C`
 
-* **2.5.3 `CREATE RECTANGLE`**: `name=<name> p1=<p1> width=<w> height=<h>`
-    * **描述**: 通过左上角顶点 `p1`、宽度和高度创建一个与坐标轴平行的**矩形**。
-    * **参数**: `name`(必须), `p1`(必须), `width`(或`w`, 必须), `height`(或`h`, 必须)。
-    * **示例**: `CREATE RECTANGLE name=rect1 p1=A width=200 height=100`
+* **2.5.3 `CREATE RECTANGLE`**: `name=<name> p1=<p1> a=<a> b=<b>`
+    * **描述**: 通过顶点 `p1` 和两条边长创建一个与坐标轴平行的**矩形**。`p1` 是左上角；从 `p1` 向右 `a`、向下 `b` 各延展出一个顶点。
+    * **参数**: `name`(必须), `p1`(必须), `a`(横边边长, 必须), `b`(纵边边长, 必须)。
+    * **边长必须用 `a` / `b`**：`width` / `height` 在本 DSL 里是**线宽**的意思，把它当边长会让矩形被超粗描边糊成一坨实心块。写成表达式也照样可以：`a={w * 2} b={w}`。
+    * **示例**: `CREATE RECTANGLE name=rect1 p1=A a=200 b=100`（正方形：令 `a` 与 `b` 相等，如 `CREATE RECTANGLE name=sq p1=A a=100 b=100`）
 
 * **2.5.4 `CREATE CIRCLE`**: `name=<name(s)> [params...]`
     * **描述**: 创建一个或多个**圆**，支持多种构造方式。
@@ -437,19 +495,39 @@
     * **方法5 (弦上两点+圆心角)**: `chordPt1=<p1> chordPt2=<p2> centerAngle=<a>`
         * `CREATE CIRCLE name=c1,c2 chordPt1=A chordPt2=B centerAngle=60`
 
-* **2.5.5 `CREATE CIRCUMCIRCLE`**: `name=<name> p1=<p1> p2=<p2> p3=<p3>`
+* **2.5.5 `CREATE CIRCUMCIRCLE`**: `name=<name> (p1=<p1> p2=<p2> p3=<p3> | tri=<三角形名>)`
     * **描述**: 创建通过三个给定点的**外接圆**。
-    * **参数**: `name`(必须), `p1`, `p2`, `p3` (必须)。
-    * **注意**: 它同时会自动创建其圆心，命名为 `<circle_name>_cumcenter`。
+    * **参数**: `name`(必须)；顶点两种写法二选一：`p1`/`p2`/`p3` 三个点，或 `tri=<三角形名>`（`CREATE TRIANGLE` 建出来的那个）。
+    * **注意**: 它同时会自动创建其圆心，命名为 `<circle_name>_<cumcenter>`。想要一个**可引用**的外心请用 `CREATE CIRCUMCENTER`。
     * **示例**: `CREATE CIRCUMCIRCLE name=circum p1=A p2=B p3=C`
 
-* **2.5.6 `CREATE INCIRCLE`**: `name=<name> p1=<p1> p2=<p2> p3=<p3>`
+* **2.5.6 `CREATE INCIRCLE`**: `name=<name> (p1=<p1> p2=<p2> p3=<p3> | tri=<三角形名>)`
     * **描述**: 创建由三个点构成的三角形的**内切圆**。
-    * **参数**: `name`(必须), `p1`, `p2`, `p3` (必须)。
-    * **注意**: 它同时会自动创建其内心，命名为 `<circle_name>_inccenter`。
+    * **参数**: `name`(必须)；顶点同上。
+    * **注意**: 它同时会自动创建其内心，命名为 `<circle_name>_<inccenter>`。想要一个**可引用**的内心请用 `CREATE INCENTER`。
     * **示例**: `CREATE INCIRCLE name=incirc p1=A p2=B p3=C`
 
-* **2.5.7 `CREATE TANGENT`**: `name=<切点名> circle=<c> point=<p>`
+* **2.5.7 `CREATE CENTROID` / `CREATE ORTHOCENTER` / `CREATE INCENTER` / `CREATE CIRCUMCENTER` / `CREATE FERMAT_POINT`**: `name=<name> (p1=.. p2=.. p3=.. | tri=<三角形名>)`
+    * **描述**: 依次创建三角形的**重心 / 垂心 / 内心 / 外心 / 费马点**（第一费马点：到三个顶点距离之和最小的点）。
+    * **参数**: `name`(必须)；顶点两种写法二选一：`p1`/`p2`/`p3` 三个点，或 `tri=<三角形名>`。
+    * **可选参数**: `draw`。
+    * **注意**: 产出的是**一等公民的点** —— 有自己的名字和源码行，后面的指令可以直接引用（例如 `CREATE SEGMENT name=seg p1=G p2=A`）。这一点和 `CREATE CIRCUMCIRCLE` 顺手建的那个 `<圆名>_<cumcenter>` 不同，那个是内部点。
+    * **注意**: 它们都由三个顶点算出来，所以画布上**拖不动**（拖了会弹回原位）—— 想改就改三个顶点。
+    * **费马点**: 有一个内角 ≥ 120° 时，费马点就是那个角的顶点本身。
+    * **示例**: `CREATE CENTROID name=G p1=A p2=B p3=C draw=true` / `CREATE CIRCUMCENTER name=O tri=tri1 draw=true`
+
+* **2.5.8 `CREATE EXCENTER`**: `name=<n1,n2,n3> (p1=.. p2=.. p3=.. | tri=<三角形名>)`
+    * **描述**: 创建三角形的三个**旁心**（旁切圆的圆心），一次建三个点。
+    * **参数**: `name`(必须，逗号分隔的三个名字；只给一个时后两个自动补 `_2` / `_3`)，顶点同上。
+    * **顺序**: 固定为「对着 `p1` / `p2` / `p3` 的那一个」。
+    * **示例**: `CREATE EXCENTER name=I1,I2,I3 p1=A p2=B p3=C draw=true`
+
+* **2.5.9 `CREATE EXCIRCLE`**: `name=<n1,n2,n3> (p1=.. p2=.. p3=.. | tri=<三角形名>)`
+    * **描述**: 创建三角形的三个**旁切圆**，一次建三个圆。
+    * **顺序**: 与 `CREATE EXCENTER` 一一对应（第 k 个与第 k 个顶点对面的那条边相切）。
+    * **示例**: `CREATE EXCIRCLE name=E1,E2,E3 tri=tri1 draw=true`
+
+* **2.5.10 `CREATE TANGENT`**: `name=<切点名> circle=<c> point=<p>`
     * **描述**: 过一点作圆的**切线**，并创建**切点**。
     * **参数**: `name`(必须，**切点的名字**，逗号分隔), `circle`(或`c`), `point`(或`p`)。
     * **注意**: 点在圆上 → 一条切线、一个切点（即该点）；点在圆外 → 两条切线、两个切点。切线自动命名：`<切点名>_tan`（圆外时两条分别为 `T1_tan` / `T2_tan`）；只给一个名字时第二个切点自动取名 `<名字>_2`。若切点位置上已有点，则复用该点而不重复创建。
@@ -457,24 +535,24 @@
         * `CREATE TANGENT name=T circle=c1 point=P_on_circle` → 切点 `T`，切线 `T_tan`
         * `CREATE TANGENT name=T1,T2 circle=c1 point=P_outside` → 切点 `T1`/`T2`，切线 `T1_tan`/`T2_tan`
 
-* **2.5.8 `CREATE ELLIPSE`**: `name=<name> center=<c> radiusX=<rX> radiusY=<rY> [rotation=<rot>]`
+* **2.5.11 `CREATE ELLIPSE`**: `name=<name> center=<c> radiusX=<rX> radiusY=<rY> [rotation=<rot>]`
     * **描述**: 创建一个**椭圆**。
     * **参数**: `name`, `center`(或`c`), `radiusX`(或`rX`), `radiusY`(或`rY`)均为必须；`rotation`(或`rot`)为可选。
     * **示例**: `CREATE ELLIPSE n=E1 c=O rX=100 rY=50 rot=45`
 
-* **2.5.9 `CREATE FOCIS`**: `name=<f1,f2> obj=<ellipse>`
+* **2.5.12 `CREATE FOCIS`**: `name=<f1,f2> obj=<ellipse>`
     * **描述**: 创建一个给定椭圆的两个**焦点**。
     * **参数**: `name`(必须, 逗号分隔的两个名称), `obj`(或`o`, 必须)。
     * **示例**: `CREATE FOCIS name=F1,F2 obj=my_ellipse`
 
-* **2.5.10 `CREATE PARABOLA`**: `name=<name> [params...]`
+* **2.5.13 `CREATE PARABOLA`**: `name=<name> [params...]`
     * **描述**: 创建**抛物线**，支持两种方式。
     * **方法1 (几何法)**: `vertex=<v> pValue=<p> [rotateAngle=<rot>]`
         * `CREATE PARABOLA n=P1 v=V p=50 rot=45`
     * **方法2 (系数法)**: `a=<a> b=<b> c=<c>` (用于`y=ax²+bx+c`)
         * `CREATE PARABOLA n=P2 a=0.1 b=2 c=5`
 
-* **2.5.11 `CREATE HYPERBOLA`**: `name=<name> [params...]`
+* **2.5.14 `CREATE HYPERBOLA`**: `name=<name> [params...]`
     * **描述**: 创建**双曲线**，支持两种方式。
     * **方法1 (几何法)**: `center=<c> aValue=<a> bValue=<b> [rotateAngle=<rot>]`
         * `CREATE HYPERBOLA n=H1 c=O a=100 b=50`
